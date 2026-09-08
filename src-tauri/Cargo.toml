@@ -1,0 +1,36 @@
+[package]
+name = "aeroshoot"
+version = "0.1.0"
+description = "Next-generation AI-assisted screen recording studio"
+authors = ["AeroShoot.AI Team"]
+license = "MIT OR Apache-2.0"
+edition = "2021"
+
+[lib]
+name = "aeroshoot_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "aeroshoot"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+uuid = { version = "1.8", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+tokio = { version = "1.38", features = ["sync", "rt", "macros", "time"] }
+libc = "0.2"
+tauri = { version = "2.0.0", optional = true }
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", optional = true }
+
+[features]
+default = []
+tauri-app = ["dep:tauri", "dep:tauri-build"]
+
+[dev-dependencies]
+tempfile = "3.10"
