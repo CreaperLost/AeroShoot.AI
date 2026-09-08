@@ -2,7 +2,7 @@
 
 > **Persistent Blueprint & Development Roadmap**
 > Target Platforms: macOS (Apple Silicon ARM64, macOS 13+) & Windows 11 (x86_64 / ARM64)
-> Architecture review: 2026-09-07. This repository currently contains planning documents only; all capabilities below are planned, not implemented or benchmarked.
+> Architecture review: 2026-09-07. The repository currently contains the Phase 1 shared recording foundations and a synthetic studio shell. Native capture, preview, export, and performance targets below remain planned and unbenchmarked.
 > Core Framework: Tauri v2 (Rust) + React / TypeScript / Vite + Native OS Capture Modules
 
 ---
