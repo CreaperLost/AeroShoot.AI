@@ -65,6 +65,39 @@ fn get_permission_status(state: State<'_, AppState>) -> capture::PermissionStatu
 
 #[cfg(feature = "tauri-app")]
 #[tauri::command]
+async fn request_capture_permissions(
+    screen: bool,
+    camera: bool,
+    microphone: bool,
+) -> capture::PermissionStatus {
+    tauri::async_runtime::spawn_blocking(move || {
+        commands::request_permissions_impl(screen, camera, microphone)
+    })
+    .await
+    .unwrap_or(capture::PermissionStatus {
+        screen_recording: capture::PermissionState::Unknown,
+        camera: capture::PermissionState::Unknown,
+        microphone: capture::PermissionState::Unknown,
+    })
+}
+
+/// Computes the active source / destination geometry for a given
+/// `source_id`. The Frontend calls this to preview the rect that will
+/// be captured before pressing record, and to surface fit vs. fill
+/// decisions in the settings UI.
+#[cfg(feature = "tauri-app")]
+#[tauri::command]
+fn compute_source_geometry(
+    source_id: String,
+    dest_width: Option<u32>,
+    dest_height: Option<u32>,
+    fit_mode: Option<capture::FitMode>,
+) -> Result<commands::SourceGeometryResult, String> {
+    commands::compute_source_geometry_impl(source_id, dest_width, dest_height, fit_mode)
+}
+
+#[cfg(feature = "tauri-app")]
+#[tauri::command]
 fn detect_silence(config: dsp::SilenceConfig) -> Vec<dsp::SilenceCutInterval> {
     let sample_rate = 48000;
     let mut mock_samples = vec![0.5f32; sample_rate as usize]; // 1s speech
@@ -86,6 +119,8 @@ pub fn run() {
             stop_recording,
             get_session_status,
             get_permission_status,
+            request_capture_permissions,
+            compute_source_geometry,
             detect_silence
         ])
         .run(tauri::generate_context!())

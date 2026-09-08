@@ -226,6 +226,9 @@ impl TrackSegmentWriter {
             end_us,
             size_bytes,
             is_keyframe_start,
+            media_timescale: 0,
+            media_start_value: 0,
+            host_anchor_us: 0,
         })?;
 
         let result = SegmentCommitResult {

@@ -4,7 +4,7 @@ High-performance, AI-assisted screen recording studio for **macOS (Apple Silicon
 
 Combining the low-level capture power of OBS Studio with the post-production elegance of Screen Studio and AI jump-cut automation.
 
-**Status:** Phase 1 shared recording foundations and the synthetic studio shell are implemented and test-qualified. Native capture, preview playback, and export are not yet implemented or benchmarked.
+**Status:** Shared recording foundations, a synthetic studio shell, and an in-progress macOS capture bridge exist. Phase completion and native qualification remain subject to the acceptance gates in the master plan, revised 2026-09-08. Native preview/export and platform performance are not yet qualified.
 
 ## 📖 Master Architecture & Development Roadmap
 Please see [AEROSHOOT_MASTER_PLAN.md](AEROSHOOT_MASTER_PLAN.md) for the complete, persistent technical architecture, subsystem breakdown, and phased implementation guide.

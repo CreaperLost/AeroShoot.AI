@@ -1,5 +1,5 @@
 use aeroshoot_lib::capture::{
-    AudioDevice, CameraDevice, NativeCaptureSessionHandle, PermissionStatus,
+    AudioDevice, CameraDevice, NativeCaptureSessionHandle, PermissionState, PermissionStatus,
 };
 use aeroshoot_lib::commands::{
     get_permission_status_impl, pause_recording_impl, resume_recording_impl, start_recording_impl,
@@ -75,10 +75,14 @@ fn test_ipc_serialization_contracts_match_frontend() {
         elapsed_us: 2_500_000,
         dropped_frames: 1,
         audio_buffer_underflows: 0,
+        last_runtime_error: None,
+        gaps_total: 0,
+        timestamp_records_dropped: 0,
     };
     let status_json = serde_json::to_string(&status_res).unwrap();
     assert!(status_json.contains("\"elapsedUs\":2500000"));
     assert!(status_json.contains("\"droppedFrames\":1"));
+    assert!(status_json.contains("\"timestampRecordsDropped\":0"));
 
     // 6. DevicesResult and AudioDevice / CameraDevice serialize with isDefault
     let dev_res = DevicesResult {
@@ -254,6 +258,9 @@ fn test_media_validator_and_unindexed_committed_segment_recovery() {
             end_us: 2_000_000,
             size_bytes: fs::metadata(&seg1).unwrap().len(),
             is_keyframe_start: true,
+            media_timescale: 90_000,
+            media_start_value: 0,
+            host_anchor_us: 0,
         })
         .unwrap();
 
@@ -266,6 +273,9 @@ fn test_media_validator_and_unindexed_committed_segment_recovery() {
             end_us: 4_000_000,
             size_bytes: 512,
             is_keyframe_start: true,
+            media_timescale: 90_000,
+            media_start_value: 0,
+            host_anchor_us: 0,
         })
         .unwrap();
 
@@ -297,6 +307,9 @@ fn test_project_input_validation_and_symlink_escape_rejection() {
             end_us: 1000,
             size_bytes: 10,
             is_keyframe_start: true,
+            media_timescale: 0,
+            media_start_value: 0,
+            host_anchor_us: 0,
         })
         .unwrap();
 
@@ -799,13 +812,13 @@ fn test_permission_status_and_override() {
 
     // Overriding permissions to deny screen recording
     *state.permission_override.write() = Some(PermissionStatus {
-        screen_recording: false,
-        camera: true,
-        microphone: true,
+        screen_recording: PermissionState::Denied,
+        camera: PermissionState::Authorized,
+        microphone: PermissionState::Authorized,
     });
 
     let status_denied = get_permission_status_impl(&state);
-    assert!(!status_denied.screen_recording);
+    assert_eq!(status_denied.screen_recording, PermissionState::Denied);
 
     // Attempting to start recording with screen permission denied must fail
     let opts = StartRecordingOptions {

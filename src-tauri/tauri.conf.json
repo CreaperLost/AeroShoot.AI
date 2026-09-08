@@ -4,9 +4,15 @@
   "version": "0.1.0",
   "identifier": "ai.aeroshoot.studio",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": {
+      "script": "npm run dev",
+      "cwd": "../front-end"
+    },
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": {
+      "script": "npm run build",
+      "cwd": "../front-end"
+    },
     "frontendDist": "../front-end/dist"
   },
   "app": {
@@ -44,6 +50,10 @@
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/icon.png"
-    ]
+    ],
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "infoPlist": "Info.plist"
+    }
   }
 }

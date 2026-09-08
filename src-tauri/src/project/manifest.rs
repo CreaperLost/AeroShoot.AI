@@ -29,6 +29,15 @@ pub struct TrackDescriptor {
     pub sample_rate: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channels: Option<u16>,
+    /// Number of timeline gaps (discontinuities) observed on this track.
+    /// Persisted so downstream tools can re-derive diagnostics without
+    /// re-scanning the journal.
+    #[serde(default)]
+    pub gaps_total: u64,
+    /// Native media-clock timescale parsed from the track's `mdhd` box.
+    /// Used to re-establish a rational media-clock → host-clock mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_timescale: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -50,6 +59,16 @@ pub struct ProjectManifest {
     pub active_duration_us: u64,
     #[serde(default)]
     pub pause_intervals: Vec<PauseInterval>,
+    /// Total number of timeline gaps (discontinuities) observed across
+    /// every track. Mirrors the journal's `Discontinuity` records so the
+    /// editor can surface this without re-scanning the journal.
+    #[serde(default)]
+    pub gaps_total: u64,
+    /// Most-recent source geometry revision (display/window/app rect +
+    /// destination rect + fit mode). `None` until the first compute
+    /// happens. See `crate::capture::SourceGeometry`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_geometry: Option<crate::capture::SourceGeometry>,
     pub tracks: Vec<TrackDescriptor>,
 }
 
@@ -81,8 +100,26 @@ impl ProjectManifest {
             duration_us: 0,
             active_duration_us: 0,
             pause_intervals: Vec::new(),
+            gaps_total: 0,
+            source_geometry: None,
             tracks: Vec::new(),
         }
+    }
+
+    /// Returns the sum of all `gaps_total` counters across the manifest's
+    /// track descriptors. Used by recovery to re-validate the global counter.
+    pub fn gaps_total_from_tracks(&self) -> u64 {
+        self.tracks.iter().map(|t| t.gaps_total).sum()
+    }
+
+    /// Increments both the global counter and the matching track's counter
+    /// when a new discontinuity is observed. Returns the new total.
+    pub fn record_gap(&mut self, track_id: &str) -> u64 {
+        if let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) {
+            track.gaps_total = track.gaps_total.saturating_add(1);
+        }
+        self.gaps_total = self.gaps_total.saturating_add(1);
+        self.gaps_total
     }
 
     /// Validates the manifest integrity and path security.
@@ -221,6 +258,8 @@ mod tests {
             fps: Some(30),
             sample_rate: None,
             channels: None,
+            gaps_total: 0,
+            media_timescale: None,
         });
 
         assert!(manifest.validate().is_ok());

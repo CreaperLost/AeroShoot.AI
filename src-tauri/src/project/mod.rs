@@ -14,6 +14,7 @@ pub use segment_writer::{SegmentCommitResult, SegmentWriterError, TrackSegmentWr
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -36,7 +37,7 @@ pub enum ProjectError {
 pub struct ProjectBundle {
     root_path: PathBuf,
     manifest: ProjectManifest,
-    journal: ProjectJournal,
+    journal: Arc<ProjectJournal>,
     _lock: ProjectLock,
 }
 
@@ -71,7 +72,7 @@ impl ProjectBundle {
         manifest.save_with_backup(&manifest_path)?;
 
         // Open append-only journal
-        let journal = ProjectJournal::open_or_create(&root_path)?;
+        let journal = Arc::new(ProjectJournal::open_or_create(&root_path)?);
 
         Ok(Self {
             root_path,
@@ -91,7 +92,7 @@ impl ProjectBundle {
         let manifest: ProjectManifest = serde_json::from_str(&data)?;
         manifest.validate()?;
 
-        let journal = ProjectJournal::open_or_create(&root_path)?;
+        let journal = Arc::new(ProjectJournal::open_or_create(&root_path)?);
 
         Ok(Self {
             root_path,
@@ -138,6 +139,10 @@ impl ProjectBundle {
 
     pub fn journal(&self) -> &ProjectJournal {
         &self.journal
+    }
+
+    pub fn journal_arc(&self) -> Arc<ProjectJournal> {
+        Arc::clone(&self.journal)
     }
 }
 

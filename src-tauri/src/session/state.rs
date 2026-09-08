@@ -80,6 +80,9 @@ impl SessionStateMachine {
                 (SessionState::Paused, SessionState::Error) => true,
                 (SessionState::Stopping, SessionState::Completed) => true,
                 (SessionState::Stopping, SessionState::Error) => true,
+                // A failed native session must still be stoppable so writers,
+                // callbacks, and the project lock are finalized deterministically.
+                (SessionState::Error, SessionState::Stopping) => true,
                 (SessionState::Completed, SessionState::Idle) => true,
                 (SessionState::Completed, SessionState::Preparing) => true,
                 (SessionState::Error, SessionState::Idle) => true,

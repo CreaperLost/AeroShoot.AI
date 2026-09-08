@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>AeroShoot records the selected camera as a separate video track.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>AeroShoot records the selected microphone as a separate audio track.</string>
+</dict>
+</plist>
