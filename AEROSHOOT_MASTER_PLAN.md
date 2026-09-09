@@ -2,9 +2,10 @@
 
 > **Persistent Blueprint & Development Roadmap**
 > Target Platforms: macOS (Apple Silicon ARM64, macOS 13+) & Windows 11 (x86_64 / ARM64)
-> Plan revision: 2026-09-08 (Post-GUI Overhaul & Real-Device Alignment)
+> Plan revision: 2026-09-08 (Native integration status & agent execution guide)
 > Current baseline: Completed two-scene studio frontend with dedicated Record Scene & Edit Studio Scene, physical hardware device deck (zero mock devices, real displays, mics with VU meter, webcams with hotplug), responsive aspect-ratio canvas (16:9, 9:16, 4:3, 1:1), and full-height multi-track timeline studio; shared Rust recording foundations (session, journal, segment writer, recovery); and in-progress macOS ScreenCaptureKit/AVFoundation capture bridge.
 > Core Framework: Tauri v2 (Rust) + React / TypeScript / Vite + Native OS Capture Modules
+> **Start here when implementing:** [Section 10 — Agent Execution Guide](#10-agent-execution-guide) provides the current task selection rule, actual file map, ordered work packages, and acceptance examples. Read it together with the subsystem requirements; it does not waive native qualification gates.
 
 ---
 
@@ -26,11 +27,12 @@ This document specifies the target architecture. Requirements are not claims tha
 
 | Area | Baseline observed on 2026-09-08 | Required next evidence |
 | --- | --- | --- |
-| Desktop Studio & GUI | **Completed Overhaul**: Scene separation (`RecordScene` vs `EditStudioScene`) via top card; physical device deck (`DeviceControlDeck`) querying only real displays, webcams, and mics with hotplugging and animated VU meter; responsive multi-aspect canvas (`StudioCanvas`); floating dock; full-height multi-track `TimelineStudio`. | Connect live native media playback and waveform generation from `.aero` project bundles. |
+| Desktop Studio & GUI | **E1–E4 and F1/F2 contract-tested**: Stop opens a real project; waveforms come from PCM; Rust owns playback; an AppKit overlay exists; WGPU can composite a styled scene; VideoToolbox can encode/decode it; E4 muxes H.264/AAC from the same evaluator. Production frames are still unavailable (`previewAvailable: false`). | Live Tauri preview qualification; do not treat HTML video or a solid overlay as production playback. |
+
 | Shared recording foundations | Rust session state machine, monotonic clock, bounded queues, segment writer, project manifest, journal, and recovery engine implemented. | Failure-injection, concurrency, actual media validation, and cross-platform durability acceptance. |
-| macOS capture | Swift ScreenCaptureKit/AVFoundation bridge (`SCKitBridge.swift` & `src-tauri/src/capture/macos.rs`); AVAssetWriter prototype. | Shared clock mapping and durable segment commit integration with Rust `SegmentWriter`; real-device qualification. |
-| Mouse telemetry | Event schema, coordinate normalization, and geometry tracking contracts specified. | Native macOS `CGEventTap` (`MouseHookMac.swift`) integration logging real click/cursor events to `telemetry/events.jsonl`. |
-| Native preview and export | Architecture specified; timeline editor and canvas playback UI completed. | Phase 0 embedding/interoperability experiments, then Phase 4 parity tests. |
+| macOS capture | `AeroShootCapture.swift` and `capture/macos.rs` integrate rotating AVAssetWriter containers with Rust `TrackSegmentWriter::commit_native_segment`. See [implementation evidence](NATIVE_SEGMENT_INTEGRATION.md). | Real decoding, clock alignment, durability failure injection, pause/shutdown and device qualification remain open. |
+| Mouse telemetry | `MouseHookMac.swift` and `telemetry/native.rs` implement a bounded v2 transition stream, geometry revisions and an Input Monitoring UI. See [implementation evidence](MOUSE_TELEMETRY_INTEGRATION.md). | Live permission/timing qualification, precise changing-window geometry and downstream v1/v2 readers; no cursor replacement or keyboard capture implemented. |
+| Native preview and export | F1 overlay, F2 WGPU/VideoToolbox interop, and E4 H.264/AAC export are contract-tested. See [F1](F1_NATIVE_PREVIEW.md), [F2](F2_MEDIA_INTEROP.md), [E4](E4_EXPORT.md). FFmpeg is not pinned. | Rec.709/zero-copy; live window qualification; 1080p export; Windows media adapters. |
 | Windows | Planned native adapters (`WGCBridge.cpp`, WASAPI). | Windows x64 feasibility and vertical slice; ARM64 qualification separately. |
 
 Keep short independent media segments as the baseline. Change storage format, preview transport, or platform encoder strategy only through a recorded decision with measurements, recovery implications, compatibility, and acceptance tests. Do not treat unmeasured concerns about file counts, webview embedding, or keyframe overhead as proof of failure.
@@ -95,7 +97,7 @@ Keep short independent media segments as the baseline. Change storage format, pr
 * **Webcam Capture**: `AVCaptureSession` capturing raw YUV/NV12 frames from built-in FaceTime HD / Studio Display / external USB-C cameras.
 * **Microphone Audio**: `AVCaptureDevice` or `CoreAudio` with customizable sample rate (48 kHz default).
 * **Hardware Encoding**: Apple `VideoToolbox` (`VTCompressionSession`) produces encoded H.264 packets for the initial recording format. A separate muxer writes fMP4. Probe hardware availability and concurrent screen/webcam encoder capacity; HEVC and ProRes are later, capability-gated options.
-* **Existing bridge integration**: The current `AeroShootCapture.swift` uses `AVAssetWriter` for one output file per track, with a video fragment interval. Treat it as an integration prototype until it satisfies the common timestamp, segment, journal, and shutdown contracts. A hardware encoder probe alone does not prove the production path or concurrent encoder capacity.
+* **Existing bridge integration**: The active `ActiveRecorder` / `RotatingMediaWriter` path in `AeroShootCapture.swift` rotates AVAssetWriter containers and submits finalized temporary files to Rust for publication and journaling. Older prototype code remains in the same file; follow the exported `aeroshoot_macos_start` call chain before editing. The rotation strategy and common clock/shutdown contracts still need hardware qualification. A hardware encoder probe alone does not prove the production path or concurrent encoder capacity.
 * **Permitted alternative to the baseline encoder/mux split**: Evaluate `AVAssetWriter` segment-output delegates and `preferredOutputSegmentInterval` if useful. Apple supports segment output without requiring a writer restart for every segment. An adapter must still attach appropriate initialization metadata, prove independent keyframe starts, preserve PTS/DTS, and submit completed data through the shared commit protocol. Select one production adapter after measurement; do not maintain competing persistence paths.
 
 #### B. Windows 11 Engine (x86_64 / ARM64)
@@ -126,12 +128,14 @@ To achieve the "Screen Studio" post-processing zoom effect, cursor movement must
 
 #### Event payload and platform requirements
 
-* The next telemetry schema uses a tagged payload: `move`; `button_down`/`button_up` with a button identifier (including auxiliary buttons); `scroll` with signed X/Y deltas and explicit units; `cursor_changed` with an asset/shape reference and hotspot; and `gap` with reason and affected time interval. Preserve platform scroll phase/precision when available. Modifier state is optional and must distinguish unknown from an empty set.
+* The implemented v2 telemetry subset uses a tagged payload for movement, button transitions, scroll and gaps. The full target schema also includes cursor changes: `move`; `button_down`/`button_up` with a button identifier (including auxiliary buttons); `scroll` with signed X/Y deltas and explicit units; `cursor_changed` with an asset/shape reference and hotspot; and `gap` with reason and affected time interval. Preserve platform scroll phase/precision when available. Modifier state is optional and must distinguish unknown from an empty set.
 * Button transitions are authoritative. Clicks and double-clicks are derived annotations with references to their originating transitions; consumers must not animate both a derived click and its source transition as separate clicks. Maintain held-button state and reset it to unknown across telemetry gaps until resynchronized.
 * Version payload changes explicitly. Existing v1 `Click` records have unknown button/derivation provenance; do not invent it during migration. Validate geometry and cursor references, and bound cursor asset sizes and cache memory.
 * macOS permission preflight distinguishes listening/Input Monitoring from event modification/Accessibility. Use the listening-access APIs where applicable and test the actual event mask, tap location, signed app, and supported OS versions. Handle timeout/user-input tap-disable notifications: record the gap, revalidate authorization, and re-enable only where appropriate; do not repeatedly prompt or restart after an explicit denial.
 * `NSCursor.current` is application-local; `currentSystem` was documented as system-wide but is deprecated and is not a dependable cross-version foundation. Qualify public cursor extraction on supported versions. If reliable extraction is unavailable, use the baked-cursor mode already defined above. Do not assume standard global cursor-shape identification is guaranteed, and do not use private cursor APIs.
 * Windows `MSLLHOOKSTRUCT.pt` is documented as per-monitor-aware screen coordinates. Define the conversion to source physical pixels once and test negative desktop origins, rotation, mixed DPI, and moved windows. The hook does not provide stationary cursor-shape notifications; use a bounded cursor polling adapter or another qualified mechanism. Keep callbacks immediate, account for silent timeout removal, and report telemetry-health uncertainty rather than promising reliable removal detection. Do not hardcode an assumed 200 ms timeout.
+
+Legacy v1 example (do not use this shape for new native v2 events):
 
 ```json
 {"version":1,"seq":42,"t_us":1042000,"geometry_id":"g1","kind":"move","norm_x":0.4521,"norm_y":0.7832,"inside_source":true,"visible":true,"cursor_id":"arrow-1"}
@@ -357,7 +361,7 @@ AeroShoot.AI/
 * **Evidence**: Check in a reproducible procedure and result record for each native experiment. Include native surface placement and transparent-corner hit testing, identical preview/export scene evaluation, four-track timestamp alignment, cold permission denial, and forced termination. Select the encoder/muxer and preview adapters explicitly. Missing platform hardware is an open gate, not a pass.
 * Shared Phase 1 contracts and synthetic tests may proceed while feasibility experiments are open. Production editor implementation and claims of native qualification depend on the applicable Phase 0 gates; a synthetic studio shell does not satisfy them.
 
-### Phase 1: Shared Recording Foundations & Studio Shell (Complete)
+### Phase 1: Shared Recording Foundations & Studio Shell (Implemented; Acceptance Gaps Remain)
 
 * Initialized Tauri v2, React/TypeScript/Vite, Tailwind CSS and Zustand, with least-privilege window capabilities.
 * **Studio GUI Overhaul**:
@@ -422,20 +426,24 @@ These checks close shared requirements; they do not replace the real-device Phas
 ### Immediate Implementation Order & Next Steps
 
 1. **Step 1: Native macOS Recording & Segment Commit Integration (Phase 2)**:
-   - Connect the Swift `SCKitBridge.swift` / `AVAssetWriter` delegate buffers directly into Rust's `SegmentWriter` and `Journal`.
+   - **Implementation update (2026-09-08):** Native rotated containers now enter `TrackSegmentWriter::commit_native_segment` as finalized temporary files. Rust validates, syncs, publishes without replacement, syncs the directory, and journals the supplied clock anchor; the synchronous callback returns persistence failure to Swift. Removed Stop’s independent salvage/commit path. See [integration evidence](NATIVE_SEGMENT_INTEGRATION.md). Real-device Start/Stop, decoding, synchronization, and long-session qualification remain open; Step 1 is not yet hardware-qualified.
+   - Continue from the active `AeroShootCapture.swift` → `capture/macos.rs` → `TrackSegmentWriter::commit_native_segment` integration; qualify it instead of creating another persistence path.
    - Ensure native ScreenCaptureKit screen frames, system audio loopback, webcam frames, and microphone PCM chunks write out verified, timestamped `.mp4` and `.wav` segments into the active `.aero/media/` project bundle.
    - Verify that clicking `Start Recording` in the UI records real media and `Stop Recording` commits the project bundle.
 
 2. **Step 2: Global Mouse Telemetry Capture (`CGEventTap` on macOS)**:
+   - **Implementation update (2026-09-08):** Added `MouseHookMac.swift`, bounded native event capture, v2 Rust telemetry persistence, explicit Input Monitoring UI, pause/overflow/permission gaps, and baked-cursor manifest metadata. See [implementation and qualification notes](MOUSE_TELEMETRY_INTEGRATION.md). Native hardware permission/timing and mixed-DPI geometry qualification remain open.
    - Wire `MouseHookMac.swift` using a passive listen-only `CGEventTap` to record mouse position, clicks, and dwell times.
    - Stream normalized coordinates and button transitions into `telemetry/events.jsonl` aligned with the monotonic session clock.
 
 3. **Step 3: Real Media Playback & Waveforms in Edit Studio (Phase 4)**:
+   - **Implementation update (2026-09-08):** E1 is implemented and contract-tested. Stop returns a resolvable `projectPath`; `open_project` / `close_project` / `project_segments` load a bounded read-only segment index into the editor. The Edit Studio no longer injects a sample session. See [E1 evidence](E1_PROJECT_METADATA.md).
+   - **Implementation update (2026-09-08):** E4 is contract-tested for an immutable-revision H.264/AAC export job that uses the same timeline/scene evaluator as preview. Collision, cancel, and source-path policies preserve sources. `previewAvailable` becomes true after a native project frame is presented. See [E4](E4_EXPORT.md).
    - Connect the `EditStudioScene` video preview to playback the recorded screen and webcam video tracks from the `.aero` project bundle.
    - Generate true audio waveforms (RMS/peak) on the `TimelineStudio` mic and system audio tracks instead of sample placeholder waveforms.
 
 4. **Step 4: Smart Auto-Zoom Keyframing Algorithm (Phase 5)**:
-   - Implement the telemetry parser that scans `events.jsonl` for high-interest clusters (clicks, typing, cursor dwell) and automatically generates smooth cubic Bézier zoom keyframe blocks on the timeline.
+   - Implement a version-aware telemetry reader and derive interest from supported button transitions and cursor dwell, then generate smooth cubic Bézier zoom keyframes. Current telemetry does not capture typing; do not invent keyboard activity or add keyboard collection as part of this task.
    - Allow user adjustment and preview directly on the canvas.
 
 5. **Step 5: Windows 11 Native Core & Platform Parity (Phase 3)**:
@@ -502,3 +510,273 @@ Reviewed through 2026-09-08. These sources establish API behavior and constraint
 | Separate Input Monitoring and Accessibility preflight | Listen-only and modifying event paths have different authorization requirements |
 | Use explicit sample-frame/channel contracts for DSP | RMS squares do not cancel opposite polarity; channel misuse can corrupt timing or detection policy |
 | Require reproducible acceptance evidence | Tests, native spikes, packaging checks, and performance measurements qualify different claims |
+
+---
+
+## 10. Agent Execution Guide
+
+This section turns the architecture into small implementation assignments. **Existing** means observed in the working tree on 2026-09-08. **Proposed** means a file, command, or contract still needs implementation. A proposed name is not an API you can already call. Recheck the tree and linked evidence before starting; do not use old line numbers or comments as proof of behavior.
+
+### 10.1 Select the next assignment
+
+1. Read Sections 1.1, 3.3, 3.8, 3.9 and the relevant subsystem section. Read `NATIVE_SEGMENT_INTEGRATION.md` and `MOUSE_TELEMETRY_INTEGRATION.md` before modifying native recording.
+2. Inspect `git status --short`, `git diff --stat`, and applicable `AGENTS.md` files. Preserve existing working-tree changes. Do not restart Steps 1–2 merely because their hardware gates are still open.
+3. Unless the user selects a different task, **the next bounded coding assignment is Z1: telemetry-driven zoom parsing**. E1–E4, F1 and F2 are contract-tested. F2/E4 use system AVFoundation/VideoToolbox, explicit Rec.709 and the native playback worker; sustained device qualification remains open; do not implement a production renderer as a web-only substitute. Z1 parsing can proceed independently of live preview qualification.
+4. Next, Z1 can use E1 metadata contracts. Production playback still needs live preview qualification. Z2 production integration depends on the shared evaluator (E3/E4).
+5. Keep H1/H2 qualification open until measured. If a device or permission is unavailable, write the exact missing experiment and continue independent shared work. Do not mark a gate passed, replace it with synthetic media, or stop all unrelated implementation.
+6. For a user-directed Windows task, start W1; the numbering of “Immediate Steps” is product priority, not permission to skip Phase 0 or Windows feasibility gates.
+
+| Roadmap area | Work packages | Start condition |
+| --- | --- | --- |
+| Remaining recording/telemetry acceptance | H1, H2 | Existing native integration; hardware needed for qualification. |
+| Native camera HUD | H3 | Shared window/settings contracts first; native rendering depends on an F1-qualified preview surface (F1 is contract-tested, not hardware-qualified). |
+| Native media feasibility | F1, F2 | F1 and F2 are contract-tested on macOS. FFmpeg remains unpinned. Windows media is open. |
+| Immediate Step 3 | E1 → E2 → E3 | E1–E4, F1 and F2 are contract-tested. Z1 is next for zoom parsing. |
+| Basic export | E4 | E3 + F2. **E4 is contract-tested** ([E4_EXPORT.md](E4_EXPORT.md)). |
+| Immediate Step 4 | Z1 → Z2 | Z1 parsing can start after E1; Z2 depends on E3/E4. |
+| Advanced styling and silence | A1, S1 | Shared evaluator/export and audio contracts. |
+| Immediate Step 5 | W1 → W2 → W3 | Windows x64 SDK/hardware; do not infer parity from macOS. |
+| Distribution | R1 | Working slices and measured capability results. |
+
+**Status vocabulary:** `planned` → `implemented` → `contract-tested` → `hardware-qualified`. Record these separately per platform and feature. A passing compile establishes buildability; a passing synthetic test establishes only its asserted contract. “Done” for a work package means its listed output and checks are complete, not that the entire phase is qualified.
+
+### 10.2 Actual repository map and observed traps
+
+All paths below are repository-relative. Section 4 is a target layout and includes directories that do not yet exist.
+
+| Responsibility | Existing entry points | What to check before changing it |
+| --- | --- | --- |
+| Tauri command registration | `src-tauri/src/lib.rs` | A Rust helper is not callable from React until registered in `generate_handler!`; match argument and result serialization. |
+| Session orchestration | `src-tauri/src/commands/mod.rs`, `session/state.rs`, `session/clock.rs` | Keep Start/Pause/Resume/Stop ownership serialized; read retries and error paths, not only the successful path. |
+| Native capture | `src-tauri/native/macos/AeroShootCapture.swift`, `src-tauri/src/capture/macos.rs`, `src-tauri/build.rs` | The active path is `aeroshoot_macos_start` → `ActiveRecorder`; `SCKitBridge.swift` is not a current file. Do not edit only the legacy prototype. |
+| Segment publication/recovery | `project/segment_writer.rs`, `project/journal.rs`, `project/recovery.rs`, `project/media_validator.rs`, `project/lock.rs` under `src-tauri/src/` | Native publication uses `commit_native_segment`; general `commit_segment` is a separate existing method. Do not assume their durability properties are identical. Container validation is not full decoding. |
+| Native telemetry | `src-tauri/native/macos/MouseHookMac.swift`, `src-tauri/src/telemetry/native.rs` | New v2 events have a tagged `payload`; the old `telemetry/event.rs` types are v1. Native logger creation is for fresh recording bundles, not replay. |
+| Native preview overlay | `src-tauri/native/macos/AeroShootPreview.swift`, `src-tauri/src/playback/preview.rs`, `src-tauri/src/playback/native.rs`, `front-end/src/components/canvas/NativePreviewHost.tsx` | Child overlay above WKWebView. Geometry is CSS points; pixels stay in-process. `previewAvailable` remains false. Browser HTML video is not this surface. Windows is unimplemented. |
+| Decoder/compositor/encoder | `src-tauri/src/media/`, `src-tauri/src/render/`, `src-tauri/native/macos/AeroShootMedia.swift` | Owned BGRA frames; WGPU 27 offscreen scene; VideoToolbox H.264; encoder occupancy ≤ 1. FFmpeg is not in `Cargo.toml`. Do not serialize frames through IPC. |
+| Export job | `src-tauri/src/export/`, `src-tauri/native/macos/AeroShootExport.swift`, `front-end/src/components/scenes/EditStudioScene.tsx` | Immutable revision; H.264+AAC only; dest cannot be inside the bundle or overwrite sources; temp + fsync + hard_link; status has no pixels. Browser emulation is not an export. Bound to 512px / 120 frames in this slice. |
+| Rust timeline/DSP | `src-tauri/src/timeline/{interval,mapper}.rs`, `src-tauri/src/dsp/silence.rs` | Existing helpers need input validation and channel-aware integration. `TimelineMapper::new` sorts but does not reject overlaps. Exact edited end currently returns a source end sentinel. |
+| UI/native boundary | `front-end/src/lib/ipc.ts`, `front-end/src/lib/types.ts` | Browser emulation is not native success. Project/open DTOs now match the Rust `OpenedProject` contract; telemetry v1 TypeScript types still do not match native v2 disk records. |
+| Record-to-edit handoff | `front-end/src/hooks/useRecording.ts`, `front-end/src/components/scenes/RecordScene.tsx` | Stop returns `projectPath` and RecordScene switches to Edit only after `open_project` succeeds. A caught stop/open error must not display a sample session. |
+| Editor state and timing | `front-end/src/stores/projectStore.ts`, `front-end/src/hooks/useTimeline.ts`, `front-end/src/App.tsx` | Ordinary sessions start with an empty editor. Audio lanes query `project_waveform` (E2). Playhead position is polled from Rust `playback_status` (E3); `requestAnimationFrame` is not the media clock. Native project frames are delivered by the Rust media worker to AppKit; availability is set after successful presentation. |
+| Canvas, waveforms, editing | `front-end/src/components/scenes/EditStudioScene.tsx`, `components/canvas/NativePreviewHost.tsx`, `components/canvas/StudioCanvas.tsx`, `components/timeline/TimelineStudio.tsx`, `components/waveform/WaveformRenderer.tsx` | Record Scene owns live camera preview. Edit Studio mounts the F1 AppKit overlay host, not an HTML `<video>` element. F2 can composite/encode offscreen. Ripple cuts persist through `project.json`. Export starts a native H.264/AAC job (E4). Silence *detection* remains synthetic (S1). |
+| App packaging | `src-tauri/tauri.conf.json`, `src-tauri/capabilities/default.json`, `src-tauri/Info.plist` | Current CSP is null. The hidden `camera_overlay` window is a separate root to verify. Signed permission behavior is not established by a development launch. |
+
+**Frontend tracking warning:** `git ls-files --stage front-end` currently reports a mode `160000` submodule entry, but this checkout has no `front-end/.git`. Therefore the parent diff may omit frontend edits. Before a frontend delivery, inventory changed files explicitly and preserve a reviewable patch or equivalent artifact. Diagnose the intended submodule remote/history before repairing metadata; do not delete the directory, replace the gitlink, or reset the checkout just to make status look clean.
+
+**Dependency warning:** FFmpeg bindings and native Windows adapters are architectural targets, not installed implementations. F2 pinned `wgpu 27.0.1` and used VideoToolbox for decode/encode. Choose/pin FFmpeg through a recorded packaging/license review. Do not guess APIs from this document or install several competing media stacks.
+
+### 10.3 Invariants to apply in every work package
+
+| Topic | Required rule | Concrete example or failure to reject |
+| --- | --- | --- |
+| Time units | Use integer microseconds for source/edited time; keep rational native PTS separately. Convert milliseconds only at the UI boundary. | `durationMs: 400` means `400_000` microseconds, not 400. Never use file modification time as media time. |
+| Track identity | Use manifest track IDs and a deliberate serialization adapter. | Current bundle IDs are `screen`, `webcam`, `system`, `mic`; Rust audio track-type values are `system_audio`/`mic_audio`, while UI aliases differ. Do not infer type from display labels. |
+| Time mapping | Map edited time to source time once, then select each track's segment at that source instant. | With retained `[0,2s)` and `[5s,10s)`, edited `2s` maps to source `5s`; edited `2.5s` maps to `5.5s`. |
+| Endpoints | Use half-open media intervals; end-of-playback is a state, not another decodable frame. | The exact edited duration may position a UI playhead, but must not request a sample at the exclusive source end. |
+| Native clocks | Preserve original timestamp/timebase and source-relative host anchor; distinguish original sample PTS from container-rebased PTS. | Do not subtract a raw capture PTS from a decoder PTS unless a measured mapping establishes that they share a timebase and origin. Unknown legacy anchors remain unknown. |
+| Missing media | Represent gaps separately from valid silence and valid black frames. | A missing mic file is not evidence of silence suitable for an automatic cut. A late webcam must stay hidden until its first available sample. |
+| Project mutation | Source media is immutable. Changes to edits, caches and recovery each need their own explicit ownership. | Opening a browser should not invoke a repairing journal writer or create a telemetry logger as a side effect. |
+| Failure | Return a typed error and keep previously usable state. | A failed export cannot overwrite an earlier export; a failed Stop cannot display a sample session as the new recording. |
+| Resource bounds | Declare numeric queue, cache, file and input limits in code/config and test them. Values need measured tuning. | Avoid `read_to_string` on unlimited JSONL or loading an hour of PCM into React. Return only viewport-sized waveform data. |
+| Cursor | Respect `cursorMode`; missing shape/visibility is unknown. | With `baked`, the captured cursor is already in the screen pixels. Do not draw another cursor. |
+| Compatibility | Validate versions at the boundary and migrate only with an explicit rule. | Never parse v2 telemetry as the old TypeScript `kind: "click"` interface or silently rewrite unknown project versions. |
+
+### 10.4 Foundation and native qualification work packages
+
+#### H1 — Close recording persistence and lifecycle gaps
+
+**Read:** Sections 3.1, 3.3, 3.8–3.9; native segment evidence; active native/Rust Stop and Pause paths.
+
+**Implement/verify in order:** identify which thread owns each writer; verify pause finalizes native segments before acknowledgment; verify resume starts fresh segments; trace commit failure into session diagnostics and Stop; retain recoverable ownership after preparation/finalization failure; verify retries do not turn an earlier failure into false success. Audit native and non-native publication methods for no-overwrite, sync ordering and error propagation. Do not restore Stop's removed salvage scan.
+
+**Output:** targeted lifecycle/failure tests plus a repeatable hardware recording procedure. **Pass:** finalized segments decode independently; a forced termination preserves prior commits; injected sync/journal/finalization failure returns an error; pause boundaries and late tracks preserve source time. The 60-minute four-track skew/memory/drop gate remains separate from a short smoke test.
+
+#### H2 — Qualify telemetry before trusting automatic zooms
+
+**Read:** Section 3.2, `MOUSE_TELEMETRY_INTEGRATION.md`, native hook and v2 schema.
+
+**Implement/verify in order:** exercise explicit permission grant/denial/revocation; confirm ordinary recording remains available; align visible physical clicks with media; move a window across negative-origin/mixed-DPI displays; establish source content/crop transforms; test event-tap timeout, user disable, overflow and shutdown. Preserve the current 100 ms geometry uncertainty intervals until a more precise adapter has measured evidence.
+
+**Output:** a supported-source capability matrix and reproducible evidence. **Pass:** no double cursor, no button provenance invented across a gap, bounded memory and no callbacks after teardown. Application capture and missing window physical transforms remain unsupported/uncertain until implemented and measured. Do not add keystroke collection to infer “typing interest.”
+
+#### H3 — HUD-only window and shared settings
+
+**Read:** Section 3.4, `front-end/src/main.tsx`, `src-tauri/tauri.conf.json`, `settingsStore.ts` and native camera ownership. The current `main.tsx` mounts `App` unconditionally; the configured secondary window is not evidence that a HUD-only root exists.
+
+**Sequence:** select the UI root from verified window identity before mounting → create a HUD-only component → expose Rust-owned revisioned settings/snapshots → test reconnect/stale updates → attach the F1-qualified native preview surface to the existing camera capture session → verify capture exclusion and hit testing. Do not create another camera capture session or a second recording state machine for the overlay.
+
+**Acceptance:** opening/reloading `camera_overlay` mounts only the HUD, changing settings in either window converges to one revision, dropped events trigger snapshot recovery, camera device removal is visible, and closing the HUD does not stop source recording. Qualify transparent corners, focus and self-exclusion on real platforms; use the Section 3.4 fallback if exclusion/embedding cannot be established.
+
+#### F1 — Minimal native preview feasibility spike
+
+**Status:** `contract-tested` on 2026-09-08 for the macOS AppKit child-overlay spike (fixed frame, one in-process H.264 fixture, geometry/hit/lifetime contracts). Not hardware-qualified. Windows is open. Evidence: [F1_NATIVE_PREVIEW.md](F1_NATIVE_PREVIEW.md).
+
+**Prerequisite:** a small, actually decodable recording fixture; Sections 3.5 and Phase 0. Implemented modules: `src-tauri/src/playback/preview.rs`, `src-tauri/src/playback/native.rs`, `src-tauri/native/macos/AeroShootPreview.swift`, `front-end/src/components/canvas/NativePreviewHost.tsx`.
+
+**Sequence:** first embed an owned native view and draw a fixed frame; next attach one decoded screen stream; then prove resize/backing-scale/occlusion and lifetime handling; then test the hidden HUD window and transparent hit regions. Measure copies, memory and view placement. Keep the spike small enough to discard without rewriting the editor.
+
+**Output:** an architecture decision recording the chosen native surface arrangement, ownership/thread rules, tested OS/device, measurements and failure modes. **Pass:** the view tracks the React viewport without intercepting unrelated controls; close/reopen leaves no dangling view or callback. A video visible in a browser alone does not close this native gate. Windows needs its own experiment; macOS success does not qualify Windows. Live Tauri/React tracking was not run in this evidence set; do not promote F1 to `hardware-qualified` from the synthetic contracts.
+
+#### F2 — Decoder, compositor and encoder interoperability
+
+**Status:** `contract-tested` on 2026-09-08 for a macOS VideoToolbox decoder/encoder plus a WGPU 27 offscreen compositor. Not hardware-qualified. FFmpeg is unpinned. Evidence: [F2_MEDIA_INTEROP.md](F2_MEDIA_INTEROP.md).
+
+**Prerequisite:** F1 and the media dependency policy in Section 3.7. Implemented modules: `src-tauri/src/media/`, `src-tauri/src/render/`, `src-tauri/native/macos/AeroShootMedia.swift`.
+
+**Sequence:** select one decoder interface with owned timestamped frames; pin the actual dependency build; decode real segmented H.264 and PCM; feed one WGPU scene to preview and an encoder; verify color interpretation, output dimensions and timestamps; measure any required copies and concurrent encoder limits. Record software fallback settings only after testing them.
+
+**Output:** a minimal styled preview/export pair plus dependency/version/build-flag records. **Pass:** independently decoded exported frames match the preview reference within a stated tolerance; resource counts stay bounded. Keep packaging/license obligations open until reviewed against the chosen binary configuration. This spike did not pin FFmpeg, convert to Rec.709, or qualify Windows.
+
+### 10.5 E1 — Open real project metadata and build the segment index (implemented, contract-tested)
+
+**Status:** `contract-tested` on 2026-09-08. Hardware-qualified native playback is out of scope. Evidence: [E1_PROJECT_METADATA.md](E1_PROJECT_METADATA.md).
+
+**Scope:** shared project loading and honest editor state. This can proceed while native rendering gates are open. Do not implement a second renderer in this package.
+
+1. Inspect `StopRecordingResult`: it currently returns only `sessionId`, `state`, and `durationUs`, with no project path or handle. Extend the successful response with a resolvable project identity/handle (or add a session-to-project lookup), preserving repeated-Stop results and updating IPC tests. Do not reconstruct the recording directory in React from a guessed path. Define a registered project-open command and owned project handle. **Proposed names:** `open_project`, `close_project`, `OpenedProject`; reuse equivalent existing contracts if they have appeared since this revision.
+2. Under `src-tauri/src/project/`, add a bounded reader for manifest and committed journal metadata. The current `ProjectBundle::open_existing` acquires a writer lock and opens a potentially repairing journal; do not advertise it as a read-only inspection API without separating those behaviors. Reject unsafe paths, unsupported versions and active-writer conflicts according to an explicit ownership policy.
+3. Build a per-track, source-time segment index from committed/recovered records. Preserve relative path, source interval, format, container timestamps and known clock anchors. Sort and validate; expose missing/conflicting entries as diagnostics. Do not treat directory listing order or a track's `relative_path` directory as the playable index.
+4. Define the actual serialized DTO in Rust first, then update `lib/types.ts` and `lib/ipc.ts`. Include project identity/revision, manifest, track/segment summaries, source duration, retained intervals and diagnostics. Large indexes should be paged or queried, not copied through every UI update. Proposed command arguments should use a project handle after the initial user-selected path.
+5. Change `useRecording.ts` to open the successful Stop result's real project. Return an explicit success/failure outcome to `RecordScene`; switch scenes only on success. Load actual metadata into `projectStore.ts`. Remove automatic sample population in `App.tsx` for ordinary desktop sessions; an explicit demo mode may retain fixtures.
+6. Give an empty/new project an empty editor. Give missing media a visible unavailable state. Until E3 is ready, show “preview unavailable” rather than the current live camera or invented recording pixels. Keep Export/AI controls disabled when their backend operation is unavailable.
+
+**Acceptance:** open two different bundles with different track counts/durations and observe different editor state; close/reopen restores the same metadata; failed Stop stays out of a falsely successful Edit state; malformed/escaping paths fail without mutation; absent optional tracks create no fabricated rows. Test the real serialized command boundary, not just a helper returning a hand-built object.
+
+### 10.6 E2 — Real waveform cache and channel-aware audio reads (implemented, contract-tested)
+
+**Status:** `contract-tested` on 2026-09-08. Native compositor F2 is contract-tested. Evidence: [E2_WAVEFORM_CACHE.md](E2_WAVEFORM_CACHE.md).
+
+**Prerequisite:** E1's segment index (implemented). **Read:** Section 3.6, `dsp/silence.rs`, `WaveformRenderer.tsx`, `TimelineStudio.tsx`. Implemented in `src-tauri/src/project/pcm.rs` and `src-tauri/src/project/waveform.rs`.
+
+1. Read validated WAV headers and supported PCM formats from real files; report unsupported encodings. Stream sample frames in bounded chunks. Preserve each segment's source offset, sample rate and channel count. Do not assume every WAV is 16-bit mono or every segment lasts exactly two seconds.
+2. Compute per-channel peak and RMS buckets with sample-frame boundaries. For a bucket of N samples in one channel, `peak = max(abs(x))` and `RMS = sqrt(sum(x*x)/N)`. A stereo frame contains two samples but represents one time step. Do not average opposite-polarity channels before measuring energy.
+3. Store rebuildable cache levels under `cache/`, keyed by source identity, channel policy, bucket size and analysis version. A corrupt/stale cache should trigger recomputation, not source edits. Reuse the same PCM reader later for silence detection.
+4. Register a cancellable waveform query with project/track/range/resolution arguments. Fetch the visible time range at an appropriate cache level. Make gaps visibly distinct from low amplitude; map buckets through the shared retained intervals after cuts.
+5. Replace `generateSyntheticWaveform` in normal project loading. Adjust the waveform view so zero-amplitude/gap display is deliberate; its current minimum bar height is decorative, not proof of audio energy.
+
+**Acceptance:** zero PCM gives zero RMS/peak; a constant 0.5 channel gives RMS/peak 0.5; stereo `[a,-a]` remains energetic under the documented channel policy; a late segment starts at its actual source offset; a missing file is a gap; cache invalidation, cancellation and long input stay bounded. A 48 kHz frame index of 48,000 is one second regardless of channel count.
+
+### 10.7 E3 — Synchronized playback, seek and basic timeline edits (implemented, contract-tested)
+
+**Status:** `contract-tested` on 2026-09-08 for the playback owner, seek plans, clock policy, bounded working set, and edit revisions. F1 overlay, F2 interop, and E4 mux are contract-tested; native decode, stereo audio-device playback and AppKit presentation are implemented; sustained device qualification remains open. Evidence: [E3_PLAYBACK_EDITS.md](E3_PLAYBACK_EDITS.md).
+
+**Prerequisites:** E1/E2 (implemented). F2 compositor and native playback worker are integrated; sustained device performance still needs qualification. Start with one screen track; add webcam and both audio tracks only after basic seeking works.
+
+1. Add a native playback owner with explicit `closed`, `ready`, `playing`, `paused`, `seeking`, `ended`, `error` states. Give each open/seek a generation identifier; discard stale decoder results after a new seek or project switch.
+2. Use the shared Rust evaluator to map edited time to source time and select segments. Seek to a preceding keyframe, then decode to the requested presentation time. Keep a bounded decoder/file working set. Do not instantiate one decoder per segment in the entire project.
+3. Use the native audio playback clock when audio is present and a defined monotonic fallback when all audio is absent. Publish throttled positions/status to React. Replace the authoritative `requestAnimationFrame` clock in `useTimeline.ts`; UI interpolation may smooth display but cannot determine media offsets.
+4. Draw screen and webcam into the selected native compositor; apply the missing-track policies in Section 3.8. Separate live recording preview from opened-project playback in `StudioCanvas`/`EditStudioScene`.
+5. Define and persist a versioned `project.json` edit revision with validated retained source intervals and basic layout. Implement trims/ripple cuts/undo/redo in Rust, then return a new revision. Reject stale revision writes; one interval list applies to all synchronized tracks.
+
+**Acceptance:** the retained-interval example in 10.3 holds exactly at cuts; all tracks seek together; repeated seek/project switching cannot show an older frame; project reopen preserves edits; undo restores prior content with a new revision ID; missing mic does not stall the clock; no decoder request uses the exclusive end sentinel. Measure seek latency and maximum open files over thousands of segments.
+
+### 10.8 E4 — Basic export and preview parity (implemented, contract-tested)
+
+**Status:** `contract-tested` on 2026-09-08 for an immutable-revision MP4 H.264/AAC job that samples the same timeline/scene evaluator as preview. Synthetic 1080p output and explicit Rec.709 tagging are tested; sustained throughput, calibrated color and Windows remain unqualified. Evidence: [E4_EXPORT.md](E4_EXPORT.md).
+
+**Prerequisites:** E3 and F2. **Initial format:** MP4 H.264 video/AAC audio under the existing plan, not ProRes despite the former placeholder alert.
+
+1. Capture an immutable edit revision and export settings into a native job. Reject source paths as output destinations; use a temporary output and a deliberate collision policy.
+2. At each rational output frame time, call the same timeline/scene evaluator as preview. Render the resulting native frame and mix/resample source audio through the same retained intervals. Keep PTS/DTS and encoder delay handling explicit.
+3. Expose job ID, progress, cancellation and typed failure. Throttle UI events. On success, finalize/validate/sync and publish the output; on cancel/error, preserve source media and any previous output.
+4. Wire the existing Export button to this job and show the actual result. Disable unsupported codec/settings choices. Add basic background/webcam layout parity before advanced effects.
+
+**Acceptance:** decode the produced file, compare representative frames at cuts/zooms/gaps against the preview reference, and verify audio duration/alignment. Cancellation, destination collision, disk failure and project edits during export cannot alter the captured revision or source files. Document color/codec comparison tolerances and measured throughput.
+
+### 10.9 Z1/Z2 — Telemetry-driven zoom suggestions and editing
+
+**Z1 prerequisites:** E1 metadata contracts (now implemented); H2 limitations must be respected. Pure parser/algorithm tests can precede E3. **Z2 prerequisites:** E3/E4 shared scene evaluation.
+
+1. Implement a bounded, version-aware reader. V1 uses top-level `kind`; v2 uses `payload.kind`. Native v2 disk records use snake_case and omit the FFI-only `record` wrapper. Gap events may have no coordinates or geometry. Recover only a partial final JSONL line; report corrupt interior lines and unknown versions.
+2. Build interest events from known button-down transitions and dwell intervals. Reset held-button knowledge across gaps; do not double-count a v1 click and a guessed transition. Ignore off-source coordinates, unsupported geometry and uncertainty intervals when generating targets. Do not clamp an off-source event into an artificial edge click.
+3. Make clustering/dwell/merge thresholds explicit configuration. Use deterministic time/space grouping, tie-breaking and stable IDs. Define a maximum zoom, minimum hold time, transition duration and viewport bounds policy. Record generation version/config with suggestions so regeneration is reproducible.
+4. Produce source-anchored zoom suggestions with references to contributing events. Generate smooth cubic Bézier transitions through a pure evaluator. Cuts retain the explicit discontinuity policy from Section 3.8; a suggested trajectory must not interpolate through removed time.
+5. Z2: let users accept, move, resize and delete suggestions with undo/redo. Persist edits; distinguish manual keyframes from generated suggestions so regeneration cannot silently overwrite manual work. Preview and export consume the same evaluated transform.
+
+**Acceptance:** identical input/config yields identical output; empty/denied/gapped telemetry does not fabricate zooms; auxiliary buttons and rapid clicks follow the declared interest policy; a cut through a zoom has the same result in preview and export. Clamp the camera viewport when necessary, not the original recorded coordinates. No ML service or remote upload is needed for this deterministic first version.
+
+#### A1 — Advanced canvas and webcam styling
+
+**Prerequisites:** E3/E4. Promote the existing inspector controls into validated, revisioned scene parameters: background, padding, aspect ratio, corner radius, shadow and webcam placement/shape/mirror. Apply every parameter through the shared native scene evaluator; CSS changes alone affect only the controls/preview shell. Import wallpaper assets into a validated project asset store with size/path limits instead of depending on external URLs during export.
+
+**Acceptance:** save/reopen and undo preserve styling; wide/portrait/square outputs fit the intended source without accidental stretching; webcam mirroring affects the selected compositing layer only; representative preview/export frames match for all supported shapes and backgrounds. Keep unsupported effects disabled until they render in both paths. Do not add HDR, ProRes or new cursor replacement capabilities as styling shortcuts.
+
+### 10.10 S1 — Real silence suggestions and reversible cuts
+
+**Prerequisites:** E2 PCM reader and E3 revision/interval edits. `detect_silence` in `src-tauri/src/lib.rs` currently generates synthetic samples; replace that command path, not only the DSP helper.
+
+1. Accept project/track/channel policy and analysis settings, then stream real audio. Extend the current mono detector with explicit sample-frame timing and validation for supported sample rates/configuration. Prevent zero window/step sizes and reject non-finite thresholds.
+2. Preserve detector state across contiguous segment/chunk boundaries. Reset across missing data or discontinuities. Return source-time suggestions and diagnostics; padding shrinks the proposed silence removal to protect speech edges.
+3. Preview suggestions in the existing modal. Applying selected cuts makes one revision through the shared interval editor; do not append independent excluded frontend ranges to every track. Undo restores the previous retained intervals.
+
+**Acceptance:** a silent run crossing two contiguous WAV files is detected once; a missing file is not classified as silence; opposite-polarity stereo retains energy; selected channel timing is correct; all tracks ripple together and reopen preserves the result. Filler-word recognition and speech transcription remain deferred features.
+
+### 10.11 W1–W3 — Windows adapter sequence
+
+These are proposed files/modules: `src-tauri/native/windows/WGCBridge.cpp`, companion WASAPI/Media Foundation adapters and `src-tauri/src/capture/windows.rs`. Keep dependencies/build logic target-gated in `build.rs` and Cargo; macOS must still build without Windows SDK libraries.
+
+| Package | Ordered work | Required output and evidence |
+| --- | --- | --- |
+| W1: screen vertical slice | Establish C ABI ownership and QPC/session-clock mapping → enumerate/select a real display or window → WGC frame pool/D3D11 resources → hardware MFT probe → encode one video track → shared segment publication. | Real decodable recording plus consent, selected-window close/minimize/resize, GPU-loss and Stop-failure tests on Windows x64. Never broaden window capture into full-display capture silently. |
+| W2: synchronized optional tracks | Add WASAPI mic → loopback including idle endpoint → Media Foundation webcam → explicit gaps/device loss → pause/drain/stop across all tracks. | Four-track timing test, no-audio startup, silence-to-audio return, endpoint removal and long-session skew/memory/drop report. Source clock must advance when no audio packets arrive. |
+| W3: telemetry, preview and packaging parity | Add bounded mouse-hook thread/geometry conversions → native preview surface and compositor interop → export parity → packaging smoke tests. | Mixed-DPI/negative-origin tests, stationary-cursor capability decision, callback shutdown tests and the Windows equivalents of F1/F2/E4. Missing ARM64 hardware leaves ARM64 unqualified. |
+
+Reuse shared commands, schemas, timeline and commit semantics. Do not create a separate Windows project format or editor. Confirm that the shared publication primitive and directory durability implementation actually work on the target filesystem; compiling the Rust interface is insufficient.
+
+### 10.12 R1 — Performance, security and distribution
+
+**Prerequisites:** functional capture, preview and export slices. Separate application changes from qualification artifacts.
+
+1. Pin toolchains/dependencies and record reproducible native build commands. Add CI for shared contracts, frontend build and desktop feature builds on supported runners. Run real-device tests outside hosted CI where capture/permission/GPU behavior requires it.
+2. Define a capability report and test 1080p30 first, then candidate 1080p60/4K modes. Record actual encoder selection, concurrent-track load, memory/open-file peaks, dropped frames, disk bandwidth and thermal behavior. Disable modes with no qualifying result rather than exposing a blanket “4K60 supported” setting.
+3. Set a deliberate CSP and project-scoped media access policy, audit both window roots/capabilities, and test untrusted bundles. Review dependency build flags/notices and the chosen distribution obligations before packaging.
+4. Build signed/notarized macOS and signed Windows artifacts through the approved release workflow. Test installation, launch, permissions, capture, reopen, export and uninstall on clean target machines. Do not log or upload private media/telemetry by default.
+
+**Acceptance:** each shipping OS/architecture/mode has a linked result and reproducible artifact; unsupported modes have an honest UI state. Signing, distribution approval and external publication follow the user's release authorization; local implementation and build work do not require an invented approval checkpoint.
+
+### 10.13 Validation commands, evidence and handoff
+
+Run from the repository root unless stated otherwise. Run checks relevant to changed code; a documentation-only update needs link/symbol/consistency checks, not a native recording.
+
+```sh
+# Shared tests; on macOS the normal build also links the real Swift bridge.
+cargo test --manifest-path src-tauri/Cargo.toml
+
+# Desktop-feature type/build check; does not launch the app or prove capture.
+cargo check --manifest-path src-tauri/Cargo.toml --features tauri-app
+
+# Synthetic native mouse contracts on macOS; installs no global event tap.
+sh script/test-mouse-telemetry.sh
+
+# Frontend type check + production build (execute in front-end/).
+npm run build
+
+# Whitespace / patch integrity.
+git diff --check
+```
+
+`AEROSHOOT_SKIP_SWIFT` bypasses the real bridge. Do not use a skipped/stubbed build as native evidence. Finish editing Swift inputs before starting their compile; the compiler rejects files modified during a build. `script/codex.sh start` launches Vite only, not the native desktop app. There is no general frontend test runner configured yet; add a focused harness when behavioral UI tests require one, and report what actually ran.
+
+For every completed package, append an evidence record to its relevant implementation note or a new named report:
+
+```text
+Work package ID / status:
+Commit + working-tree changes (including frontend tracking limitations):
+OS / architecture / device / SDK / compiler / dependency versions:
+Fixture or real capture provenance / recording configuration:
+Reproduction commands and manual steps:
+Expected outcome:
+Observed outcome and measured values:
+Artifact paths (local/private where appropriate):
+Checks not run and exact reason:
+Open gates / next smallest package:
+```
+
+Before handing off, confirm that the user-visible behavior reaches the new backend, errors remain visible, serialization agrees on both sides, and affected checks pass. Update the task status in one place and link the evidence; do not copy a stale test count into a new claim. Keep unresolved defects and platform limits explicit. If a choice is already fixed by this plan, follow it; if measurements require changing an architectural choice, record the alternatives, evidence and recovery/compatibility consequences before adopting it.
+
+
+## E1–E4 / F1–F2 review resolution — 2026-09-09
+
+The 14 correctness findings in REVIEW_E1_E4_F1_F2.md have code fixes and focused regression coverage. E1 preserves an open project on failed replacement. E2 safely publishes content-validated waveform caches and bounds viewport work. E3 now includes actual native decode/composition/audio playback, manual trim/delete controls and durable monotonic edit history. E4 streams resampled stereo audio, preserves the final fractional frame, validates native output and offers 720p/1080p/4K. F1 tracks scrolling and clips geometry/hits with generation-qualified lifetime. F2 preserves capture dimensions, handles local segment PTS and declares explicit SDR Rec.709.
+
+The frontend's broken gitlink was replaced with ordinary source entries in the index so these UI changes are recoverable. Changes remain uncommitted. Task-specific documents distinguish implemented behavior and automated tests from unqualified live desktop/device, sustained-load and Windows acceptance. Do not promote all packages to hardware-qualified based on the regression suite.

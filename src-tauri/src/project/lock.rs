@@ -23,6 +23,8 @@ pub struct ProjectLock {
     canonical_project_dir: PathBuf,
     lock_path: PathBuf,
     _file: File,
+    #[cfg(unix)]
+    _directory_lease: File,
 }
 
 impl ProjectLock {
@@ -30,9 +32,18 @@ impl ProjectLock {
     /// Fails if another thread in the current process or another OS process holds the lock.
     pub fn acquire<P: AsRef<Path>>(project_dir: P) -> Result<Self, LockError> {
         let p_ref = project_dir.as_ref();
-        let canonical_dir = p_ref
-            .canonicalize()
-            .unwrap_or_else(|_| p_ref.to_path_buf());
+        let canonical_dir = p_ref.canonicalize().unwrap_or_else(|_| p_ref.to_path_buf());
+        #[cfg(unix)]
+        let directory_lease = File::open(&canonical_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::flock(directory_lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
+                != 0
+            {
+                return Err(LockError::AlreadyLocked { pid: 0 });
+            }
+        }
         let lock_path = canonical_dir.join(".lock");
 
         // 1. In-process check: ensure no other thread in this process holds the lock
@@ -90,6 +101,8 @@ impl ProjectLock {
             canonical_project_dir: canonical_dir,
             lock_path,
             _file: file,
+            #[cfg(unix)]
+            _directory_lease: directory_lease,
         })
     }
 }

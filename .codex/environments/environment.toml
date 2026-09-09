@@ -19,3 +19,9 @@ command = "./script/codex.sh start"
 name = "Stop"
 icon = "tool"
 command = "./script/codex.sh stop"
+
+[[actions]]
+name = "Build"
+icon = "tool"
+command = "./script/build.sh"
+

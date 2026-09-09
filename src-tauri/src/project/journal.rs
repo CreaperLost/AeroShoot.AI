@@ -135,10 +135,7 @@ impl ProjectJournal {
             .open(&path)?;
 
         let existing_records = Self::read_records_from_path(&path)?;
-        let next_seq = existing_records
-            .last()
-            .map(|r| r.seq() + 1)
-            .unwrap_or(0);
+        let next_seq = existing_records.last().map(|r| r.seq() + 1).unwrap_or(0);
 
         Ok(Self {
             path,
@@ -195,7 +192,9 @@ impl ProjectJournal {
         Self::read_records_from_path(&self.path)
     }
 
-    pub fn read_records_from_path<P: AsRef<Path>>(path: P) -> Result<Vec<JournalRecord>, JournalError> {
+    pub fn read_records_from_path<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Vec<JournalRecord>, JournalError> {
         let p = path.as_ref();
         if !p.exists() {
             return Ok(Vec::new());
@@ -271,7 +270,11 @@ mod tests {
         // Write a valid record followed by a truncated partial record without newline
         let valid_record = r#"{"type":"pause_started","seq":0,"t_us":1000}"#;
         let truncated_tail = r#"{"type":"segment_committed","seq":1,"track_id":"scre"#;
-        std::fs::write(&journal_path, format!("{}\n{}", valid_record, truncated_tail)).unwrap();
+        std::fs::write(
+            &journal_path,
+            format!("{}\n{}", valid_record, truncated_tail),
+        )
+        .unwrap();
 
         // Reopening journal should repair the tail
         let journal = ProjectJournal::open_or_create(dir.path()).unwrap();
@@ -285,7 +288,10 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(s2, 1, "Repaired journal should sequence after valid records");
+        assert_eq!(
+            s2, 1,
+            "Repaired journal should sequence after valid records"
+        );
 
         // Reading all should return exactly the 2 valid records without corrupt line errors
         let records = journal.read_all().unwrap();

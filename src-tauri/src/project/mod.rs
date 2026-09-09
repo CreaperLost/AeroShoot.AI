@@ -2,15 +2,24 @@ pub mod journal;
 pub mod lock;
 pub mod manifest;
 pub mod media_validator;
+pub mod pcm;
+pub mod reader;
 pub mod recovery;
+pub mod revision;
 pub mod segment_writer;
+pub mod waveform;
 
 pub use journal::{JournalError, JournalRecord, ProjectJournal};
 pub use lock::{LockError, ProjectLock};
 pub use manifest::{ManifestError, PauseInterval, ProjectManifest, TrackDescriptor, TrackType};
 pub use media_validator::{MediaValidationError, MediaValidationInfo, MediaValidator};
+pub use reader::{
+    OpenedProject, ProjectReader, RetainedInterval, SegmentPage, SegmentSummary, TrackSummary,
+};
 pub use recovery::{ProjectRecoveryReport, RecoveryEngine, RecoveryError, TrackRecoveryReport};
+pub use revision::{EditDocument, EditHistory};
 pub use segment_writer::{SegmentCommitResult, SegmentWriterError, TrackSegmentWriter};
+pub use waveform::{WaveformPage, WaveformTrackContext};
 
 use std::fs;
 use std::path::{Path, PathBuf};

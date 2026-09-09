@@ -35,8 +35,8 @@ impl SyntheticCaptureStream {
 
     /// Generates next audio buffer presentation timestamp and sample count in microseconds.
     pub fn next_audio_chunk_us(&mut self, chunk_samples: u64) -> (u64, u64) {
-        let pts_us = (self.audio_sample_count as u128 * 1_000_000
-            / self.audio_sample_rate as u128) as u64;
+        let pts_us =
+            (self.audio_sample_count as u128 * 1_000_000 / self.audio_sample_rate as u128) as u64;
         let dur_us = (chunk_samples as u128 * 1_000_000 / self.audio_sample_rate as u128) as u64;
 
         self.audio_sample_count += chunk_samples;
@@ -68,11 +68,7 @@ pub fn make_mp4_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
 /// Generates a fully standard-compliant fragmented MP4 (fMP4) segment containing
 /// `ftyp`, `moov` (with `mvhd`, `trak`, and `mvex`), `moof` (with `mfhd`, `traf`, `tfhd`, `tfdt`, `trun`),
 /// and `mdat` with real sample payloads and keyframe/sync flags.
-pub fn generate_valid_fmp4_segment(
-    start_us: u64,
-    duration_us: u64,
-    is_keyframe: bool,
-) -> Vec<u8> {
+pub fn generate_valid_fmp4_segment(start_us: u64, duration_us: u64, is_keyframe: bool) -> Vec<u8> {
     let mut out = Vec::new();
 
     // 1. ftyp box (32 bytes)
@@ -94,7 +90,7 @@ pub fn generate_valid_fmp4_segment(
     mvhd_payload.extend_from_slice(&0x00010000u32.to_be_bytes()); // rate 1.0
     mvhd_payload.extend_from_slice(&0x0100u16.to_be_bytes()); // volume 1.0
     mvhd_payload.extend_from_slice(&[0u8; 10]); // reserved
-    // matrix 36 bytes (unity)
+                                                // matrix 36 bytes (unity)
     mvhd_payload.extend_from_slice(&0x00010000u32.to_be_bytes());
     mvhd_payload.extend_from_slice(&[0u8; 12]);
     mvhd_payload.extend_from_slice(&0x00010000u32.to_be_bytes());
@@ -322,11 +318,7 @@ pub fn generate_valid_fmp4_segment(
 }
 
 /// Generates a standard-compliant PCM WAV file with valid headers and sample data.
-pub fn generate_valid_wav_segment(
-    duration_us: u64,
-    sample_rate: u32,
-    channels: u16,
-) -> Vec<u8> {
+pub fn generate_valid_wav_segment(duration_us: u64, sample_rate: u32, channels: u16) -> Vec<u8> {
     let total_samples = ((duration_us as u128 * sample_rate as u128) / 1_000_000) as usize;
     let data_bytes = (total_samples * channels as usize * 2) as u32; // 16-bit PCM
     let riff_chunk_size = 36 + data_bytes;
@@ -359,6 +351,33 @@ pub fn generate_valid_wav_segment(
         }
     }
 
+    out
+}
+
+/// 16-bit PCM WAV from interleaved sample frames. Frame count is `samples.len() / channels`.
+pub fn generate_pcm16_wav(sample_rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
+    assert!(channels > 0);
+    assert_eq!(samples.len() % channels as usize, 0);
+    let data_bytes = (samples.len() * 2) as u32;
+    let riff_chunk_size = 36 + data_bytes;
+    let mut out = Vec::with_capacity(44 + samples.len() * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_chunk_size.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    let byte_rate = sample_rate * channels as u32 * 2;
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&(channels * 2).to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_bytes.to_le_bytes());
+    for sample in samples {
+        out.extend_from_slice(&sample.to_le_bytes());
+    }
     out
 }
 

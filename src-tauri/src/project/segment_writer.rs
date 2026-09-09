@@ -116,13 +116,83 @@ impl TrackSegmentWriter {
         self.current_seq
     }
 
+    /// Accept a finalized native container. The caller holds the project lease;
+    /// native writers surrender this path until publication has completed.
+    pub fn commit_native_segment(
+        &self,
+        temp_path: &Path,
+        index: u32,
+        host_anchor_us: i64,
+        timescale: u32,
+        media_start_value: i64,
+        journal: &ProjectJournal,
+    ) -> Result<SegmentCommitResult, SegmentWriterError> {
+        use crate::project::{manifest::ProjectManifest, media_validator::MediaValidator};
+        let invalid = |message: String| SegmentWriterError::Io(message);
+        if host_anchor_us < 0 || timescale == 0 {
+            return Err(invalid("Invalid native clock anchor".into()));
+        }
+        let filename = format!("{:06}.{}", u64::from(index) + 1, self.extension);
+        let relative_path = format!("media/{}/{}", self.track_id, filename);
+        let temp_relative = format!("{relative_path}.tmp");
+        ProjectManifest::validate_path_in_root(&self.project_dir, &temp_relative)
+            .map_err(|e| invalid(e.to_string()))?;
+        ProjectManifest::validate_path_in_root(&self.project_dir, &relative_path)
+            .map_err(|e| invalid(e.to_string()))?;
+        let expected = self.project_dir.join(&temp_relative);
+        if temp_path != expected || fs::symlink_metadata(temp_path)?.file_type().is_symlink() {
+            return Err(invalid("Unexpected native segment path".into()));
+        }
+        let info = MediaValidator::validate(temp_path, self.track_type)
+            .map_err(|e| invalid(e.to_string()))?;
+        if info.duration_us == 0 || !info.is_keyframe_start {
+            return Err(invalid(
+                "Native segment has no duration or independent start".into(),
+            ));
+        }
+        let start_us = host_anchor_us as u64;
+        let end_us = start_us
+            .checked_add(info.duration_us)
+            .ok_or_else(|| invalid("Native segment time overflow".into()))?;
+        File::open(temp_path)?.sync_all()?;
+        let destination = self.project_dir.join(&relative_path);
+        // Same-filesystem hard-link publication is atomic and never replaces
+        // an existing destination, including a dangling symlink.
+        fs::hard_link(temp_path, &destination).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                SegmentWriterError::DestinationAlreadyExists(destination.clone())
+            } else {
+                e.into()
+            }
+        })?;
+        fs::remove_file(temp_path)?;
+        #[cfg(unix)]
+        File::open(destination.parent().unwrap())?.sync_all()?;
+        journal.append(JournalRecord::SegmentCommitted {
+            seq: 0,
+            track_id: self.track_id.clone(),
+            relative_path: relative_path.clone(),
+            start_us,
+            end_us,
+            size_bytes: info.size_bytes,
+            is_keyframe_start: info.is_keyframe_start,
+            media_timescale: timescale,
+            media_start_value,
+            host_anchor_us,
+        })?;
+        Ok(SegmentCommitResult {
+            seq: u64::from(index) + 1,
+            relative_path,
+            start_us,
+            end_us,
+            size_bytes: info.size_bytes,
+        })
+    }
+
     /// Opens a new temporary segment file within the project directory tree.
     /// Exclusively creates temporary file and ensures current_seq is strictly unused.
     pub fn begin_segment(&mut self, start_us: u64) -> Result<PathBuf, SegmentWriterError> {
-        let track_dir = self
-            .project_dir
-            .join("media")
-            .join(&self.track_id);
+        let track_dir = self.project_dir.join("media").join(&self.track_id);
         fs::create_dir_all(&track_dir)?;
 
         // Find unused sequence ID
@@ -277,6 +347,79 @@ impl TrackSegmentWriter {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn native_commit_publishes_and_preserves_clock_and_collision() {
+        let dir = tempdir().unwrap();
+        let journal = ProjectJournal::open_or_create(dir.path()).unwrap();
+        let writer =
+            TrackSegmentWriter::new(dir.path(), "mic".into(), TrackType::MicAudio, "pcm".into());
+        fs::create_dir_all(dir.path().join("media/mic")).unwrap();
+        let temp = dir.path().join("media/mic/000001.wav.tmp");
+        let data = crate::fixtures::generate_valid_wav_segment(100_000, 48_000, 1);
+        fs::write(&temp, &data).unwrap();
+        let result = writer
+            .commit_native_segment(&temp, 0, 750_000, 48_000, 36_000, &journal)
+            .unwrap();
+        assert_eq!((result.start_us, result.end_us), (750_000, 850_000));
+        assert!(!temp.exists());
+        let records = journal.read_all().unwrap();
+        assert!(matches!(
+            &records[0],
+            JournalRecord::SegmentCommitted {
+                media_timescale: 48_000,
+                media_start_value: 36_000,
+                host_anchor_us: 750_000,
+                ..
+            }
+        ));
+        fs::write(&temp, &data).unwrap();
+        assert!(matches!(
+            writer.commit_native_segment(&temp, 0, 0, 48_000, 0, &journal),
+            Err(SegmentWriterError::DestinationAlreadyExists(_))
+        ));
+        assert_eq!(
+            fs::read(dir.path().join(&result.relative_path)).unwrap(),
+            data
+        );
+        assert_eq!(journal.read_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_commit_rejects_invalid_media_and_paths() {
+        let dir = tempdir().unwrap();
+        let journal = ProjectJournal::open_or_create(dir.path()).unwrap();
+        let writer =
+            TrackSegmentWriter::new(dir.path(), "mic".into(), TrackType::MicAudio, "pcm".into());
+        fs::create_dir_all(dir.path().join("media/mic")).unwrap();
+        let temp = dir.path().join("media/mic/000001.wav.tmp");
+        fs::write(&temp, b"invalid media").unwrap();
+        assert!(writer
+            .commit_native_segment(&temp, 0, 0, 48_000, 0, &journal)
+            .is_err());
+        assert!(writer
+            .commit_native_segment(&temp, 1, 0, 48_000, 0, &journal)
+            .is_err());
+        assert!(temp.exists());
+        assert!(journal.read_all().unwrap().is_empty());
+        #[cfg(unix)]
+        {
+            let external = tempdir().unwrap();
+            let source = external.path().join("source.wav");
+            fs::write(
+                &source,
+                crate::fixtures::generate_valid_wav_segment(100_000, 48_000, 1),
+            )
+            .unwrap();
+            fs::remove_file(&temp).unwrap();
+            std::os::unix::fs::symlink(&source, &temp).unwrap();
+            assert!(writer
+                .commit_native_segment(&temp, 0, 0, 48_000, 0, &journal)
+                .is_err());
+            assert!(source.exists());
+            assert!(journal.read_all().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn test_segment_writer_commit_order() {

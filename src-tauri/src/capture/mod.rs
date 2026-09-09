@@ -90,7 +90,12 @@ pub struct SourceRect {
 
 impl SourceRect {
     pub const fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// The whole rectangle from (0,0) with the given dimensions.
@@ -121,7 +126,10 @@ pub struct SourceGeometry {
 pub fn is_macos_14_plus() -> bool {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(output) = std::process::Command::new("sw_vers").arg("-productVersion").output() {
+        if let Ok(output) = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+        {
             if let Ok(text) = String::from_utf8(output.stdout) {
                 if let Some(major_str) = text.trim().split('.').next() {
                     if let Ok(major) = major_str.parse::<u32>() {
@@ -416,7 +424,10 @@ mod geometry_tests {
         let geometry = compute_source_geometry(&source, 1920, 1080, FitMode::Fit);
         assert_eq!(geometry.dest_rect.width, 1920);
         // Height is the limiting axis; expect a Y offset that centers.
-        assert!(geometry.dest_rect.y != 0, "wide source must produce a letterbox offset");
+        assert!(
+            geometry.dest_rect.y != 0,
+            "wide source must produce a letterbox offset"
+        );
         assert!(geometry.dest_rect.height < 1080);
     }
 

@@ -11,9 +11,20 @@ pub struct TimelineMapper {
 
 impl TimelineMapper {
     pub fn new(intervals: Vec<SourceInterval>) -> Self {
-        let mut sorted = intervals;
-        sorted.sort_by_key(|i| i.start_us);
-        Self { intervals: sorted }
+        Self::try_new(intervals).unwrap_or_else(|_| Self {
+            intervals: Vec::new(),
+        })
+    }
+
+    pub fn try_new(mut intervals: Vec<SourceInterval>) -> Result<Self, String> {
+        intervals.retain(|i| i.end_us > i.start_us);
+        intervals.sort_by_key(|i| i.start_us);
+        for pair in intervals.windows(2) {
+            if pair[1].start_us < pair[0].end_us {
+                return Err("Retained intervals must be non-overlapping".into());
+            }
+        }
+        Ok(Self { intervals })
     }
 
     pub fn intervals(&self) -> &[SourceInterval] {
@@ -25,7 +36,8 @@ impl TimelineMapper {
         self.intervals.iter().map(|i| i.duration_us()).sum()
     }
 
-    /// Maps an edited timeline position `edited_us` to the corresponding source recording timestamp `source_us`.
+    /// Maps an edited timeline position to source time for a decodable sample.
+    /// The exclusive edited duration is not a sample and returns `None`.
     pub fn edited_to_source_us(&self, edited_us: u64) -> Option<u64> {
         let mut accumulated_us: u64 = 0;
 
@@ -38,14 +50,72 @@ impl TimelineMapper {
             accumulated_us += dur;
         }
 
-        // Clamped to end of last interval if exact match at duration
-        if let Some(last) = self.intervals.last() {
-            if edited_us == accumulated_us {
-                return Some(last.end_us);
-            }
-        }
-
         None
+    }
+
+    /// Playhead may sit on the exclusive edited end; that must not be decoded.
+    pub fn playhead_source_us(&self, edited_us: u64) -> Option<u64> {
+        self.edited_to_source_us(edited_us)
+    }
+
+    /// Maps a half-open edited range onto source ranges without using the exclusive end as a sample.
+    pub fn edited_range_to_source(&self, start_us: u64, end_us: u64) -> Vec<(u64, u64)> {
+        let mut ranges = Vec::new();
+        let mut edited_cursor = 0u64;
+        for interval in &self.intervals {
+            let duration = interval.duration_us();
+            let interval_end = edited_cursor + duration;
+            let a = start_us.max(edited_cursor);
+            let b = end_us.min(interval_end);
+            if a < b {
+                let source_a = interval.start_us + (a - edited_cursor);
+                let source_b = interval.start_us + (b - edited_cursor);
+                ranges.push((source_a, source_b));
+            }
+            edited_cursor = interval_end;
+        }
+        ranges
+    }
+
+    /// Ripple-cuts a half-open edited range. One shared interval list applies to every track.
+    pub fn ripple_cut_edited(
+        &mut self,
+        edited_start_us: u64,
+        edited_end_us: u64,
+    ) -> Result<(), String> {
+        if edited_start_us >= edited_end_us {
+            return Err("Cut must be a half-open interval".into());
+        }
+        let duration = self.total_edited_duration_us();
+        if edited_end_us > duration {
+            return Err("Cut exceeds edited duration".into());
+        }
+        let source_ranges = self.edited_range_to_source(edited_start_us, edited_end_us);
+        for (start, end) in source_ranges {
+            self.apply_cut(start, end);
+        }
+        Ok(())
+    }
+
+    /// Keeps only the half-open edited range `[start, end)`.
+    pub fn trim_edited(&mut self, edited_start_us: u64, edited_end_us: u64) -> Result<(), String> {
+        if edited_start_us >= edited_end_us {
+            return Err("Trim must be a half-open interval".into());
+        }
+        let duration = self.total_edited_duration_us();
+        if edited_end_us > duration {
+            return Err("Trim exceeds edited duration".into());
+        }
+        let kept = self.edited_range_to_source(edited_start_us, edited_end_us);
+        self.intervals = kept
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (a, b))| b > a)
+            .map(|(i, (start_us, end_us))| {
+                SourceInterval::new(format!("trim-{i}"), start_us, end_us)
+            })
+            .collect();
+        Ok(())
     }
 
     /// Maps a source recording timestamp `source_us` to its edited timeline position.
@@ -84,11 +154,8 @@ mod tests {
     #[test]
     fn test_timeline_mapping_and_ripple_cuts() {
         // Initial single 10-second interval: [0, 10_000_000)
-        let mut mapper = TimelineMapper::new(vec![SourceInterval::new(
-            "int-1".into(),
-            0,
-            10_000_000,
-        )]);
+        let mut mapper =
+            TimelineMapper::new(vec![SourceInterval::new("int-1".into(), 0, 10_000_000)]);
 
         assert_eq!(mapper.total_edited_duration_us(), 10_000_000);
         assert_eq!(mapper.edited_to_source_us(4_000_000), Some(4_000_000));
@@ -108,5 +175,24 @@ mod tests {
 
         // Cut region (e.g. source 3s) is excluded
         assert_eq!(mapper.source_to_edited_us(3_000_000), None);
+    }
+
+    #[test]
+    fn retained_example_and_exclusive_end_are_not_decoded() {
+        let mapper = TimelineMapper::try_new(vec![
+            SourceInterval::new("a".into(), 0, 2_000_000),
+            SourceInterval::new("b".into(), 5_000_000, 10_000_000),
+        ])
+        .unwrap();
+        assert_eq!(mapper.total_edited_duration_us(), 7_000_000);
+        assert_eq!(mapper.edited_to_source_us(2_000_000), Some(5_000_000));
+        assert_eq!(mapper.edited_to_source_us(2_500_000), Some(5_500_000));
+        assert_eq!(mapper.edited_to_source_us(7_000_000), None);
+        assert_eq!(mapper.edited_to_source_us(6_999_999), Some(9_999_999));
+
+        let mut cut = mapper.clone();
+        cut.ripple_cut_edited(1_000_000, 2_000_000).unwrap();
+        assert_eq!(cut.total_edited_duration_us(), 6_000_000);
+        assert_eq!(cut.edited_to_source_us(1_000_000), Some(5_000_000));
     }
 }

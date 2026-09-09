@@ -6,5 +6,9 @@
   <string>AeroShoot records the selected camera as a separate video track.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>AeroShoot records the selected microphone as a separate audio track.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>AeroShoot records the selected screen or window for your video project.</string>
+  <key>NSInputMonitoringUsageDescription</key>
+  <string>AeroShoot tracks mouse telemetry during screen recording.</string>
 </dict>
 </plist>

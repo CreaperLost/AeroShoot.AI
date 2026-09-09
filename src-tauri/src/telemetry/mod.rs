@@ -1,4 +1,5 @@
 pub mod event;
+pub mod native;
 
 pub use event::{GeometryRecord, TelemetryEvent, TelemetryKind};
 

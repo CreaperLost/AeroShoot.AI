@@ -118,17 +118,16 @@ public typealias CEncoderResultTuple = (Int32, Int32, CCharBuffer256)
 @available(*, unavailable, message: "C structs are passed via UnsafeMutableRawPointer at the @_cdecl boundary")
 public typealias CPermissionBundleTuple = (Int32, Int32, Int32)
 
-// Invoked after a segment is atomically committed. The track_id and file_path
-// C strings are heap-allocated via strdup; the Rust side MUST release them with
-// aeroshoot_macos_free_string after the callback returns.
+// Synchronously submit a finalized temporary segment to Rust persistence.
+// Strings are borrowed during the call; Swift frees them. Zero means committed.
 public typealias AeroShootSegmentCallback = @convention(c) (
   UnsafePointer<CChar>?,    // track_id ("screen" | "camera" | "system_audio" | "mic")
   Int64,                    // host_anchor_us
   Int32,                    // segment_index (0-based, monotonic per track per session)
   Int32,                    // timescale (e.g. 90000 for H.264 CMTime, 48000 for PCM)
   Int64,                    // media_start_value (media PTS of this segment's first sample)
-  UnsafePointer<CChar>?     // file_path (absolute, just-committed segment)
-) -> Void
+  UnsafePointer<CChar>?     // file_path (absolute, finalized temporary segment)
+) -> Int32
 
 // Asynchronous runtime errors from ScreenCaptureKit / AVFoundation. track_id may
 // be an empty string for session-level errors. The C strings are heap-allocated;
@@ -268,13 +267,136 @@ private func permissionState(for mediaType: AVMediaType) -> Int32 {
   }
 }
 
+// ScreenCaptureKit's shareable-content query presents a system dialog on
+// packaged macOS Sequoia/Tahoe apps — even after TCC is granted. Never use it
+// to *check* or *refresh* permission. Check with preflight / window titles;
+// request with CGRequestScreenCaptureAccess, which is the one-shot TCC prompt.
+private let g_screenAccessLock = NSLock()
+private var g_screenAuthorizedThisProcess = false
+
+private final class ShareableContentProbe {
+  private let lock = NSLock()
+  private var boxedContent: SCShareableContent?
+  private var boxedError: Error?
+
+  func set(_ content: SCShareableContent?, _ error: Error?) {
+    lock.lock()
+    boxedContent = content
+    boxedError = error
+    lock.unlock()
+  }
+
+  var content: SCShareableContent? {
+    lock.lock(); defer { lock.unlock() }
+    return boxedContent
+  }
+
+  var error: Error? {
+    lock.lock(); defer { lock.unlock() }
+    return boxedError
+  }
+
+  var finished: Bool {
+    lock.lock(); defer { lock.unlock() }
+    return boxedContent != nil || boxedError != nil
+  }
+}
+
+/// Other apps' window titles are only populated when Screen Recording TCC is granted.
+private func windowListIndicatesScreenAccess() -> Bool {
+  guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as NSArray? else {
+    return false
+  }
+  let myPID = Int32(ProcessInfo.processInfo.processIdentifier)
+  for case let window as NSDictionary in info {
+    let pid = (window[kCGWindowOwnerPID] as? NSNumber)?.int32Value ?? 0
+    if pid == 0 || pid == myPID { continue }
+    if let name = window[kCGWindowName] as? String, !name.isEmpty {
+      return true
+    }
+  }
+  return false
+}
+
+private func markScreenAuthorizedThisProcess() {
+  g_screenAccessLock.lock()
+  g_screenAuthorizedThisProcess = true
+  g_screenAccessLock.unlock()
+}
+
+private func screenAuthorizedThisProcess() -> Bool {
+  g_screenAccessLock.lock()
+  defer { g_screenAccessLock.unlock() }
+  return g_screenAuthorizedThisProcess
+}
+
+/// Non-prompting Screen Recording check. Must never call ScreenCaptureKit.
+private func peekScreenRecordingState() -> Int32 {
+  if screenAuthorizedThisProcess() || CGPreflightScreenCaptureAccess() || windowListIndicatesScreenAccess() {
+    markScreenAuthorizedThisProcess()
+    return AEROSHOOT_PERMISSION_AUTHORIZED()
+  }
+  return AEROSHOOT_PERMISSION_NOT_DETERMINED()
+}
+
+/// One-shot TCC request. Does not enumerate shareable content (that re-prompts).
+private func requestScreenRecordingAccess() -> Int32 {
+  let peeked = peekScreenRecordingState()
+  if peeked == AEROSHOOT_PERMISSION_AUTHORIZED() {
+    return peeked
+  }
+  var granted = false
+  if Thread.isMainThread {
+    granted = CGRequestScreenCaptureAccess()
+  } else {
+    let sem = DispatchSemaphore(value: 0)
+    DispatchQueue.main.async {
+      granted = CGRequestScreenCaptureAccess()
+      sem.signal()
+    }
+    _ = sem.wait(timeout: .now() + 120)
+  }
+  if granted {
+    markScreenAuthorizedThisProcess()
+    return AEROSHOOT_PERMISSION_AUTHORIZED()
+  }
+  return peekScreenRecordingState()
+}
+
+private func waitForShareableContent(timeout: TimeInterval) -> (SCShareableContent?, Error?) {
+  let probe = ShareableContentProbe()
+  let sem = DispatchSemaphore(value: 0)
+  let startQuery = {
+    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+      probe.set(content, error)
+      sem.signal()
+    }
+  }
+
+  if Thread.isMainThread {
+    startQuery()
+    let deadline = Date().addingTimeInterval(timeout)
+    while !probe.finished && Date() < deadline {
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+  } else {
+    DispatchQueue.main.async { startQuery() }
+    _ = sem.wait(timeout: .now() + timeout)
+  }
+  return (probe.content, probe.error)
+}
+
 private func screenRecordingState() -> Int32 {
-  // CGPreflightScreenCaptureAccess returns the current OS-level screen recording
-  // authorization, but does not surface "notDetermined" or "restricted" distinctly
-  // from "denied". Treat both the false case and any failure as DENIED, and fall
-  // back to NOT_DETERMINED only when the API is genuinely unavailable (older OS).
-  let granted = CGPreflightScreenCaptureAccess()
-  return granted ? AEROSHOOT_PERMISSION_AUTHORIZED() : AEROSHOOT_PERMISSION_DENIED()
+  peekScreenRecordingState()
+}
+
+private func writePermissionBundle(_ bundle: AeroShootPermissionBundle, to outBundle: UnsafeMutableRawPointer?) {
+  guard let raw = outBundle else { return }
+  // Store three packed Int32s. Do not assign a Swift struct through
+  // assumingMemoryBound — Swift struct ABI is not the C layout Rust expects.
+  raw.storeBytes(of: bundle.screen_recording, as: Int32.self)
+  raw.advanced(by: MemoryLayout<Int32>.size).storeBytes(of: bundle.camera, as: Int32.self)
+  raw.advanced(by: MemoryLayout<Int32>.size * 2).storeBytes(of: bundle.microphone, as: Int32.self)
 }
 
 private func currentPermissionBundle() -> AeroShootPermissionBundle {
@@ -372,37 +494,65 @@ private struct StatsDTO: Encodable {
 @_cdecl("aeroshoot_macos_free_string")
 public func aeroshootMacOSFreeString(_ pointer: UnsafeMutablePointer<CChar>?) { free(pointer) }
 
+private func coreGraphicsDisplaySources() -> [SourceDTO] {
+  var result: [SourceDTO] = []
+  var maxDisplays: UInt32 = 16
+  var activeDisplays = [CGDirectDisplayID](repeating: 0, count: Int(maxDisplays))
+  var displayCount: UInt32 = 0
+  if CGGetActiveDisplayList(maxDisplays, &activeDisplays, &displayCount) == .success {
+    for i in 0..<Int(displayCount) {
+      let dId = activeDisplays[i]
+      let width = CGDisplayPixelsWide(dId)
+      let height = CGDisplayPixelsHigh(dId)
+      result.append(SourceDTO(
+        id: "display:\(dId)",
+        name: "Display \(dId)",
+        sourceType: "display",
+        width: UInt32(max(0, width)),
+        height: UInt32(max(0, height))
+      ))
+    }
+  }
+  return result
+}
+
+private func sources(from content: SCShareableContent) -> [SourceDTO] {
+  var result: [SourceDTO] = []
+  result.append(contentsOf: content.displays.map {
+    SourceDTO(id: "display:\($0.displayID)", name: "Display \($0.displayID)", sourceType: "display", width: UInt32($0.width), height: UInt32($0.height))
+  })
+  let myPID = ProcessInfo.processInfo.processIdentifier
+  let myBID = Bundle.main.bundleIdentifier ?? ""
+  result.append(contentsOf: content.windows.compactMap {
+    if let app = $0.owningApplication, app.processID == myPID || (!myBID.isEmpty && app.bundleIdentifier == myBID) {
+      return nil
+    }
+    let app = $0.owningApplication?.applicationName ?? "Application"
+    let title = $0.title?.isEmpty == false ? $0.title! : "Untitled Window"
+    return SourceDTO(id: "window:\($0.windowID)", name: "\(app) — \(title)", sourceType: "window", width: UInt32(max(0, Int($0.frame.width))), height: UInt32(max(0, Int($0.frame.height))))
+  })
+  result.append(contentsOf: content.applications.compactMap {
+    if $0.processID == myPID || (!myBID.isEmpty && $0.bundleIdentifier == myBID) {
+      return nil
+    }
+    let display = content.displays.first
+    return SourceDTO(id: "application:\($0.bundleIdentifier)", name: $0.applicationName, sourceType: "application", width: UInt32(display?.width ?? 0), height: UInt32(display?.height ?? 0))
+  })
+  return result
+}
+
 @_cdecl("aeroshoot_macos_copy_sources_json")
 public func aeroshootMacOSCopySourcesJSON() -> UnsafeMutablePointer<CChar>? {
-  let semaphore = DispatchSemaphore(value: 0)
-  var result: [SourceDTO] = []
-  SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+  // Only enumerate via ScreenCaptureKit when preflight is already true.
+  // A speculative SCK query re-presents the system permission dialog on
+  // packaged Sequoia/Tahoe builds even after the user has granted access.
+  if CGPreflightScreenCaptureAccess() {
+    let (content, _) = waitForShareableContent(timeout: 8)
     if let content {
-      result.append(contentsOf: content.displays.map {
-        SourceDTO(id: "display:\($0.displayID)", name: "Display \($0.displayID)", sourceType: "display", width: UInt32($0.width), height: UInt32($0.height))
-      })
-      let myPID = ProcessInfo.processInfo.processIdentifier
-      let myBID = Bundle.main.bundleIdentifier ?? ""
-      result.append(contentsOf: content.windows.compactMap {
-        if let app = $0.owningApplication, app.processID == myPID || (!myBID.isEmpty && app.bundleIdentifier == myBID) {
-          return nil
-        }
-        let app = $0.owningApplication?.applicationName ?? "Application"
-        let title = $0.title?.isEmpty == false ? $0.title! : "Untitled Window"
-        return SourceDTO(id: "window:\($0.windowID)", name: "\(app) — \(title)", sourceType: "window", width: UInt32(max(0, Int($0.frame.width))), height: UInt32(max(0, Int($0.frame.height))))
-      })
-      result.append(contentsOf: content.applications.compactMap {
-        if $0.processID == myPID || (!myBID.isEmpty && $0.bundleIdentifier == myBID) {
-          return nil
-        }
-        let display = content.displays.first
-        return SourceDTO(id: "application:\($0.bundleIdentifier)", name: $0.applicationName, sourceType: "application", width: UInt32(display?.width ?? 0), height: UInt32(display?.height ?? 0))
-      })
+      return copiedCString(jsonString(sources(from: content)))
     }
-    semaphore.signal()
   }
-  _ = semaphore.wait(timeout: .now() + 10)
-  return copiedCString(jsonString(result))
+  return copiedCString(jsonString(coreGraphicsDisplaySources()))
 }
 
 private func devices(for mediaType: AVMediaType) -> [AVCaptureDevice] {
@@ -446,7 +596,7 @@ private func authorized(_ mediaType: AVMediaType) -> Bool {
 
 @_cdecl("aeroshoot_macos_copy_permissions_json")
 public func aeroshootMacOSCopyPermissionsJSON() -> UnsafeMutablePointer<CChar>? {
-  copiedCString(jsonString(PermissionsDTO(screenRecording: CGPreflightScreenCaptureAccess(), camera: authorized(.video), microphone: authorized(.audio))))
+  copiedCString(jsonString(PermissionsDTO(screenRecording: peekScreenRecordingState() == AEROSHOOT_PERMISSION_AUTHORIZED(), camera: authorized(.video), microphone: authorized(.audio))))
 }
 
 @_cdecl("aeroshoot_macos_request_permissions")
@@ -787,16 +937,17 @@ private func invokeSegmentCallback(
   segmentIndex: Int32,
   timescale: Int32,
   mediaStartValue: Int64
-) {
+) -> Int32 {
   g_stateLock.lock()
   let cb = g_segmentCallback
   g_stateLock.unlock()
-  guard let cb else { return }
-  guard let trackIdPtr = strdup(trackId) else { return }
-  guard let filePathPtr = strdup(filePath) else { free(trackIdPtr); return }
-  cb(trackIdPtr, hostAnchorUs, segmentIndex, timescale, mediaStartValue, filePathPtr)
+  guard let cb else { return -600 }
+  guard let trackIdPtr = strdup(trackId) else { return -600 }
+  guard let filePathPtr = strdup(filePath) else { free(trackIdPtr); return -600 }
+  let result = cb(trackIdPtr, hostAnchorUs, segmentIndex, timescale, mediaStartValue, filePathPtr)
   free(trackIdPtr)
   free(filePathPtr)
+  return result
 }
 
 private func invokeRuntimeErrorCallback(trackId: String, code: Int32, message: String) {
@@ -1160,11 +1311,10 @@ private final class BoundedTimestampLog {
 //      the writer
 //   3. validates the file (AVAsset track check for video, header check for
 //      audio)
-//   4. fsyncs the file
-//   5. atomically renames .tmp -> .<index>.<ext>
-//   6. fsyncs the parent directory
-//   7. invokes the segment callback
-//   8. opens a new writer for the next segment
+//   4. submits the finalized temporary file to Rust TrackSegmentWriter
+//   5. waits for validation, durable no-overwrite publication and journaling
+//   6. latches any persistence failure; the caller opens the next writer only
+//      after successful completion
 //
 // append() returns MediaAppendOutcome (Task 3). finish(timeout:) returns the
 // typed finalization tuple (Task 3).
@@ -1448,8 +1598,8 @@ private final class RotatingMediaWriter {
     }
   }
 
-  // Commit the current tmp file: finish writer, validate, fsync, rename, fsync
-  // parent dir, invoke segment callback. Metadata is captured from the first
+  // Finish and validate the temporary file, then submit it to Rust for durable
+  // publication and journaling. Metadata is captured from the first
   // sample of this segment, rather than reusing the track's session anchor.
   func commitSegment() -> AeroShootEncoderResult {
     lock.lock()
@@ -1495,35 +1645,20 @@ private final class RotatingMediaWriter {
       terminalFailure = failure
       return encoderResultFailed(code: failure.0, message: failure.1)
     }
-    // fsync file
-    guard fsyncFile(at: currentTmpPath) else {
-      let failure = (Int32(-6), "fsync failed for track \(trackId)")
-      terminalFailure = failure
-      return encoderResultFailed(code: failure.0, message: failure.1)
-    }
-    // atomic rename
-    if !atomicRename(from: currentTmpPath, to: currentFinalPath) {
-      let failure = (Int32(-7), "rename failed for track \(trackId)")
-      terminalFailure = failure
-      return encoderResultFailed(code: failure.0, message: failure.1)
-    }
-    // fsync parent directory
-    guard fsyncParentDirectory(of: currentFinalPath) else {
-      // The file is visible but the commit is not durable. It is deliberately
-      // not reported through the success callback, so Rust will not journal it.
-      let failure = (Int32(-8), "parent directory fsync failed for track \(trackId)")
-      terminalFailure = failure
-      return encoderResultFailed(code: failure.0, message: failure.1)
-    }
-    // Fire segment callback (Task 4 anchor data)
-    invokeSegmentCallback(
+    // Rust exclusively owns durable publication and journal ordering.
+    let commitStatus = invokeSegmentCallback(
       trackId: trackId,
-      filePath: currentFinalPath,
+      filePath: currentTmpPath,
       hostAnchorUs: currentHostAnchorUs,
       segmentIndex: Int32(currentIndex),
       timescale: currentMediaTimescale,
       mediaStartValue: currentMediaStartValue
     )
+    if commitStatus != 0 {
+      let failure = (commitStatus, "Rust segment commit failed for track \(trackId)")
+      terminalFailure = failure
+      return encoderResultFailed(code: failure.0, message: failure.1)
+    }
     return encoderResultOK()
   }
 
@@ -1702,6 +1837,7 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   private var systemTracker: PerTrackRecorder?
   private var cameraTracker: PerTrackRecorder?
   private var micTracker: PerTrackRecorder?
+  private var mouseHook: MouseHookMac?
   private var timestampLog: BoundedTimestampLog?
   private var rotationTimer: DispatchSourceTimer?
   private let segmentDurationSec: TimeInterval = 2.0
@@ -1777,6 +1913,10 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
       }
     }
 
+    let mouse = MouseHookMac(sourceID: config.sourceId, width: config.width, height: config.height,
+      epoch: sessionHostEpoch, offsetUs: config.sessionOffsetUs)
+    mouseHook = mouse
+    mouse.start()
     startRotationTimer()
     return encoderResultOK()
   }
@@ -2079,6 +2219,7 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
 
   func setPaused(_ value: Bool) {
     stateLock.lock(); paused = value; stateLock.unlock()
+    mouseHook?.setPaused(value)
   }
 
   // MARK: Stop (Task 3 typed outcomes)
@@ -2090,6 +2231,10 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     NotificationCenter.default.removeObserver(self)
     cameraSession?.stopRunning()
     var firstFailure: AeroShootEncoderResult?
+    if let error = mouseHook?.stop() {
+      firstFailure = encoderResultFailed(code: -700, message: error)
+    }
+    mouseHook = nil
     if let stream = stream {
       let semaphore = DispatchSemaphore(value: 0)
       var stopError: Error?
@@ -2172,91 +2317,83 @@ public func aeroshootCheckPermissions(_ outBundle: UnsafeMutableRawPointer?) {
   // but Swift's @_cdecl cannot return a Swift struct type. The ABI is
   // therefore exposed as:
   //   `void aeroshoot_check_permissions(AeroShootPermissionBundle* out_bundle)`
-  // and the Swift side writes the bundle into the caller-provided memory
-  // (which has identical layout on both sides). The Rust agent must bind to
-  // the out-pointer variant.
-  let b = currentPermissionBundle()
-  guard let raw = outBundle else { return }
-  raw.assumingMemoryBound(to: AeroShootPermissionBundle.self).pointee = b
+  // Three packed Int32 fields are written explicitly to match the Rust
+  // `#[repr(C)]` layout (Swift struct assignment is not C-ABI-safe).
+  writePermissionBundle(currentPermissionBundle(), to: outBundle)
 }
 
 @_cdecl("aeroshoot_request_permissions")
 public func aeroshootRequestPermissions(_ requestScreen: Bool, _ requestCamera: Bool, _ requestMicrophone: Bool, _ completion: AeroShootPermissionCompletion?) {
-  // Task 5: run all three prompts in parallel. Screen Recording is triggered
-  // by enumerating shareable content; the resulting -3801 error is a
-  // reliable signal of denial. The completion fires exactly once with the
-  // final bundle.
+  // Report current camera, microphone, and screen states. Screen Recording is
+  // requested with CGRequestScreenCaptureAccess (one-shot TCC), never by
+  // enumerating shareable content.
   let group = DispatchGroup()
-  var screenState = screenRecordingState()
+  var screenState = AEROSHOOT_PERMISSION_NOT_DETERMINED()
   var cameraState = permissionState(for: .video)
   var micState = permissionState(for: .audio)
   let lock = NSLock()
 
-  // Screen Recording: kick off the prompt by enumerating shareable content.
-  // The system only shows the prompt once; subsequent calls return the
-  // current grant status without re-prompting.
+  // Screen: never probe ScreenCaptureKit here. Check is silent; an explicit
+  // request uses CGRequestScreenCaptureAccess so a packaged app does not
+  // re-present the share-content dialog after the user has already granted.
   group.enter()
-  if !requestScreen || CGPreflightScreenCaptureAccess() {
-    screenState = AEROSHOOT_PERMISSION_AUTHORIZED()
-    group.leave()
+  if requestScreen {
+    DispatchQueue.global(qos: .userInitiated).async {
+      let state = requestScreenRecordingAccess()
+      lock.lock(); screenState = state; lock.unlock()
+      group.leave()
+    }
   } else {
-    // Triggering CGRequestScreenCaptureAccess alone is not sufficient on
-    // modern macOS; the canonical way to ask is to attempt an
-    // SCShareableContent query and observe the error code.
-    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
-      defer { group.leave() }
-      lock.lock(); defer { lock.unlock() }
-      if content != nil {
-        screenState = AEROSHOOT_PERMISSION_AUTHORIZED()
-      } else if let nsErr = error as NSError? {
-        if nsErr.code == -3801 {
-          screenState = AEROSHOOT_PERMISSION_DENIED()
-        } else {
-          screenState = AEROSHOOT_PERMISSION_DENIED()
+    lock.lock(); screenState = peekScreenRecordingState(); lock.unlock()
+    group.leave()
+  }
+
+  // Camera: only call requestAccess when still notDetermined.
+  group.enter()
+  if !requestCamera {
+    lock.lock(); cameraState = permissionState(for: .video); lock.unlock(); group.leave()
+  } else {
+    switch AVCaptureDevice.authorizationStatus(for: .video) {
+    case .authorized:
+      lock.lock(); cameraState = AEROSHOOT_PERMISSION_AUTHORIZED(); lock.unlock(); group.leave()
+    case .denied:
+      lock.lock(); cameraState = AEROSHOOT_PERMISSION_DENIED(); lock.unlock(); group.leave()
+    case .restricted:
+      lock.lock(); cameraState = AEROSHOOT_PERMISSION_RESTRICTED(); lock.unlock(); group.leave()
+    case .notDetermined:
+      DispatchQueue.main.async {
+        AVCaptureDevice.requestAccess(for: .video) { granted in
+          lock.lock(); cameraState = granted ? AEROSHOOT_PERMISSION_AUTHORIZED() : AEROSHOOT_PERMISSION_DENIED(); lock.unlock()
+          group.leave()
         }
-      } else {
-        screenState = AEROSHOOT_PERMISSION_DENIED()
       }
+    @unknown default:
+      lock.lock(); cameraState = AEROSHOOT_PERMISSION_UNKNOWN(); lock.unlock(); group.leave()
     }
-    // CGRequestScreenCaptureAccess is a legacy hook that some macOS versions
-    // honor; we call it as a belt-and-braces measure.
-    _ = CGRequestScreenCaptureAccess()
   }
 
-  // Camera.
+  // Microphone: only call requestAccess when still notDetermined.
   group.enter()
-  switch requestCamera ? AVCaptureDevice.authorizationStatus(for: .video) : .authorized {
-  case .authorized:
-    lock.lock(); cameraState = AEROSHOOT_PERMISSION_AUTHORIZED(); lock.unlock(); group.leave()
-  case .denied:
-    lock.lock(); cameraState = AEROSHOOT_PERMISSION_DENIED(); lock.unlock(); group.leave()
-  case .restricted:
-    lock.lock(); cameraState = AEROSHOOT_PERMISSION_RESTRICTED(); lock.unlock(); group.leave()
-  case .notDetermined:
-    AVCaptureDevice.requestAccess(for: .video) { granted in
-      lock.lock(); cameraState = granted ? AEROSHOOT_PERMISSION_AUTHORIZED() : AEROSHOOT_PERMISSION_DENIED(); lock.unlock()
-      group.leave()
+  if !requestMicrophone {
+    lock.lock(); micState = permissionState(for: .audio); lock.unlock(); group.leave()
+  } else {
+    switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    case .authorized:
+      lock.lock(); micState = AEROSHOOT_PERMISSION_AUTHORIZED(); lock.unlock(); group.leave()
+    case .denied:
+      lock.lock(); micState = AEROSHOOT_PERMISSION_DENIED(); lock.unlock(); group.leave()
+    case .restricted:
+      lock.lock(); micState = AEROSHOOT_PERMISSION_RESTRICTED(); lock.unlock(); group.leave()
+    case .notDetermined:
+      DispatchQueue.main.async {
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+          lock.lock(); micState = granted ? AEROSHOOT_PERMISSION_AUTHORIZED() : AEROSHOOT_PERMISSION_DENIED(); lock.unlock()
+          group.leave()
+        }
+      }
+    @unknown default:
+      lock.lock(); micState = AEROSHOOT_PERMISSION_UNKNOWN(); lock.unlock(); group.leave()
     }
-  @unknown default:
-    lock.lock(); cameraState = AEROSHOOT_PERMISSION_UNKNOWN(); lock.unlock(); group.leave()
-  }
-
-  // Microphone.
-  group.enter()
-  switch requestMicrophone ? AVCaptureDevice.authorizationStatus(for: .audio) : .authorized {
-  case .authorized:
-    lock.lock(); micState = AEROSHOOT_PERMISSION_AUTHORIZED(); lock.unlock(); group.leave()
-  case .denied:
-    lock.lock(); micState = AEROSHOOT_PERMISSION_DENIED(); lock.unlock(); group.leave()
-  case .restricted:
-    lock.lock(); micState = AEROSHOOT_PERMISSION_RESTRICTED(); lock.unlock(); group.leave()
-  case .notDetermined:
-    AVCaptureDevice.requestAccess(for: .audio) { granted in
-      lock.lock(); micState = granted ? AEROSHOOT_PERMISSION_AUTHORIZED() : AEROSHOOT_PERMISSION_DENIED(); lock.unlock()
-      group.leave()
-    }
-  @unknown default:
-    lock.lock(); micState = AEROSHOOT_PERMISSION_UNKNOWN(); lock.unlock(); group.leave()
   }
 
   // Fire the completion once all three have settled. The C contract states the
@@ -2264,7 +2401,7 @@ public func aeroshootRequestPermissions(_ requestScreen: Bool, _ requestCamera: 
   // async runtime. The C ABI for the completion takes a 3-Int32 homogeneous
   // struct by value, which is ABI-identical to passing three Int32s.
   DispatchQueue.global(qos: .userInitiated).async {
-    _ = group.wait(timeout: .now() + 30)
+    _ = group.wait(timeout: .now() + 125)
     completion?(screenState, cameraState, micState)
   }
 }

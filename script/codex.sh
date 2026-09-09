@@ -8,12 +8,14 @@ DEV_PORT="${AEROSHOOT_DEV_PORT:-1420}"
 
 show_usage() {
   cat <<'USAGE'
-usage: ./script/codex.sh <setup|start|stop>
+usage: ./script/codex.sh <setup|start|stop|build|install>
 
 Commands:
-  setup  Install the frontend dependencies from package-lock.json
-  start  Start the Vite development server in the foreground
-  stop   Stop this project's Vite server listening on port 1420
+  setup    Install the frontend dependencies from package-lock.json
+  start    Start the Vite development server in the foreground
+  stop     Stop this project's Vite server listening on port 1420
+  build    Build the production release of the application
+  install  Build and install the application to /Applications with stable code signing
 USAGE
 }
 
@@ -155,6 +157,10 @@ stop() {
   fi
 }
 
+build() {
+  exec bash "$ROOT_DIR/script/build.sh" "$@"
+}
+
 case "$MODE" in
   setup)
     setup
@@ -164,6 +170,14 @@ case "$MODE" in
     ;;
   stop)
     stop
+    ;;
+  build)
+    shift || true
+    build "$@"
+    ;;
+  install)
+    shift || true
+    exec bash "$ROOT_DIR/script/build.sh" --install "$@"
     ;;
   --help|help)
     show_usage

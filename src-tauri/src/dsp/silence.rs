@@ -86,7 +86,8 @@ impl SilenceDetector {
             let is_silent = dbfs < config.threshold_db;
 
             let window_center_sample = start_idx + window_size / 2;
-            let current_us = (window_center_sample as u128 * 1_000_000 / sample_rate as u128) as u64;
+            let current_us =
+                (window_center_sample as u128 * 1_000_000 / sample_rate as u128) as u64;
 
             if is_silent && !in_silence {
                 in_silence = true;
@@ -158,7 +159,8 @@ mod tests {
 
         // 1 sec active speech (sine wave, amplitude 0.5 ~ -6 dBFS)
         for i in 0..sample_rate {
-            let s = ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI) / sample_rate as f32).sin() * 0.5;
+            let s =
+                ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI) / sample_rate as f32).sin() * 0.5;
             samples.push(s);
         }
 
@@ -169,7 +171,8 @@ mod tests {
 
         // 1 sec active speech again
         for i in 0..sample_rate {
-            let s = ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI) / sample_rate as f32).sin() * 0.5;
+            let s =
+                ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI) / sample_rate as f32).sin() * 0.5;
             samples.push(s);
         }
 

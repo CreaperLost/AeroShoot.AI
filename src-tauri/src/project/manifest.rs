@@ -69,6 +69,9 @@ pub struct ProjectManifest {
     /// happens. See `crate::capture::SourceGeometry`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_geometry: Option<crate::capture::SourceGeometry>,
+    /// Unknown on legacy bundles; native recording currently bakes the OS cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_mode: Option<String>,
     pub tracks: Vec<TrackDescriptor>,
 }
 
@@ -102,6 +105,7 @@ impl ProjectManifest {
             pause_intervals: Vec::new(),
             gaps_total: 0,
             source_geometry: None,
+            cursor_mode: None,
             tracks: Vec::new(),
         }
     }
@@ -134,7 +138,9 @@ impl ProjectManifest {
         for track in &self.tracks {
             let path = Path::new(&track.relative_path);
             if path.is_absolute()
-                || path.components().any(|c| c == std::path::Component::ParentDir)
+                || path
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
             {
                 return Err(ManifestError::InvalidTrackPath(track.relative_path.clone()));
             }
@@ -154,7 +160,11 @@ impl ProjectManifest {
             .map_err(|e| ManifestError::Io(e.to_string()))?;
 
         let rel = Path::new(relative_path);
-        if rel.is_absolute() || rel.components().any(|c| c == std::path::Component::ParentDir) {
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
             return Err(ManifestError::InvalidTrackPath(relative_path.to_string()));
         }
 
@@ -189,8 +199,8 @@ impl ProjectManifest {
             }
         }
 
-        let serialized = serde_json::to_string_pretty(self)
-            .map_err(|e| ManifestError::Serde(e.to_string()))?;
+        let serialized =
+            serde_json::to_string_pretty(self).map_err(|e| ManifestError::Serde(e.to_string()))?;
 
         // Safely prepare tmp path: remove any pre-existing tmp file/symlink safely
         let tmp_path = path.with_extension("tmp");
@@ -208,7 +218,8 @@ impl ProjectManifest {
 
         file.write_all(serialized.as_bytes())
             .map_err(|e| ManifestError::Io(e.to_string()))?;
-        file.sync_all().map_err(|e| ManifestError::Io(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| ManifestError::Io(e.to_string()))?;
         drop(file);
 
         // Retain prior revision backup if manifest exists

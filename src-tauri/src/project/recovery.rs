@@ -61,9 +61,7 @@ impl RecoveryEngine {
             return Err(RecoveryError::MissingProjectDir(dir.to_path_buf()));
         }
 
-        let canonical_dir = dir
-            .canonicalize()
-            .map_err(|e| RecoveryError::Io(e))?;
+        let canonical_dir = dir.canonicalize().map_err(|e| RecoveryError::Io(e))?;
 
         // Acquire exclusive project lock before scanning or rewriting snapshots
         let _lock = ProjectLock::acquire(&canonical_dir)?;
@@ -123,16 +121,16 @@ impl RecoveryEngine {
 
                     indexed_relative_paths.insert(relative_path.clone());
 
-                    let report = track_reports
-                        .entry(track_id.clone())
-                        .or_insert_with(|| TrackRecoveryReport {
+                    let report = track_reports.entry(track_id.clone()).or_insert_with(|| {
+                        TrackRecoveryReport {
                             track_id: track_id.clone(),
                             valid_segments: 0,
                             unindexed_recovered_segments: 0,
                             missing_segments: 0,
                             total_recoverable_bytes: 0,
                             max_timestamp_us: 0,
-                        });
+                        }
+                    });
 
                     let segment_file = canonical_dir.join(relative_path);
                     if segment_file.exists() && segment_file.is_file() {
@@ -242,18 +240,30 @@ impl RecoveryEngine {
                                     let is_temp = lower_file_name.ends_with(".tmp");
 
                                     if ext == "mp4" || ext == "wav" {
-                                        let file_name = seg_path.file_name().unwrap_or_default().to_string_lossy();
-                                        let rel_path = format!("media/{}/{}", track_name, file_name);
+                                        let file_name = seg_path
+                                            .file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy();
+                                        let rel_path =
+                                            format!("media/{}/{}", track_name, file_name);
 
                                         // Path security validation
-                                        if ProjectManifest::validate_path_in_root(&canonical_dir, &rel_path).is_err() {
+                                        if ProjectManifest::validate_path_in_root(
+                                            &canonical_dir,
+                                            &rel_path,
+                                        )
+                                        .is_err()
+                                        {
                                             continue;
                                         }
 
                                         // If not in journal, we discovered an unindexed committed file!
                                         if !indexed_relative_paths.contains(&rel_path) {
-                                            let track_type = determine_track_type(&track_name, &rel_path);
-                                            if let Ok(info) = MediaValidator::validate(&seg_path, track_type) {
+                                            let track_type =
+                                                determine_track_type(&track_name, &rel_path);
+                                            if let Ok(info) =
+                                                MediaValidator::validate(&seg_path, track_type)
+                                            {
                                                 let report = track_reports
                                                     .entry(track_name.clone())
                                                     .or_insert_with(|| TrackRecoveryReport {
@@ -318,14 +328,22 @@ impl RecoveryEngine {
                                             .strip_suffix(&format!(".{}", container_ext))
                                             .unwrap_or(&base_stem);
                                         let new_filename = format!("{}.{}", seq_str, container_ext);
-                                        let new_rel_path = format!("media/{}/{}", track_name, new_filename);
+                                        let new_rel_path =
+                                            format!("media/{}/{}", track_name, new_filename);
 
-                                        if ProjectManifest::validate_path_in_root(&canonical_dir, &new_rel_path).is_err() {
+                                        if ProjectManifest::validate_path_in_root(
+                                            &canonical_dir,
+                                            &new_rel_path,
+                                        )
+                                        .is_err()
+                                        {
                                             continue;
                                         }
 
-                                        let track_type = determine_track_type(&track_name, &new_rel_path);
-                                        let validated = MediaValidator::validate(&seg_path, track_type);
+                                        let track_type =
+                                            determine_track_type(&track_name, &new_rel_path);
+                                        let validated =
+                                            MediaValidator::validate(&seg_path, track_type);
                                         let info = match validated {
                                             Ok(info) => info,
                                             Err(err) => {
@@ -457,7 +475,9 @@ impl RecoveryEngine {
         recovered_manifest.pause_intervals = pause_intervals.clone();
 
         // Ensure recovered tracks are registered in manifest
-        for (track_id, track_type, rel_path, _, _, _, media_timescale, _, _) in &recovered_unindexed_records {
+        for (track_id, track_type, rel_path, _, _, _, media_timescale, _, _) in
+            &recovered_unindexed_records
+        {
             if !recovered_manifest.tracks.iter().any(|t| &t.id == track_id) {
                 recovered_manifest.tracks.push(TrackDescriptor {
                     id: track_id.clone(),
@@ -467,11 +487,35 @@ impl RecoveryEngine {
                         TrackType::SystemAudio | TrackType::MicAudio => "pcm".into(),
                     },
                     relative_path: rel_path.clone(),
-                    width: if *track_type == TrackType::Screen { Some(1920) } else { None },
-                    height: if *track_type == TrackType::Screen { Some(1080) } else { None },
-                    fps: if *track_type == TrackType::Screen { Some(30) } else { None },
-                    sample_rate: if *track_type == TrackType::MicAudio || *track_type == TrackType::SystemAudio { Some(48000) } else { None },
-                    channels: if *track_type == TrackType::MicAudio { Some(1) } else if *track_type == TrackType::SystemAudio { Some(2) } else { None },
+                    width: if *track_type == TrackType::Screen {
+                        Some(1920)
+                    } else {
+                        None
+                    },
+                    height: if *track_type == TrackType::Screen {
+                        Some(1080)
+                    } else {
+                        None
+                    },
+                    fps: if *track_type == TrackType::Screen {
+                        Some(30)
+                    } else {
+                        None
+                    },
+                    sample_rate: if *track_type == TrackType::MicAudio
+                        || *track_type == TrackType::SystemAudio
+                    {
+                        Some(48000)
+                    } else {
+                        None
+                    },
+                    channels: if *track_type == TrackType::MicAudio {
+                        Some(1)
+                    } else if *track_type == TrackType::SystemAudio {
+                        Some(2)
+                    } else {
+                        None
+                    },
                     gaps_total: 0,
                     media_timescale: if *media_timescale > 0 {
                         Some(*media_timescale)
@@ -579,7 +623,10 @@ mod tests {
 
         assert_eq!(screen_rep.valid_segments, 1, "seg1 is valid");
         assert_eq!(screen_rep.missing_segments, 1, "seg3 zero dummy rejected");
-        assert_eq!(screen_rep.unindexed_recovered_segments, 1, "seg2 discovered");
+        assert_eq!(
+            screen_rep.unindexed_recovered_segments, 1,
+            "seg2 discovered"
+        );
     }
 
     #[test]

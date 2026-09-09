@@ -101,12 +101,7 @@ impl SessionStateMachine {
 
             if self
                 .state
-                .compare_exchange_weak(
-                    current_raw,
-                    next as u8,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
+                .compare_exchange_weak(current_raw, next as u8, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
                 return Ok(());

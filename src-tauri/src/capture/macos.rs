@@ -1,6 +1,8 @@
-use super::{AudioDevice, CameraDevice, CaptureSource, PermissionState, PermissionStatus, SourceRect};
-use crate::project::manifest::{ProjectManifest, TrackType};
-use crate::project::media_validator::MediaValidator;
+use super::{
+    AudioDevice, CameraDevice, CaptureSource, PermissionState, PermissionStatus, SourceRect,
+};
+use crate::project::manifest::TrackType;
+use crate::project::segment_writer::TrackSegmentWriter;
 use crate::session::SessionEvent;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
@@ -63,7 +65,7 @@ impl AeroShootEncoderStatus {
 }
 
 /// Typed permission state matching the Swift `AeroShootPermissionState` C enum.
-#[repr(C)]
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AeroShootPermissionState {
     Unknown = 0,
@@ -73,13 +75,27 @@ pub enum AeroShootPermissionState {
     Restricted = 4,
 }
 
-/// Typed permission bundle matching the Swift `AeroShootPermissionBundle` C struct.
+impl AeroShootPermissionState {
+    fn from_c(value: i32) -> Self {
+        match value {
+            1 => Self::NotDetermined,
+            2 => Self::Authorized,
+            3 => Self::Denied,
+            4 => Self::Restricted,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Packed C layout: three `int32_t` fields. Swift writes these with
+/// `storeBytes` rather than assigning a Swift struct, so keep this as raw
+/// integers and decode — a `repr(C)` enum in the struct is UB on a bad value.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AeroShootPermissionBundle {
-    pub screen_recording: AeroShootPermissionState,
-    pub camera: AeroShootPermissionState,
-    pub microphone: AeroShootPermissionState,
+    pub screen_recording: i32,
+    pub camera: i32,
+    pub microphone: i32,
 }
 
 // Opaque `repr(C)` enums so the function-pointer types compile without
@@ -96,7 +112,7 @@ pub type AeroShootSegmentCallback = unsafe extern "C" fn(
     timescale: i32,
     media_start_value: i64,
     file_path: *const c_char,
-);
+) -> c_int;
 
 /// C function pointer type for the runtime-error callback.
 pub type AeroShootRuntimeErrorCallback =
@@ -107,6 +123,10 @@ pub type AeroShootPermissionCompletion =
     unsafe extern "C" fn(screen_recording: i32, camera: i32, microphone: i32);
 
 extern "C" {
+    fn aeroshoot_macos_mouse_permission(request: bool) -> bool;
+    fn aeroshoot_macos_register_mouse_sink(
+        sink: Option<unsafe extern "C" fn(*const c_char) -> c_int>,
+    );
     fn aeroshoot_macos_copy_sources_json() -> *mut c_char;
     fn aeroshoot_macos_copy_devices_json() -> *mut c_char;
     fn aeroshoot_check_permissions(out_bundle: *mut AeroShootPermissionBundle);
@@ -126,10 +146,7 @@ extern "C" {
     /// `aeroshoot_macos_stop_capture` returns a typed result.
     fn aeroshoot_macos_stop(handle: *mut c_void);
     /// New stop symbol that surfaces encoder status to Rust.
-    fn aeroshoot_macos_stop_capture(
-        handle: *mut c_void,
-        out_result: *mut AeroShootEncoderResult,
-    );
+    fn aeroshoot_macos_stop_capture(handle: *mut c_void, out_result: *mut AeroShootEncoderResult);
     /// New optional Swift-side callback registration entry points. The
     /// Swift agent wires these to a static function pointer so callbacks
     /// fire from its serial queue.
@@ -184,17 +201,15 @@ mod stub_swift_ffi {
     }
     #[no_mangle]
     pub extern "C" fn aeroshoot_macos_copy_devices_json() -> *mut c_char {
-        dup_cstr(
-            r#"{"cameras":[],"mics":[]}"#,
-        )
+        dup_cstr(r#"{"cameras":[],"mics":[]}"#)
     }
     #[no_mangle]
     pub extern "C" fn aeroshoot_check_permissions(out: *mut AeroShootPermissionBundle) {
         if let Some(out) = unsafe { out.as_mut() } {
             *out = AeroShootPermissionBundle {
-                screen_recording: AeroShootPermissionState::Authorized,
-                camera: AeroShootPermissionState::Authorized,
-                microphone: AeroShootPermissionState::Authorized,
+                screen_recording: AeroShootPermissionState::Authorized as i32,
+                camera: AeroShootPermissionState::Authorized as i32,
+                microphone: AeroShootPermissionState::Authorized as i32,
             };
         }
     }
@@ -221,15 +236,21 @@ mod stub_swift_ffi {
     #[no_mangle]
     pub extern "C" fn aeroshoot_macos_set_paused(_handle: *mut c_void, _paused: bool) {}
     #[no_mangle]
-    pub extern "C" fn aeroshoot_macos_copy_stats_json(
-        _handle: *mut c_void,
-    ) -> *mut c_char {
-        dup_cstr(
-            r#"{"droppedFrames":0,"audioBufferUnderflows":0,"lastError":null}"#,
-        )
+    pub extern "C" fn aeroshoot_macos_copy_stats_json(_handle: *mut c_void) -> *mut c_char {
+        dup_cstr(r#"{"droppedFrames":0,"audioBufferUnderflows":0,"lastError":null}"#)
     }
     #[no_mangle]
     pub extern "C" fn aeroshoot_macos_stop(_handle: *mut c_void) {}
+    #[no_mangle]
+    pub extern "C" fn aeroshoot_macos_mouse_permission(_request: bool) -> bool {
+        false
+    }
+    #[no_mangle]
+    pub extern "C" fn aeroshoot_macos_register_mouse_sink(
+        _sink: Option<unsafe extern "C" fn(*const c_char) -> c_int>,
+    ) {
+    }
+
     #[no_mangle]
     pub extern "C" fn aeroshoot_macos_stop_capture(
         _handle: *mut c_void,
@@ -310,39 +331,37 @@ fn permission_state(value: AeroShootPermissionState) -> PermissionState {
 
 fn permission_status(bundle: AeroShootPermissionBundle) -> PermissionStatus {
     PermissionStatus {
-        screen_recording: permission_state(bundle.screen_recording),
-        camera: permission_state(bundle.camera),
-        microphone: permission_state(bundle.microphone),
+        screen_recording: permission_state(AeroShootPermissionState::from_c(
+            bundle.screen_recording,
+        )),
+        camera: permission_state(AeroShootPermissionState::from_c(bundle.camera)),
+        microphone: permission_state(AeroShootPermissionState::from_c(bundle.microphone)),
     }
+}
+
+pub fn mouse_permission(request: bool) -> bool {
+    unsafe { aeroshoot_macos_mouse_permission(request) }
 }
 
 pub fn permissions() -> PermissionStatus {
     let mut bundle = AeroShootPermissionBundle {
-        screen_recording: AeroShootPermissionState::Unknown,
-        camera: AeroShootPermissionState::Unknown,
-        microphone: AeroShootPermissionState::Unknown,
+        screen_recording: 0,
+        camera: 0,
+        microphone: 0,
     };
     unsafe { aeroshoot_check_permissions(&mut bundle) };
     permission_status(bundle)
 }
 
-static PERMISSION_WAIT: OnceLock<(Mutex<Option<AeroShootPermissionBundle>>, Condvar)> = OnceLock::new();
+static PERMISSION_WAIT: OnceLock<(Mutex<Option<AeroShootPermissionBundle>>, Condvar)> =
+    OnceLock::new();
 
 unsafe extern "C" fn permission_completion(screen: i32, camera: i32, microphone: i32) {
-    fn decode(value: i32) -> AeroShootPermissionState {
-        match value {
-            1 => AeroShootPermissionState::NotDetermined,
-            2 => AeroShootPermissionState::Authorized,
-            3 => AeroShootPermissionState::Denied,
-            4 => AeroShootPermissionState::Restricted,
-            _ => AeroShootPermissionState::Unknown,
-        }
-    }
     let (slot, ready) = PERMISSION_WAIT.get_or_init(|| (Mutex::new(None), Condvar::new()));
     *slot.lock().unwrap() = Some(AeroShootPermissionBundle {
-        screen_recording: decode(screen),
-        camera: decode(camera),
-        microphone: decode(microphone),
+        screen_recording: screen,
+        camera,
+        microphone,
     });
     ready.notify_all();
 }
@@ -351,11 +370,16 @@ pub fn request_permissions(screen: bool, camera: bool, microphone: bool) -> Perm
     let (slot, ready) = PERMISSION_WAIT.get_or_init(|| (Mutex::new(None), Condvar::new()));
     let mut guard = slot.lock().unwrap();
     *guard = None;
-    unsafe { aeroshoot_request_permissions(screen, camera, microphone, Some(permission_completion)) };
+    unsafe {
+        aeroshoot_request_permissions(screen, camera, microphone, Some(permission_completion))
+    };
     let (mut guard, _) = ready
-        .wait_timeout_while(guard, Duration::from_secs(31), |result| result.is_none())
+        .wait_timeout_while(guard, Duration::from_secs(125), |result| result.is_none())
         .unwrap();
-    guard.take().map(permission_status).unwrap_or_else(permissions)
+    guard
+        .take()
+        .map(permission_status)
+        .unwrap_or_else(permissions)
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +397,35 @@ pub fn request_permissions(screen: bool, camera: bool, microphone: bool) -> Perm
 //      available) or falls back to a direct synchronous call so we
 //      never block the foreign thread longer than necessary.
 // ---------------------------------------------------------------------------
+
+static MOUSE_LOGGER: Mutex<Option<crate::telemetry::native::NativeMouseLogger>> = Mutex::new(None);
+
+unsafe extern "C" fn mouse_sink(json: *const c_char) -> c_int {
+    std::panic::catch_unwind(|| {
+        if json.is_null() { return -700; }
+        let Ok(json) = CStr::from_ptr(json).to_str() else { return -700; };
+        let mut logger = MOUSE_LOGGER.lock().unwrap();
+        match logger.as_mut().map(|logger| logger.append(json)) {
+            Some(Ok(())) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                    if let Some(reason) = value.pointer("/payload/reason").and_then(|v| v.as_str()) {
+                        if matches!(reason, "input_monitoring_unavailable" | "input_monitoring_revoked" | "event_tap_unavailable" | "unsupported_source_geometry") {
+                            if let Some(target) = RUNTIME_ERROR_TARGET.lock().unwrap().as_ref() {
+                                target.diagnostics.apply(&SessionEvent::RuntimeError {
+                                    track_id: "telemetry".into(), error_code: 700,
+                                    message: format!("Mouse telemetry unavailable ({reason}); recording continues with the baked cursor."),
+                                    t_us: target.epoch.current_elapsed_us(), recoverable: true,
+                                });
+                            }
+                        }
+                    }
+                }
+                0
+            },
+            _ => -700,
+        }
+    }).unwrap_or(-700)
+}
 
 static RUNTIME_ERROR_TARGET: Mutex<Option<RuntimeErrorTarget>> = Mutex::new(None);
 static SEGMENT_TARGET: Mutex<Option<SegmentTarget>> = Mutex::new(None);
@@ -424,6 +477,10 @@ pub(crate) fn install_callback_targets(
 pub(crate) fn clear_callback_targets() {
     *RUNTIME_ERROR_TARGET.lock().unwrap() = None;
     *SEGMENT_TARGET.lock().unwrap() = None;
+    *MOUSE_LOGGER.lock().unwrap() = None;
+    unsafe {
+        aeroshoot_macos_register_mouse_sink(None);
+    }
 }
 
 /// The C function pointer the Swift side keeps. Marked `unsafe extern "C"`
@@ -435,104 +492,60 @@ unsafe extern "C" fn c_segment_callback(
     timescale: i32,
     media_start_value: i64,
     file_path: *const c_char,
-) {
-    let track_id_str = if track_id.is_null() {
-        String::new()
-    } else {
-        CStr::from_ptr(track_id).to_string_lossy().into_owned()
-    };
-    let file_path_str = if file_path.is_null() {
-        String::new()
-    } else {
-        CStr::from_ptr(file_path).to_string_lossy().into_owned()
-    };
-
-    let target = SEGMENT_TARGET.lock().unwrap().clone();
-    if let Some(target) = target {
-        let _ = target.diagnostics.apply(&SessionEvent::SegmentRotated {
-            track_id: track_id_str.clone(),
-            segment_index: segment_index.max(0) as u32,
+) -> c_int {
+    // Contain panics at the foreign ABI boundary and report failure to Swift.
+    std::panic::catch_unwind(|| {
+        if track_id.is_null() || file_path.is_null() || segment_index < 0 || timescale <= 0 {
+            return -600;
+        }
+        let id = CStr::from_ptr(track_id).to_string_lossy();
+        let path = CStr::from_ptr(file_path).to_string_lossy();
+        let target = SEGMENT_TARGET.lock().unwrap().clone();
+        let Some(target) = target else {
+            return -600;
+        };
+        let (Some(journal), Some(root)) = (&target.journal, &target.project_root) else {
+            return -600;
+        };
+        let kind = match id.as_ref() {
+            "screen" => TrackType::Screen,
+            "webcam" => TrackType::Webcam,
+            "system" => TrackType::SystemAudio,
+            "mic" => TrackType::MicAudio,
+            _ => return -600,
+        };
+        let writer = TrackSegmentWriter::new(root, id.to_string(), kind, String::new());
+        match writer.commit_native_segment(
+            Path::new(path.as_ref()),
+            segment_index as u32,
             host_anchor_us,
-            media_timescale: timescale.max(0) as u32,
+            timescale as u32,
             media_start_value,
-        });
-
-        if let (Some(journal), Some(project_root)) = (target.journal.as_ref(), target.project_root.as_ref()) {
-            if !file_path_str.is_empty() {
-                let p = Path::new(&file_path_str);
-                // The callback is the commit boundary. Validate again on the
-                // Rust side before putting anything in the durable journal;
-                // this prevents a malformed native callback (or a failed
-                // writer that nevertheless left bytes behind) from becoming
-                // committed project media.
-                let (track_type, canonical_id) = match track_id_str.as_str() {
-                    "screen" => (TrackType::Screen, "screen"),
-                    "webcam" | "camera" => (TrackType::Webcam, "webcam"),
-                    "system" | "system_audio" => (TrackType::SystemAudio, "system"),
-                    "mic" => (TrackType::MicAudio, "mic"),
-                    _ => return,
-                };
-                let canonical_root = match project_root.canonicalize() {
-                    Ok(root) => root,
-                    Err(_) => return,
-                };
-                let canonical_path = match p.canonicalize() {
-                    Ok(path) if path.starts_with(&canonical_root) => path,
-                    _ => return,
-                };
-                let rel_path = match canonical_path.strip_prefix(&canonical_root) {
-                    Ok(rel) => rel.to_string_lossy().into_owned(),
-                    Err(_) => return,
-                };
-                if !rel_path.starts_with(&format!("media/{}/", canonical_id))
-                    || rel_path.ends_with(".tmp")
-                    || ProjectManifest::validate_path_in_root(&canonical_root, &rel_path).is_err()
-                {
-                    return;
-                }
-                let info = match MediaValidator::validate(&canonical_path, track_type) {
-                    Ok(info) if info.size_bytes > 0 => info,
-                    _ => return,
-                };
-                let start_us = host_anchor_us.max(0) as u64;
-                let end_us = start_us.saturating_add(info.duration_us.max(1));
-                if journal
-                    .append(crate::project::journal::JournalRecord::SegmentCommitted {
-                        seq: 0,
-                        track_id: canonical_id.to_string(),
-                        relative_path: rel_path,
-                        start_us,
-                        end_us,
-                        size_bytes: info.size_bytes,
-                        is_keyframe_start: info.is_keyframe_start,
-                        media_timescale: if info.media_timescale > 0 {
-                            info.media_timescale
-                        } else {
-                            timescale.max(0) as u32
-                        },
-                        media_start_value: if info.media_start_value != 0 {
-                            info.media_start_value
-                        } else {
-                            media_start_value
-                        },
-                        host_anchor_us,
-                    })
-                    .is_err()
-                {
-                    // The media remains recoverable on disk, but the failed
-                    // journal append must be visible as a runtime failure and
-                    // must never be reported as a committed operation.
-                    let _ = target.diagnostics.apply(&SessionEvent::RuntimeError {
-                        track_id: track_id_str.clone(),
-                        error_code: -600,
-                        message: "failed to append native segment journal record".to_string(),
-                        t_us: target.epoch.current_elapsed_us(),
-                        recoverable: true,
-                    });
-                }
+            journal,
+        ) {
+            Ok(_) => {
+                target.diagnostics.apply(&SessionEvent::SegmentRotated {
+                    track_id: id.to_string(),
+                    segment_index: segment_index as u32,
+                    host_anchor_us,
+                    media_timescale: timescale as u32,
+                    media_start_value,
+                });
+                0
+            }
+            Err(error) => {
+                target.diagnostics.apply(&SessionEvent::RuntimeError {
+                    track_id: id.to_string(),
+                    error_code: -600,
+                    message: error.to_string(),
+                    t_us: target.epoch.current_elapsed_us(),
+                    recoverable: true,
+                });
+                -600
             }
         }
-    }
+    })
+    .unwrap_or(-600)
 }
 
 unsafe extern "C" fn c_runtime_error_callback(
@@ -641,9 +654,28 @@ unsafe impl Sync for MacCaptureSession {}
 
 impl MacCaptureSession {
     pub fn start(config: NativeRecordingConfig<'_>) -> Result<Self, String> {
+        *MOUSE_LOGGER.lock().unwrap() = Some(crate::telemetry::native::NativeMouseLogger::create(
+            config.project_path,
+        )?);
+        unsafe {
+            aeroshoot_macos_register_mouse_sink(Some(mouse_sink));
+        }
         let json = serde_json::to_string(&config).map_err(|error| error.to_string())?;
         let json = CString::new(json).map_err(|error| error.to_string())?;
         let mut error_pointer = std::ptr::null_mut();
+        // Register before startup: capture can finish its first segment before
+        // the asynchronous native start operation returns its handle.
+        unsafe {
+            aeroshoot_macos_register_segment_callback(
+                std::ptr::null_mut(),
+                Some(segment_callback_pointer()),
+            );
+            aeroshoot_macos_register_runtime_error_callback(
+                std::ptr::null_mut(),
+                Some(runtime_error_callback_pointer()),
+            );
+        }
+
         let handle = unsafe { aeroshoot_macos_start(json.as_ptr(), &mut error_pointer) };
         match NonNull::new(handle) {
             Some(handle) => {
@@ -711,7 +743,15 @@ impl MacCaptureSession {
             aeroshoot_macos_register_segment_callback(handle.as_ptr(), None);
             aeroshoot_macos_register_runtime_error_callback(handle.as_ptr(), None);
         }
-        decode_encoder_result(result)
+        let native_result = decode_encoder_result(result);
+        let telemetry_result = MOUSE_LOGGER
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(|logger| logger.finish())
+            .unwrap_or(Ok(()))
+            .map_err(|message| (-700, message));
+        native_result.and(telemetry_result)
     }
 }
 
@@ -735,8 +775,27 @@ mod tests {
 
     #[test]
     fn ffi_permission_and_device_enumeration_round_trip() {
-        let _ = permissions();
+        // Do not call permissions() against the real ScreenCaptureKit bridge in
+        // unit tests — the probe waits on WindowServer and can show a TCC prompt.
         assert!(devices().is_ok());
+    }
+
+    #[test]
+    fn permission_bundle_is_three_packed_i32s() {
+        assert_eq!(std::mem::size_of::<AeroShootPermissionBundle>(), 12);
+        assert_eq!(std::mem::align_of::<AeroShootPermissionBundle>(), 4);
+        assert_eq!(AeroShootPermissionState::from_c(2), AeroShootPermissionState::Authorized);
+        assert_eq!(AeroShootPermissionState::from_c(3), AeroShootPermissionState::Denied);
+        assert_eq!(AeroShootPermissionState::from_c(1), AeroShootPermissionState::NotDetermined);
+        assert_eq!(AeroShootPermissionState::from_c(99), AeroShootPermissionState::Unknown);
+        let status = permission_status(AeroShootPermissionBundle {
+            screen_recording: 2,
+            camera: 2,
+            microphone: 3,
+        });
+        assert_eq!(status.screen_recording, PermissionState::Authorized);
+        assert_eq!(status.camera, PermissionState::Authorized);
+        assert_eq!(status.microphone, PermissionState::Denied);
     }
 
     #[test]
@@ -780,11 +839,7 @@ mod tests {
         let track = CString::new("screen").unwrap();
         let message = CString::new("encoder timeout").unwrap();
         unsafe {
-            c_runtime_error_callback(
-                track.as_ptr(),
-                17 as c_int,
-                message.as_ptr(),
-            );
+            c_runtime_error_callback(track.as_ptr(), 17 as c_int, message.as_ptr());
         }
 
         let record = diagnostics

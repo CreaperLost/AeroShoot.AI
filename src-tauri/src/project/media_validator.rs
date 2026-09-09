@@ -169,15 +169,13 @@ impl MediaValidator {
             file.read_exact(&mut header)
                 .map_err(|e| MediaValidationError::Io(e.to_string()))?;
 
-            let box_size_raw =
-                u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+            let box_size_raw = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
             let box_type = [header[4], header[5], header[6], header[7]];
 
             if !valid_boxes.iter().any(|&b| b == &box_type) {
-                return Err(MediaValidationError::InvalidMp4Box(String::from_utf8_lossy(
-                    &box_type,
-                )
-                .into_owned()));
+                return Err(MediaValidationError::InvalidMp4Box(
+                    String::from_utf8_lossy(&box_type).into_owned(),
+                ));
             }
 
             let (box_size, header_len) = if box_size_raw == 1 {
@@ -335,9 +333,7 @@ impl MediaValidator {
     /// Parse the `moov` box, walking `trak → mdia → mdhd` to extract the
     /// track timescale + duration, and `trak → edts → elst` for the edit
     /// list offset. Returns `(MdhdInfo, Option<ElstInfo>)`.
-    pub fn parse_moov(
-        moov_bytes: &[u8],
-    ) -> Result<(MdhdInfo, Option<ElstInfo>), String> {
+    pub fn parse_moov(moov_bytes: &[u8]) -> Result<(MdhdInfo, Option<ElstInfo>), String> {
         let len = moov_bytes.len();
         if len < 8 {
             return Err("moov too small".into());
@@ -348,13 +344,15 @@ impl MediaValidator {
 
         // Walk moov children
         while idx + 8 <= len {
-            let (child_size, child_type, child_payload_start) = read_box_header(moov_bytes, idx, len)?;
+            let (child_size, child_type, child_payload_start) =
+                read_box_header(moov_bytes, idx, len)?;
             if child_type == *b"trak" {
                 // Recurse into trak to find mdia (for mdhd) and edts (for elst).
                 let trak_end = idx + child_size;
                 let mut trak_idx = child_payload_start;
                 while trak_idx + 8 <= trak_end {
-                    let (sub_size, sub_type, sub_start) = read_box_header(moov_bytes, trak_idx, trak_end)?;
+                    let (sub_size, sub_type, sub_start) =
+                        read_box_header(moov_bytes, trak_idx, trak_end)?;
                     if sub_type == *b"mdia" {
                         let mdia_end = trak_idx + sub_size;
                         let mut mdia_idx = sub_start;
@@ -362,7 +360,9 @@ impl MediaValidator {
                             let (mdhd_box_size, mdhd_box_type, mdhd_box_start) =
                                 read_box_header(moov_bytes, mdia_idx, mdia_end)?;
                             if mdhd_box_type == *b"mdhd" && mdhd_result.is_none() {
-                                mdhd_result = Some(Self::parse_mdhd(&moov_bytes[mdhd_box_start..mdhd_box_start + mdhd_box_size])?);
+                                mdhd_result = Some(Self::parse_mdhd(
+                                    &moov_bytes[mdhd_box_start..mdhd_box_start + mdhd_box_size],
+                                )?);
                             }
                             mdia_idx += mdhd_box_size;
                         }
@@ -373,7 +373,9 @@ impl MediaValidator {
                             let (elst_box_size, elst_box_type, elst_box_start) =
                                 read_box_header(moov_bytes, edts_idx, edts_end)?;
                             if elst_box_type == *b"elst" {
-                                elst_result = Some(Self::parse_elst(&moov_bytes[elst_box_start..elst_box_start + elst_box_size])?);
+                                elst_result = Some(Self::parse_elst(
+                                    &moov_bytes[elst_box_start..elst_box_start + elst_box_size],
+                                )?);
                             }
                             edts_idx += elst_box_size;
                         }
@@ -397,9 +399,8 @@ impl MediaValidator {
         // `language` is a 15-bit unsigned int packed into 2 bytes
         // (top bit is a pad bit reserved by the spec and must be
         // ignored). Use a `u16` to read both bytes at once and mask.
-        let read_language = |lo: usize| -> u16 {
-            u16::from_be_bytes([payload[lo], payload[lo + 1]]) & 0x7FFF
-        };
+        let read_language =
+            |lo: usize| -> u16 { u16::from_be_bytes([payload[lo], payload[lo + 1]]) & 0x7FFF };
         if version == 0 {
             // v0: 4 (header) + 4 (creation) + 4 (modification)
             //   + 4 (timescale) + 4 (duration) + 2 (language)
@@ -410,7 +411,8 @@ impl MediaValidator {
             let _creation = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
             let _modification =
                 u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
-            let timescale = u32::from_be_bytes([payload[12], payload[13], payload[14], payload[15]]);
+            let timescale =
+                u32::from_be_bytes([payload[12], payload[13], payload[14], payload[15]]);
             let duration = u32::from_be_bytes([payload[16], payload[17], payload[18], payload[19]]);
             let language = read_language(20);
             Ok(MdhdInfo {
@@ -427,17 +429,36 @@ impl MediaValidator {
                 return Err("mdhd v1 too small".into());
             }
             let _creation = u64::from_be_bytes([
-                payload[4], payload[5], payload[6], payload[7],
-                payload[8], payload[9], payload[10], payload[11],
+                payload[4],
+                payload[5],
+                payload[6],
+                payload[7],
+                payload[8],
+                payload[9],
+                payload[10],
+                payload[11],
             ]);
             let _modification = u64::from_be_bytes([
-                payload[12], payload[13], payload[14], payload[15],
-                payload[16], payload[17], payload[18], payload[19],
+                payload[12],
+                payload[13],
+                payload[14],
+                payload[15],
+                payload[16],
+                payload[17],
+                payload[18],
+                payload[19],
             ]);
-            let timescale = u32::from_be_bytes([payload[20], payload[21], payload[22], payload[23]]);
+            let timescale =
+                u32::from_be_bytes([payload[20], payload[21], payload[22], payload[23]]);
             let duration = u64::from_be_bytes([
-                payload[24], payload[25], payload[26], payload[27],
-                payload[28], payload[29], payload[30], payload[31],
+                payload[24],
+                payload[25],
+                payload[26],
+                payload[27],
+                payload[28],
+                payload[29],
+                payload[30],
+                payload[31],
             ]);
             let language = read_language(32);
             Ok(MdhdInfo {
@@ -475,13 +496,12 @@ impl MediaValidator {
         let entry = &payload[first_entry_offset..first_entry_end];
         let (segment_duration, media_time) = if version == 1 {
             let dur = u64::from_be_bytes([
-                entry[0], entry[1], entry[2], entry[3],
-                entry[4], entry[5], entry[6], entry[7],
+                entry[0], entry[1], entry[2], entry[3], entry[4], entry[5], entry[6], entry[7],
             ]) as i64;
             // ISO/IEC 14496-12 uses a 64-bit signed integer for media_time.
             let mt_raw = u64::from_be_bytes([
-                entry[8], entry[9], entry[10], entry[11],
-                entry[12], entry[13], entry[14], entry[15],
+                entry[8], entry[9], entry[10], entry[11], entry[12], entry[13], entry[14],
+                entry[15],
             ]);
             let media_time = i64::from_be_bytes(mt_raw.to_be_bytes());
             (dur, media_time)
@@ -492,7 +512,11 @@ impl MediaValidator {
             let media_time = i32::from_be_bytes(mt_raw.to_be_bytes()) as i64;
             (dur, media_time)
         };
-        let first_media_time = if media_time == -1 { None } else { Some(media_time) };
+        let first_media_time = if media_time == -1 {
+            None
+        } else {
+            Some(media_time)
+        };
         Ok(ElstInfo {
             version,
             first_media_time,
@@ -618,7 +642,12 @@ impl MediaValidator {
             idx += box_size;
         }
 
-        Ok((media_start_ticks, sample_duration_ticks, sample_count, is_keyframe))
+        Ok((
+            media_start_ticks,
+            sample_duration_ticks,
+            sample_count,
+            is_keyframe,
+        ))
     }
 
     fn validate_wav(
@@ -675,9 +704,7 @@ impl MediaValidator {
                 file.read_exact(&mut fmt_buf)
                     .map_err(|e| MediaValidationError::Io(e.to_string()))?;
                 channels = u16::from_le_bytes([fmt_buf[2], fmt_buf[3]]);
-                sample_rate = u32::from_le_bytes([
-                    fmt_buf[4], fmt_buf[5], fmt_buf[6], fmt_buf[7],
-                ]);
+                sample_rate = u32::from_le_bytes([fmt_buf[4], fmt_buf[5], fmt_buf[6], fmt_buf[7]]);
                 bits_per_sample = u16::from_le_bytes([fmt_buf[14], fmt_buf[15]]);
             } else if chunk_id == b"data" {
                 data_size = chunk_len;
@@ -692,8 +719,7 @@ impl MediaValidator {
 
         let bytes_per_sample = (channels as u64 * bits_per_sample as u64) / 8;
         let total_samples = data_size / bytes_per_sample;
-        let duration_us =
-            (total_samples as u128 * 1_000_000 / sample_rate as u128) as u64;
+        let duration_us = (total_samples as u128 * 1_000_000 / sample_rate as u128) as u64;
 
         Ok(MediaValidationInfo {
             container_format: "wav".into(),
@@ -746,7 +772,10 @@ fn read_box_header(
         (raw as usize, 8usize)
     };
     if box_size < header_len || offset + box_size > end {
-        return Err(format!("invalid box size {} at offset {}", box_size, offset));
+        return Err(format!(
+            "invalid box size {} at offset {}",
+            box_size, offset
+        ));
     }
     Ok((box_size, box_type, offset + header_len))
 }
@@ -869,7 +898,7 @@ mod tests {
         payload.extend_from_slice(&0u32.to_be_bytes()); // modification
         payload.extend_from_slice(&48_000u32.to_be_bytes()); // timescale
         payload.extend_from_slice(&96_000u32.to_be_bytes()); // duration
-        // language = 0x55C4 (English) packed as 2 big-endian bytes.
+                                                             // language = 0x55C4 (English) packed as 2 big-endian bytes.
         payload.extend_from_slice(&0x55C4u16.to_be_bytes());
         payload.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
 

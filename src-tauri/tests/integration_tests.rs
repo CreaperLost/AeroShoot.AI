@@ -19,7 +19,12 @@ use std::fs;
 use std::sync::Arc;
 use tempfile::tempdir;
 
-fn write_valid_fmp4_segment(path: &std::path::Path, start_us: u64, duration_us: u64, is_keyframe: bool) {
+fn write_valid_fmp4_segment(
+    path: &std::path::Path,
+    start_us: u64,
+    duration_us: u64,
+    is_keyframe: bool,
+) {
     let data = generate_valid_fmp4_segment(start_us, duration_us, is_keyframe);
     fs::write(path, data).unwrap();
 }
@@ -61,11 +66,13 @@ fn test_ipc_serialization_contracts_match_frontend() {
 
     // 4. StopRecordingResult serializes with durationUs
     let stop_res = StopRecordingResult {
+        project_path: "/tmp/example.aero".into(),
         session_id: "test-sess".into(),
         state: SessionState::Completed,
         duration_us: 5_000_000,
     };
     let stop_json = serde_json::to_string(&stop_res).unwrap();
+    assert!(stop_json.contains("\"projectPath\":\"/tmp/example.aero\""));
     assert!(stop_json.contains("\"sessionId\":\"test-sess\""));
     assert!(stop_json.contains("\"durationUs\":5000000"));
 
@@ -161,7 +168,10 @@ fn test_repeated_recording_sessions_and_retries() {
 
     // Stop
     let stop1 = stop_recording_impl(&state).unwrap();
-    assert_eq!(stop1.session_id, sess_id_1, "Stop must return original session ID");
+    assert_eq!(
+        stop1.session_id, sess_id_1,
+        "Stop must return original session ID"
+    );
     assert_eq!(stop1.state, SessionState::Completed);
 
     // Idempotent Stop Retry: must return cached result with same session ID
@@ -171,7 +181,10 @@ fn test_repeated_recording_sessions_and_retries() {
     // Cycle 2: Immediate start from Completed state (reproduced review item P1.3)
     let start2 = start_recording_impl(&state, opts.clone()).unwrap();
     assert_eq!(start2.state, SessionState::Recording);
-    assert_ne!(start2.session_id, sess_id_1, "New recording must generate fresh UUID");
+    assert_ne!(
+        start2.session_id, sess_id_1,
+        "New recording must generate fresh UUID"
+    );
 
     let stop2 = stop_recording_impl(&state).unwrap();
     assert_eq!(stop2.session_id, start2.session_id);
@@ -183,12 +196,8 @@ fn test_segment_writer_pipeline_finish_sync_rename_journal() {
     let dir = tempdir().unwrap();
     let journal = ProjectJournal::open_or_create(dir.path()).unwrap();
 
-    let mut writer = TrackSegmentWriter::new(
-        dir.path(),
-        "screen".into(),
-        TrackType::Screen,
-        "mp4".into(),
-    );
+    let mut writer =
+        TrackSegmentWriter::new(dir.path(), "screen".into(), TrackType::Screen, "mp4".into());
 
     // Begin segment
     let temp_path = writer.begin_segment(0).unwrap();
@@ -340,10 +349,7 @@ fn test_journal_truncated_tail_repair() {
 
     // Next append must start on a fresh line and succeed cleanly
     let s1 = journal
-        .append(JournalRecord::PauseStarted {
-            seq: 0,
-            t_us: 2000,
-        })
+        .append(JournalRecord::PauseStarted { seq: 0, t_us: 2000 })
         .unwrap();
     assert_eq!(s1, 1);
 
@@ -412,11 +418,15 @@ fn test_pause_intervals_persisted_and_net_duration() {
     assert_eq!(stop_res.state, SessionState::Completed);
 
     // Check project bundle manifest and journal
-    let bundle_path = dir.path().join(format!("Project_Session_{}.aero", stop_res.session_id));
+    let bundle_path = dir
+        .path()
+        .join(format!("Project_Session_{}.aero", stop_res.session_id));
     let recovery_report = RecoveryEngine::scan_and_recover(&bundle_path).unwrap();
 
     assert_eq!(recovery_report.pause_intervals.len(), 1);
-    assert!(recovery_report.pause_intervals[0].end_us > recovery_report.pause_intervals[0].start_us);
+    assert!(
+        recovery_report.pause_intervals[0].end_us > recovery_report.pause_intervals[0].start_us
+    );
     assert!(recovery_report.active_duration_us <= recovery_report.recoverable_duration_us);
 }
 
@@ -471,7 +481,10 @@ fn test_p1_finding_1_save_with_backup_symlink_overwrite_prevention() {
 
     // The sensitive external file must NOT have been modified or overwritten!
     let victim_content = fs::read_to_string(&sensitive_file).unwrap();
-    assert_eq!(victim_content, "CONFIDENTIAL EXTERNAL DATA", "External file was overwritten through symlink!");
+    assert_eq!(
+        victim_content, "CONFIDENTIAL EXTERNAL DATA",
+        "External file was overwritten through symlink!"
+    );
 
     // Also test manifest.bak pointing to external file
     let bak_symlink = project_dir.join("manifest.bak");
@@ -481,7 +494,10 @@ fn test_p1_finding_1_save_with_backup_symlink_overwrite_prevention() {
     let res2 = manifest.save_with_backup(&manifest_path);
     assert!(res2.is_ok());
     let victim_content2 = fs::read_to_string(&sensitive_file).unwrap();
-    assert_eq!(victim_content2, "CONFIDENTIAL EXTERNAL DATA", "External file was overwritten through .bak symlink!");
+    assert_eq!(
+        victim_content2, "CONFIDENTIAL EXTERNAL DATA",
+        "External file was overwritten through .bak symlink!"
+    );
 }
 
 #[test]
@@ -516,12 +532,19 @@ fn test_p1_finding_2_concurrent_start_calls_serialized() {
     let session_id_0 = &results[0].session_id;
 
     for r in &results {
-        assert_eq!(&r.session_id, session_id_0, "Concurrent start calls created conflicting sessions!");
+        assert_eq!(
+            &r.session_id, session_id_0,
+            "Concurrent start calls created conflicting sessions!"
+        );
         assert_eq!(r.state, SessionState::Recording);
     }
 
     let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
-    assert_eq!(entries.len(), 1, "Expected exactly 1 project directory created");
+    assert_eq!(
+        entries.len(),
+        1,
+        "Expected exactly 1 project directory created"
+    );
 }
 
 #[test]
@@ -543,15 +566,23 @@ fn test_p1_finding_3_stop_recording_failure_propagation() {
 
     // Intentionally cause storage failure:
     // Remove the media/screen directory so segment writer flush/sync/rename fails
-    let proj_bundle_dir = dir.path().join(format!("Project_Session_{}.aero", start_res.session_id));
+    let proj_bundle_dir = dir
+        .path()
+        .join(format!("Project_Session_{}.aero", start_res.session_id));
     let screen_media_dir = proj_bundle_dir.join("media").join("screen");
     fs::remove_dir_all(&screen_media_dir).unwrap();
 
     let stop_res = stop_recording_impl(&state);
-    assert!(stop_res.is_err(), "stop_recording_impl must propagate storage failure as Err");
+    assert!(
+        stop_res.is_err(),
+        "stop_recording_impl must propagate storage failure as Err"
+    );
 
     assert_eq!(state.state_machine.current(), SessionState::Error);
-    assert!(state.last_stop_result.read().is_none(), "Must not cache Completed result on failure");
+    assert!(
+        state.last_stop_result.read().is_none(),
+        "Must not cache Completed result on failure"
+    );
 }
 
 #[test]
@@ -567,8 +598,12 @@ fn test_p1_finding_4_media_validator_strict_box_bounds_and_samples() {
 
     let err = MediaValidator::validate(&probe_file, TrackType::Screen).unwrap_err();
     assert!(
-        matches!(err, aeroshoot_lib::project::MediaValidationError::InvalidMp4BoxSize(..)),
-        "Must reject 8-byte file claiming 999,999 byte box: {:?}", err
+        matches!(
+            err,
+            aeroshoot_lib::project::MediaValidationError::InvalidMp4BoxSize(..)
+        ),
+        "Must reject 8-byte file claiming 999,999 byte box: {:?}",
+        err
     );
 
     // 2. Probe: Header-only file (ftyp only, 32 bytes)
@@ -583,8 +618,12 @@ fn test_p1_finding_4_media_validator_strict_box_bounds_and_samples() {
 
     let err2 = MediaValidator::validate(&header_only, TrackType::Screen).unwrap_err();
     assert!(
-        matches!(err2, aeroshoot_lib::project::MediaValidationError::MissingRequiredBoxes(_)),
-        "Must reject header-only MP4: {:?}", err2
+        matches!(
+            err2,
+            aeroshoot_lib::project::MediaValidationError::MissingRequiredBoxes(_)
+        ),
+        "Must reject header-only MP4: {:?}",
+        err2
     );
 
     // 3. Probe: Valid fMP4 segment with full boxes and samples
@@ -603,7 +642,8 @@ fn test_p1_finding_4_media_validator_strict_box_bounds_and_samples() {
 #[test]
 fn test_p1_finding_5_recovery_repairs_truncated_tail_before_reading() {
     let dir = tempdir().unwrap();
-    let bundle = ProjectBundle::create_new(dir.path(), "sess-trunc-tail", "Truncated Tail Test").unwrap();
+    let bundle =
+        ProjectBundle::create_new(dir.path(), "sess-trunc-tail", "Truncated Tail Test").unwrap();
     let bundle_path = bundle.root_path().to_path_buf();
 
     // Write a valid segment file
@@ -644,12 +684,18 @@ fn test_p1_finding_6_project_lock_mutual_exclusion_and_recovery() {
 
     // 3. RecoveryEngine also attempts to acquire lock and must fail if held
     let rec = RecoveryEngine::scan_and_recover(&proj_dir);
-    assert!(matches!(rec, Err(RecoveryError::Lock(LockError::AlreadyLocked { .. }))));
+    assert!(matches!(
+        rec,
+        Err(RecoveryError::Lock(LockError::AlreadyLocked { .. }))
+    ));
 
     // 4. Drop first lock; subsequent acquisition succeeds
     drop(lock1);
     let lock3 = ProjectLock::acquire(&proj_dir);
-    assert!(lock3.is_ok(), "ProjectLock re-acquisition after drop must succeed");
+    assert!(
+        lock3.is_ok(),
+        "ProjectLock re-acquisition after drop must succeed"
+    );
 }
 
 #[test]
@@ -658,7 +704,8 @@ fn test_p1_finding_7_segment_writer_prevents_sequence_collision_and_overwrites()
     let journal = ProjectJournal::open_or_create(dir.path()).unwrap();
 
     // Writer 1 writes and commits segment 1
-    let mut writer1 = TrackSegmentWriter::new(dir.path(), "screen".into(), TrackType::Screen, "mp4".into());
+    let mut writer1 =
+        TrackSegmentWriter::new(dir.path(), "screen".into(), TrackType::Screen, "mp4".into());
     writer1.begin_segment(0).unwrap();
     writer1.write_data(b"ORIGINAL_SEGMENT_1_DATA").unwrap();
     let commit1 = writer1.commit_segment(1_000_000, true, &journal).unwrap();
@@ -667,7 +714,8 @@ fn test_p1_finding_7_segment_writer_prevents_sequence_collision_and_overwrites()
     assert_eq!(fs::read(&seg1_path).unwrap(), b"ORIGINAL_SEGMENT_1_DATA");
 
     // Writer 2 created on same track: must NOT start at seq 1 and overwrite 000001.mp4!
-    let mut writer2 = TrackSegmentWriter::new(dir.path(), "screen".into(), TrackType::Screen, "mp4".into());
+    let mut writer2 =
+        TrackSegmentWriter::new(dir.path(), "screen".into(), TrackType::Screen, "mp4".into());
     writer2.begin_segment(1_000_000).unwrap();
     writer2.write_data(b"NEW_SEGMENT_2_DATA").unwrap();
     let commit2 = writer2.commit_segment(2_000_000, false, &journal).unwrap();
@@ -683,7 +731,8 @@ fn test_p1_finding_7_segment_writer_prevents_sequence_collision_and_overwrites()
 #[test]
 fn test_p1_finding_8_recovery_skips_symlinked_directories_escaping_root() {
     let dir = tempdir().unwrap();
-    let bundle = ProjectBundle::create_new(dir.path(), "sess-symlink-dir", "Symlink Dir Test").unwrap();
+    let bundle =
+        ProjectBundle::create_new(dir.path(), "sess-symlink-dir", "Symlink Dir Test").unwrap();
     let bundle_path = bundle.root_path().to_path_buf();
     drop(bundle);
 
@@ -699,7 +748,10 @@ fn test_p1_finding_8_recovery_skips_symlinked_directories_escaping_root() {
     std::os::unix::fs::symlink(&outside_dir, &symlink_track).unwrap();
 
     let report = RecoveryEngine::scan_and_recover(&bundle_path).unwrap();
-    assert!(!report.track_reports.contains_key("escaped_track"), "Escaped symlinked track directory must be ignored!");
+    assert!(
+        !report.track_reports.contains_key("escaped_track"),
+        "Escaped symlinked track directory must be ignored!"
+    );
 }
 
 #[test]
@@ -725,13 +777,23 @@ fn test_p2_finding_9_monotonic_segment_timestamps_no_immediate_fabricated_commit
     assert_eq!(stop_res.state, SessionState::Completed);
 
     // Read journal records
-    let bundle_path = dir.path().join(format!("Project_Session_{}.aero", stop_res.session_id));
+    let bundle_path = dir
+        .path()
+        .join(format!("Project_Session_{}.aero", stop_res.session_id));
     let journal = ProjectJournal::open_or_create(&bundle_path).unwrap();
     let records = journal.read_all().unwrap();
 
     for r in records {
-        if let JournalRecord::SegmentCommitted { start_us, end_us, .. } = r {
-            assert!(start_us <= end_us, "Timestamp reversal detected: start_us ({}) > end_us ({})", start_us, end_us);
+        if let JournalRecord::SegmentCommitted {
+            start_us, end_us, ..
+        } = r
+        {
+            assert!(
+                start_us <= end_us,
+                "Timestamp reversal detected: start_us ({}) > end_us ({})",
+                start_us,
+                end_us
+            );
             assert_ne!(end_us, 500_000, "Fabricated [0, 500000) segment detected!");
         }
     }
@@ -740,7 +802,8 @@ fn test_p2_finding_9_monotonic_segment_timestamps_no_immediate_fabricated_commit
 #[test]
 fn test_p2_finding_10_unindexed_recovery_exact_packet_timing_and_journal_index_rebuild() {
     let dir = tempdir().unwrap();
-    let bundle = ProjectBundle::create_new(dir.path(), "sess-unindexed-timing", "Unindexed Test").unwrap();
+    let bundle =
+        ProjectBundle::create_new(dir.path(), "sess-unindexed-timing", "Unindexed Test").unwrap();
     let bundle_path = bundle.root_path().to_path_buf();
     drop(bundle);
 
@@ -767,8 +830,15 @@ fn test_p2_finding_10_unindexed_recovery_exact_packet_timing_and_journal_index_r
     // Check that journal index was rebuilt
     let journal_after = ProjectJournal::open_or_create(&bundle_path).unwrap();
     let records_after = journal_after.read_all().unwrap();
-    assert_eq!(records_after.len(), 1, "Journal index must be rebuilt with unindexed segment");
-    if let JournalRecord::UnindexedSegmentRecovered { start_us, end_us, .. } = &records_after[0] {
+    assert_eq!(
+        records_after.len(),
+        1,
+        "Journal index must be rebuilt with unindexed segment"
+    );
+    if let JournalRecord::UnindexedSegmentRecovered {
+        start_us, end_us, ..
+    } = &records_after[0]
+    {
         assert_eq!(*start_us, 0);
         assert_eq!(*end_us, 3_500_000);
     } else {
@@ -794,13 +864,19 @@ fn test_native_callback_draining_handshake() {
     // Shutdown should wait for active callback to drain
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert!(!handle.is_active());
-    assert!(!handle.is_shutdown_complete(), "Shutdown must NOT complete while callback is active");
+    assert!(
+        !handle.is_shutdown_complete(),
+        "Shutdown must NOT complete while callback is active"
+    );
 
     // Drop guard
     drop(guard);
 
     shutdown_thread.join().unwrap();
-    assert!(handle.is_shutdown_complete(), "Shutdown must complete once callback is drained");
+    assert!(
+        handle.is_shutdown_complete(),
+        "Shutdown must complete once callback is drained"
+    );
 
     assert!(handle.enter_callback().is_none());
 }
@@ -830,5 +906,8 @@ fn test_permission_status_and_override() {
         resolution: "1080p".into(),
     };
     let start_res = start_recording_impl(&state, opts);
-    assert!(start_res.is_err(), "Start recording must fail when screen recording permission is denied");
+    assert!(
+        start_res.is_err(),
+        "Start recording must fail when screen recording permission is denied"
+    );
 }

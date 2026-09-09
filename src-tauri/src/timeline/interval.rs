@@ -11,7 +11,11 @@ pub struct SourceInterval {
 impl SourceInterval {
     pub fn new(id: String, start_us: u64, end_us: u64) -> Self {
         assert!(start_us <= end_us, "start_us must be <= end_us");
-        Self { id, start_us, end_us }
+        Self {
+            id,
+            start_us,
+            end_us,
+        }
     }
 
     pub fn duration_us(&self) -> u64 {

@@ -220,7 +220,10 @@ mod tests {
         let t2 = epoch.current_elapsed_us();
 
         assert!(t2 > t1, "Session clock must strictly progress");
-        assert!(t2 >= 10_000, "Should have elapsed at least 10ms (10,000 us)");
+        assert!(
+            t2 >= 10_000,
+            "Should have elapsed at least 10ms (10,000 us)"
+        );
     }
 
     #[test]

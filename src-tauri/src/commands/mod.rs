@@ -4,16 +4,25 @@ use crate::capture::{
 };
 use crate::dsp::{SilenceConfig, SilenceCutInterval, SilenceDetector};
 use crate::fixtures::{generate_valid_fmp4_segment, generate_valid_wav_segment};
+use crate::media::{EncoderGate, MediaInteropStatus, MediaParityReport};
+use crate::playback::{
+    self, PlaybackOwner, PlaybackStatus, PreviewHitMode, PreviewOwner, PreviewStatus,
+    PreviewViewport,
+};
 use crate::project::manifest::{PauseInterval, TrackDescriptor, TrackType};
 use crate::project::{
-    JournalRecord, MediaValidator, ProjectBundle, ProjectRecoveryReport, RecoveryEngine,
-    TrackSegmentWriter,
+    JournalRecord, OpenedProject, ProjectBundle, ProjectReader, ProjectRecoveryReport,
+    RecoveryEngine, SegmentPage, TrackSegmentWriter, WaveformPage, WaveformTrackContext,
 };
-use crate::session::{RuntimeErrorRecord, SessionDiagnostics, SessionEpoch, SessionState, SessionStateMachine};
+use crate::session::{
+    RuntimeErrorRecord, SessionDiagnostics, SessionEpoch, SessionState, SessionStateMachine,
+};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub struct ActiveSession {
@@ -36,6 +45,14 @@ pub struct AppState {
     pub active_session: RwLock<Option<ActiveSession>>,
     pub last_stop_result: RwLock<Option<StopRecordingResult>>,
     pub project_base_dir: PathBuf,
+    pub opened_project: Mutex<Option<crate::project::ProjectReader>>,
+    pub playback: Mutex<PlaybackOwner>,
+    pub playback_shutdown: std::sync::atomic::AtomicBool,
+    pub preview: Mutex<PreviewOwner>,
+    pub encoder_gate: Arc<EncoderGate>,
+    pub export: Mutex<crate::export::ExportOwner>,
+    pub waveform_epoch: AtomicU64,
+    pub waveform_generations: Mutex<HashMap<String, u64>>,
     pub permission_override: RwLock<Option<PermissionStatus>>,
     pub native_capture_enabled: bool,
     /// Diagnostics bag for the active session: most-recent runtime error
@@ -52,6 +69,14 @@ impl AppState {
             active_session: RwLock::new(None),
             last_stop_result: RwLock::new(None),
             project_base_dir,
+            opened_project: Mutex::new(None),
+            playback: Mutex::new(PlaybackOwner::closed()),
+            playback_shutdown: std::sync::atomic::AtomicBool::new(false),
+            preview: Mutex::new(PreviewOwner::new()),
+            encoder_gate: Arc::new(EncoderGate::new()),
+            export: Mutex::new(crate::export::ExportOwner::new()),
+            waveform_epoch: AtomicU64::new(0),
+            waveform_generations: Mutex::new(HashMap::new()),
             permission_override: RwLock::new(None),
             native_capture_enabled: cfg!(target_os = "macos"),
             diagnostics: Arc::new(SessionDiagnostics::new()),
@@ -65,6 +90,14 @@ impl AppState {
             active_session: RwLock::new(None),
             last_stop_result: RwLock::new(None),
             project_base_dir,
+            opened_project: Mutex::new(None),
+            playback: Mutex::new(PlaybackOwner::closed()),
+            playback_shutdown: std::sync::atomic::AtomicBool::new(false),
+            preview: Mutex::new(PreviewOwner::new()),
+            encoder_gate: Arc::new(EncoderGate::new()),
+            export: Mutex::new(crate::export::ExportOwner::new()),
+            waveform_epoch: AtomicU64::new(0),
+            waveform_generations: Mutex::new(HashMap::new()),
             permission_override: RwLock::new(Some(PermissionStatus {
                 screen_recording: PermissionState::Authorized,
                 camera: PermissionState::Authorized,
@@ -76,13 +109,27 @@ impl AppState {
     }
 }
 
+/// Returns the cross-platform default storage directory for AeroShoot recordings and projects:
+/// `Documents/AeroShootRec/` on macOS, Windows, and Linux.
+pub fn default_projects_dir() -> PathBuf {
+    let docs_dir = dirs::document_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Documents")))
+        .unwrap_or_else(std::env::temp_dir);
+    docs_dir.join("AeroShootRec")
+}
+
+pub fn get_default_projects_dir_impl() -> String {
+    default_projects_dir().to_string_lossy().into_owned()
+}
+
 impl Default for AppState {
     fn default() -> Self {
-        let base_dir = std::env::temp_dir().join("AeroShootRecordings");
+        let base_dir = default_projects_dir();
         let _ = fs::create_dir_all(&base_dir);
         Self::new(base_dir)
     }
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -147,6 +194,7 @@ pub struct SourceGeometryResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct StopRecordingResult {
+    pub project_path: String,
     pub session_id: String,
     pub state: SessionState,
     pub duration_us: u64,
@@ -249,6 +297,35 @@ pub fn get_permission_status_impl(state: &AppState) -> PermissionStatus {
     crate::capture::check_system_permissions()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenSettingsResult {
+    pub opened: bool,
+}
+
+pub fn open_system_privacy_settings_impl(pane: Option<String>) -> OpenSettingsResult {
+    #[cfg(target_os = "macos")]
+    {
+        let url = match pane.as_deref() {
+            Some("ScreenCapture") => "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+            Some("Camera") => "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
+            Some("Microphone") => "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+            Some("Accessibility") => "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            Some("InputMonitoring") | Some("ListenEvent") => "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+            _ => "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+        };
+        let status = std::process::Command::new("open").arg(url).status();
+        OpenSettingsResult {
+            opened: status.map(|s| s.success()).unwrap_or(false),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pane;
+        OpenSettingsResult { opened: false }
+    }
+}
+
 pub fn start_recording_impl(
     state: &AppState,
     options: StartRecordingOptions,
@@ -256,7 +333,11 @@ pub fn start_recording_impl(
     // 1. Serialize all lifecycle commands
     let _cmd_guard = state.command_lock.lock();
 
-    // 2. Check system permissions for required screen recording
+    if state.export.lock().busy() { return Err("Wait for the current export to finish or cancel it before recording".into()); }
+
+    // 2. Check system permissions for required screen recording. Camera and
+    // microphone are optional tracks: if those TCC grants are missing, drop
+    // them and still record the screen instead of failing the whole session.
     let permissions = get_permission_status_impl(state);
     if !permissions.screen_recording.is_authorized() {
         let _ = state.state_machine.transition_to(SessionState::Error);
@@ -265,18 +346,12 @@ pub fn start_recording_impl(
                 .into(),
         );
     }
-    if options.camera_id.is_some() && !permissions.camera.is_authorized() {
-        let _ = state.state_machine.transition_to(SessionState::Error);
-        return Err(
-            "Camera permission denied. Please grant permission in macOS System Settings.".into(),
-        );
+    let mut options = options;
+    if !permissions.camera.is_authorized() {
+        options.camera_id = None;
     }
-    if options.mic_id.is_some() && !permissions.microphone.is_authorized() {
-        let _ = state.state_machine.transition_to(SessionState::Error);
-        return Err(
-            "Microphone permission denied. Please grant permission in macOS System Settings."
-                .into(),
-        );
+    if !permissions.microphone.is_authorized() {
+        options.mic_id = None;
     }
 
     // 3. Retry/Idempotency check: if already recording or preparing, return active session
@@ -411,13 +486,10 @@ pub fn start_recording_impl(
             width,
             height,
         });
-    let geometry = crate::capture::compute_source_geometry(
-        &resolved_source,
-        width,
-        height,
-        FitMode::Fit,
-    );
+    let geometry =
+        crate::capture::compute_source_geometry(&resolved_source, width, height, FitMode::Fit);
     bundle.manifest_mut().source_geometry = Some(geometry);
+    bundle.manifest_mut().cursor_mode = Some("baked".into());
 
     let manifest_path = bundle.root_path().join("manifest.json");
     bundle
@@ -693,16 +765,15 @@ pub fn stop_recording_impl(state: &AppState) -> Result<StopRecordingResult, Stri
     #[cfg(not(target_os = "macos"))]
     let was_native = false;
     #[cfg(target_os = "macos")]
-    let native_stop_result: Option<Result<(), (i32, String)>> = if let Some(native) =
-        session.native_session.take()
-    {
-        // Use the typed stop so we can refuse to commit failed media.
-        // The legacy `stop` is reserved for the Drop impl, which is a
-        // last-resort cleanup path.
-        Some(native.stop_with_result())
-    } else {
-        None
-    };
+    let native_stop_result: Option<Result<(), (i32, String)>> =
+        if let Some(native) = session.native_session.take() {
+            // Use the typed stop so we can refuse to commit failed media.
+            // The legacy `stop` is reserved for the Drop impl, which is a
+            // last-resort cleanup path.
+            Some(native.stop_with_result())
+        } else {
+            None
+        };
 
     // Clear the global callback targets now that the session is over;
     // any late callback after this point must be a no-op.
@@ -775,107 +846,8 @@ pub fn stop_recording_impl(state: &AppState) -> Result<StopRecordingResult, Stri
             let _ = state.state_machine.transition_to(SessionState::Error);
             return Err(format!(
                 "Native capture stopped with error (code {code}): {message}. \
-                 No media was committed; recovery may salvage partial files."
+                 Previously committed segments remain available for recovery."
             ));
-        }
-
-        let existing_journal_records = session.project_bundle.journal().read_all().unwrap_or_default();
-        let already_journaled_paths: std::collections::HashSet<String> = existing_journal_records
-            .into_iter()
-            .filter_map(|r| match r {
-                JournalRecord::SegmentCommitted { relative_path, .. } => Some(relative_path),
-                _ => None,
-            })
-            .collect();
-
-        for track in session.project_bundle.manifest().tracks.clone() {
-            let track_dir = session.project_bundle.root_path().join("media").join(&track.id);
-            if let Ok(entries) = fs::read_dir(&track_dir) {
-                for entry in entries.flatten() {
-                    let entry_path = entry.path();
-                    let name = entry_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if name.ends_with(".tmp") {
-                        let final_name = name.trim_end_matches(".tmp");
-                        let final_path = track_dir.join(final_name);
-                        let rel_path = format!("media/{}/{}", track.id, final_name);
-                        if already_journaled_paths.contains(&rel_path) {
-                            let _ = fs::remove_file(&entry_path);
-                            continue;
-                        }
-                        if let Ok(info) = MediaValidator::validate(&entry_path, track.track_type) {
-                            if !final_path.exists() {
-                                if fs::rename(&entry_path, &final_path).is_ok() {
-                                    if let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&final_path) {
-                                        let _ = file.sync_all();
-                                        if let Ok(meta) = file.metadata() {
-                                            if let Some(parent) = final_path.parent() {
-                                                if let Ok(dir) = fs::File::open(parent) {
-                                                    let _ = dir.sync_all();
-                                                }
-                                            }
-                                            let seg_start = if info.start_us > 0 {
-                                                info.start_us
-                                            } else {
-                                                0
-                                            };
-                                            let seg_end = if info.end_us > seg_start {
-                                                info.end_us
-                                            } else {
-                                                seg_start.saturating_add(info.duration_us.max(final_segment_end_us.saturating_sub(seg_start)))
-                                            };
-                                            let _ = session.project_bundle.journal().append(JournalRecord::SegmentCommitted {
-                                                seq: 0,
-                                                track_id: track.id.clone(),
-                                                relative_path: rel_path,
-                                                start_us: seg_start,
-                                                end_us: seg_end,
-                                                size_bytes: meta.len(),
-                                                is_keyframe_start: true,
-                                                media_timescale: info.media_timescale,
-                                                media_start_value: info.media_start_value,
-                                                host_anchor_us: info.host_anchor_us,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            eprintln!(
-                                "stop: rejecting native segment {:?}; retained for recovery",
-                                entry_path
-                            );
-                        }
-                    } else if (name.ends_with(".mp4") || name.ends_with(".wav")) && !already_journaled_paths.contains(&format!("media/{}/{}", track.id, name)) {
-                        let rel_path = format!("media/{}/{}", track.id, name);
-                        if let Ok(info) = MediaValidator::validate(&entry_path, track.track_type) {
-                            if let Ok(meta) = entry_path.metadata() {
-                                let seg_start = if info.start_us > 0 {
-                                    info.start_us
-                                } else {
-                                    0
-                                };
-                                let seg_end = if info.end_us > seg_start {
-                                    info.end_us
-                                } else {
-                                    seg_start.saturating_add(info.duration_us.max(final_segment_end_us.saturating_sub(seg_start)))
-                                };
-                                let _ = session.project_bundle.journal().append(JournalRecord::SegmentCommitted {
-                                    seq: 0,
-                                    track_id: track.id.clone(),
-                                    relative_path: rel_path,
-                                    start_us: seg_start,
-                                    end_us: seg_end,
-                                    size_bytes: meta.len(),
-                                    is_keyframe_start: true,
-                                    media_timescale: info.media_timescale,
-                                    media_start_value: info.media_start_value,
-                                    host_anchor_us: info.host_anchor_us,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -916,6 +888,11 @@ pub fn stop_recording_impl(state: &AppState) -> Result<StopRecordingResult, Stri
         .map_err(|e| e.to_string())?;
 
     let result = StopRecordingResult {
+        project_path: session
+            .project_bundle
+            .root_path()
+            .to_string_lossy()
+            .into_owned(),
         session_id: session.session_id.clone(),
         state: SessionState::Completed,
         duration_us: net_duration_us,
@@ -956,11 +933,17 @@ pub fn get_session_status_impl(state: &AppState) -> SessionStatusResult {
         .and_then(|session| session.native_session.as_ref())
         .map(|session| {
             let stats = session.stats();
-            (stats.dropped_frames, stats.audio_buffer_underflows, stats.gaps_total, stats.timestamp_records_dropped)
+            (
+                stats.dropped_frames,
+                stats.audio_buffer_underflows,
+                stats.gaps_total,
+                stats.timestamp_records_dropped,
+            )
         })
         .unwrap_or((0, 0, 0, 0));
     #[cfg(not(target_os = "macos"))]
-    let (dropped_frames, audio_buffer_underflows, native_gaps, timestamp_records_dropped) = (0, 0, 0, 0);
+    let (dropped_frames, audio_buffer_underflows, native_gaps, timestamp_records_dropped) =
+        (0, 0, 0, 0);
 
     SessionStatusResult {
         state: current_state,
@@ -1007,7 +990,8 @@ pub fn compute_source_geometry_impl(
         return Err("dest_width and dest_height must be > 0".into());
     }
 
-    let geometry = crate::capture::compute_source_geometry(&source, dest_width, dest_height, fit_mode);
+    let geometry =
+        crate::capture::compute_source_geometry(&source, dest_width, dest_height, fit_mode);
     Ok(SourceGeometryResult {
         source,
         geometry,
@@ -1041,11 +1025,13 @@ mod tests {
         assert!(json.contains("\"captureSystemAudio\":true"));
 
         let res = StopRecordingResult {
+            project_path: "/tmp/example.aero".into(),
             session_id: "sess-abc".into(),
             state: SessionState::Completed,
             duration_us: 10_000_000,
         };
         let res_json = serde_json::to_string(&res).unwrap();
+        assert!(res_json.contains("\"projectPath\":\"/tmp/example.aero\""));
         assert!(res_json.contains("\"sessionId\":\"sess-abc\""));
         assert!(res_json.contains("\"durationUs\":10000000"));
     }
@@ -1130,13 +1116,9 @@ mod tests {
             .find(|s| s.id == "screen-secondary")
             .map(|s| s.id.clone())
             .unwrap_or_else(|| sources[0].id.clone());
-        let result = compute_source_geometry_impl(
-            target_id,
-            Some(1920),
-            Some(1080),
-            Some(FitMode::Fit),
-        )
-        .expect("source list should compute for known source");
+        let result =
+            compute_source_geometry_impl(target_id, Some(1920), Some(1080), Some(FitMode::Fit))
+                .expect("source list should compute for known source");
         assert_eq!(result.dest_width, 1920);
         assert_eq!(result.dest_height, 1080);
         assert_eq!(result.geometry.fit_mode, FitMode::Fit);
@@ -1153,4 +1135,373 @@ mod tests {
         let res = compute_source_geometry_impl("screen-main".into(), Some(0), Some(0), None);
         assert!(res.is_err());
     }
+
+    #[test]
+    fn test_default_projects_dir_resolves_documents_aeroshootrec() {
+        let path = default_projects_dir();
+        assert!(path.ends_with("Documents/AeroShootRec") || path.ends_with("Documents\\AeroShootRec") || path.ends_with("AeroShootRec"));
+        assert_eq!(get_default_projects_dir_impl(), path.to_string_lossy());
+    }
+}
+
+pub fn open_project_impl(state: &AppState, path: String) -> Result<OpenedProject, String> {
+    let _guard = state.command_lock.lock();
+    let reader = ProjectReader::open(std::path::Path::new(&path))?;
+    let summary = reader.summary.clone();
+    let tracks = playback::tracks_from_reader(&reader);
+    let document = reader.history().current.clone();
+    let mut owner = PlaybackOwner::open(
+        summary.project_handle.clone(),
+        reader.root().to_path_buf(),
+        &document,
+        tracks,
+    )?;
+    *state.opened_project.lock() = Some(reader);
+    owner.native_enabled = state.native_capture_enabled;
+    *state.playback.lock() = owner;
+    state.waveform_epoch.fetch_add(1, Ordering::SeqCst);
+    state.waveform_generations.lock().clear();
+    Ok(summary)
+}
+
+pub fn close_project_impl(state: &AppState, project_handle: String) -> Result<(), String> {
+    let _guard = state.command_lock.lock();
+    let mut opened = state.opened_project.lock();
+    if let Some(reader) = opened.as_ref() {
+        if reader.summary.project_handle != project_handle {
+            return Err("Stale project handle".into());
+        }
+    }
+    *opened = None;
+    state.playback.lock().close();
+    state.waveform_epoch.fetch_add(1, Ordering::SeqCst);
+    state.waveform_generations.lock().clear();
+    Ok(())
+}
+
+pub fn project_segments_impl(
+    state: &AppState,
+    project_handle: String,
+    track_id: String,
+    offset: usize,
+    limit: usize,
+) -> Result<SegmentPage, String> {
+    let opened = state.opened_project.lock();
+    let reader = opened.as_ref().ok_or("No opened project")?;
+    if reader.summary.project_handle != project_handle {
+        return Err("Stale project handle".into());
+    }
+    reader.page(&track_id, offset, limit)
+}
+
+pub fn project_waveform_impl(
+    state: &AppState,
+    project_handle: String,
+    track_id: String,
+    start_us: u64,
+    end_us: u64,
+    bucket_count: usize,
+) -> Result<WaveformPage, String> {
+    let epoch = state.waveform_epoch.load(Ordering::SeqCst);
+    let generation = {
+        let mut generations = state.waveform_generations.lock();
+        let slot = generations.entry(track_id.clone()).or_insert(0);
+        *slot += 1;
+        *slot
+    };
+    let ctx = {
+        let opened = state.opened_project.lock();
+        let reader = opened.as_ref().ok_or("No opened project")?;
+        if reader.summary.project_handle != project_handle {
+            return Err("Stale project handle".into());
+        }
+        let track = reader
+            .summary
+            .tracks
+            .iter()
+            .find(|track| track.descriptor.id == track_id)
+            .ok_or("Unknown track")?;
+        WaveformTrackContext {
+            root: reader.root().to_path_buf(),
+            track_id: track_id.clone(),
+            track_type: track.descriptor.track_type,
+            segments: reader
+                .segments_for(&track_id)
+                .ok_or("Unknown track")?
+                .to_vec(),
+            retained: reader.summary.retained_intervals.clone(),
+            edited_duration_us: reader.summary.edited_duration_us,
+        }
+    };
+    crate::project::waveform::query_waveform(&ctx, start_us, end_us, bucket_count, &|| {
+        if state.waveform_epoch.load(Ordering::SeqCst) != epoch {
+            return true;
+        }
+        state
+            .waveform_generations
+            .lock()
+            .get(&track_id)
+            .copied()
+            .unwrap_or(0)
+            != generation
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EditCut {
+    pub start_us: u64,
+    pub end_us: u64,
+}
+
+fn require_handle(reader: &ProjectReader, project_handle: &str) -> Result<(), String> {
+    if reader.summary.project_handle != project_handle {
+        return Err("Stale project handle".into());
+    }
+    Ok(())
+}
+
+pub fn project_ripple_cuts_impl(
+    state: &AppState,
+    project_handle: String,
+    expected_revision: u64,
+    cuts: Vec<EditCut>,
+) -> Result<OpenedProject, String> {
+    let _guard = state.command_lock.lock();
+    let mut opened = state.opened_project.lock();
+    let reader = opened.as_mut().ok_or("No opened project")?;
+    require_handle(reader, &project_handle)?;
+    let ranges: Vec<(u64, u64)> = cuts
+        .into_iter()
+        .map(|cut| (cut.start_us, cut.end_us))
+        .collect();
+    let summary = reader.ripple_cuts(expected_revision, &ranges)?;
+    state
+        .playback
+        .lock()
+        .apply_document(&reader.history().current)?;
+    state.waveform_epoch.fetch_add(1, Ordering::SeqCst);
+    Ok(summary)
+}
+
+pub fn project_undo_impl(
+    state: &AppState,
+    project_handle: String,
+    expected_revision: u64,
+) -> Result<OpenedProject, String> {
+    let _guard = state.command_lock.lock();
+    let mut opened = state.opened_project.lock();
+    let reader = opened.as_mut().ok_or("No opened project")?;
+    require_handle(reader, &project_handle)?;
+    let summary = reader.undo(expected_revision)?;
+    state
+        .playback
+        .lock()
+        .apply_document(&reader.history().current)?;
+    state.waveform_epoch.fetch_add(1, Ordering::SeqCst);
+    Ok(summary)
+}
+
+pub fn project_redo_impl(
+    state: &AppState,
+    project_handle: String,
+    expected_revision: u64,
+) -> Result<OpenedProject, String> {
+    let _guard = state.command_lock.lock();
+    let mut opened = state.opened_project.lock();
+    let reader = opened.as_mut().ok_or("No opened project")?;
+    require_handle(reader, &project_handle)?;
+    let summary = reader.redo(expected_revision)?;
+    state
+        .playback
+        .lock()
+        .apply_document(&reader.history().current)?;
+    state.waveform_epoch.fetch_add(1, Ordering::SeqCst);
+    Ok(summary)
+}
+
+pub fn playback_status_impl(
+    state: &AppState,
+    project_handle: String,
+) -> Result<PlaybackStatus, String> {
+    let mut playback = state.playback.lock();
+    let status = playback.status()?;
+    if status.state == crate::playback::PlaybackState::Closed {
+        return Err("Playback is closed".into());
+    }
+    if status.project_handle != project_handle {
+        return Err("Stale project handle".into());
+    }
+    Ok(status)
+}
+
+pub fn playback_play_impl(
+    state: &AppState,
+    project_handle: String,
+) -> Result<PlaybackStatus, String> {
+    let mut playback = state.playback.lock();
+    if playback.status()?.project_handle != project_handle {
+        return Err("Stale project handle".into());
+    }
+    playback.play()
+}
+
+pub fn playback_pause_impl(
+    state: &AppState,
+    project_handle: String,
+) -> Result<PlaybackStatus, String> {
+    let mut playback = state.playback.lock();
+    if playback.status()?.project_handle != project_handle {
+        return Err("Stale project handle".into());
+    }
+    playback.pause()
+}
+
+pub fn playback_seek_impl(
+    state: &AppState,
+    project_handle: String,
+    edited_us: u64,
+) -> Result<PlaybackStatus, String> {
+    let mut playback = state.playback.lock();
+    if playback.status()?.project_handle != project_handle {
+        return Err("Stale project handle".into());
+    }
+    playback.seek(edited_us)
+}
+
+pub fn preview_attach_impl(
+    state: &AppState,
+    window_label: String,
+    hit_mode: PreviewHitMode,
+    native_window: Option<*mut std::ffi::c_void>,
+) -> Result<PreviewStatus, String> {
+    if native_window.is_none() {
+        return Err("Native preview requires a desktop window".into());
+    }
+    state
+        .preview
+        .lock()
+        .attach(window_label, hit_mode, native_window)
+}
+
+pub fn preview_layout_impl(
+    state: &AppState,
+    viewport: PreviewViewport,
+) -> Result<PreviewStatus, String> {
+    if viewport.generation == 0 { return Err("Preview generation is required".into()); }
+    state.preview.lock().layout(viewport)
+}
+
+pub fn preview_present_fixed_impl(
+    state: &AppState,
+    r: f32,
+    g: f32,
+    b: f32,
+    generation: u64,
+) -> Result<PreviewStatus, String> {
+    state.preview.lock().present_fixed(r, g, b, generation)
+}
+
+pub fn preview_present_fixture_impl(
+    state: &AppState,
+    path: String,
+    generation: u64,
+) -> Result<PreviewStatus, String> {
+    state.preview.lock().present_fixture(&path, generation)
+}
+
+pub fn preview_status_impl(state: &AppState) -> PreviewStatus {
+    state.preview.lock().status()
+}
+
+pub fn preview_hit_test_impl(state: &AppState, x: f64, y: f64) -> bool {
+    state.preview.lock().hit_test(x, y)
+}
+
+pub fn preview_detach_impl(
+    state: &AppState,
+    window_label: String,
+) -> Result<PreviewStatus, String> {
+    let mut preview = state.preview.lock();
+    if preview.status().attached
+        && preview.status().window_label.as_deref() != Some(window_label.as_str())
+    {
+        return Err("Stale preview window label".into());
+    }
+    preview.detach();
+    Ok(preview.status())
+}
+
+pub fn media_interop_status_impl(state: &AppState) -> MediaInteropStatus {
+    let _ = state;
+    crate::media::interop_status(
+        None,
+        vec![
+            "FFmpeg is not pinned; VideoToolbox implements the decoder/encoder contract".into(),
+            "WGPU uses a CPU upload/readback fallback; Metal texture interop is untested".into(),
+        ],
+    )
+}
+
+pub fn media_run_parity_impl(state: &AppState) -> Result<MediaParityReport, String> {
+    let dir = std::env::temp_dir().join(format!("aeroshoot-f2-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let report = crate::render::run_parity(&dir, &state.encoder_gate);
+    let _ = std::fs::remove_dir_all(&dir);
+    report
+}
+
+pub fn export_start_impl(
+    state: &AppState,
+    project_handle: String,
+    settings: crate::export::ExportSettings,
+) -> Result<crate::export::ExportStatus, String> {
+    let _guard = state.command_lock.lock();
+    let session_state = state.state_machine.current();
+    let opened = state.opened_project.lock();
+    let reader = opened.as_ref().ok_or("No opened project")?;
+    require_handle(reader, &project_handle)?;
+    let document = reader.history().current.clone();
+    let tracks = playback::tracks_from_reader(reader);
+    let root = reader.root().to_path_buf();
+    let name = reader.summary.manifest.project_name.clone();
+    drop(opened);
+    let gate = Arc::clone(&state.encoder_gate);
+    let mut owner = state.export.lock();
+    match crate::export::prepare_job(
+        session_state,
+        &root,
+        &name,
+        document,
+        tracks,
+        settings,
+        &mut owner,
+    ) {
+        Ok(captured) => Ok(crate::export::spawn_job(captured, &mut owner, gate)),
+        Err(status) => {
+            owner.install_failed(status.clone());
+            Ok(status)
+        }
+    }
+}
+
+pub fn export_status_impl(
+    state: &AppState,
+    job_id: Option<String>,
+) -> Result<crate::export::ExportStatus, String> {
+    let mut owner = state.export.lock();
+    let status = owner.status();
+    if let Some(id) = job_id {
+        if !status.job_id.is_empty() && status.job_id != id {
+            return Err("Stale export job id".into());
+        }
+    }
+    Ok(status)
+}
+
+pub fn export_cancel_impl(
+    state: &AppState,
+    job_id: String,
+) -> Result<crate::export::ExportStatus, String> {
+    state.export.lock().cancel(&job_id)
 }
