@@ -1,3 +1,4 @@
+pub mod preview;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -161,8 +162,10 @@ pub fn compute_source_geometry(
         FitMode::Fit => fit_letterbox(source.width, source.height, dest_width, dest_height),
         FitMode::Fill => fit_crop(source.width, source.height, dest_width, dest_height),
     };
-    // On macOS 14+ we can let SCStreamConfiguration preserve aspect
-    // ratio itself; otherwise the math above is the source of truth.
+    // On macOS 14+ ScreenCaptureKit letterboxes into width×height when
+    // preservesAspectRatio is set. Do not also apply sourceRect/destinationRect:
+    // those compositor pixel rects are a different coordinate space (points vs
+    // pixels on Retina) and double-letterbox into a tiny or stretched frame.
     let preserves_aspect_ratio = matches!(fit_mode, FitMode::Fit) && is_macos_14_plus();
     SourceGeometry {
         source_rect,

@@ -118,6 +118,25 @@ impl TimelineMapper {
         Ok(())
     }
 
+    /// Maps a half-open source range onto edited ranges. Cuts split the result;
+    /// removed source time is omitted rather than interpolated.
+    pub fn source_range_to_edited(&self, start_us: u64, end_us: u64) -> Vec<(u64, u64)> {
+        let mut ranges = Vec::new();
+        let mut edited_cursor = 0u64;
+        for interval in &self.intervals {
+            let duration = interval.duration_us();
+            let a = start_us.max(interval.start_us);
+            let b = end_us.min(interval.end_us);
+            if a < b {
+                let edited_a = edited_cursor + (a - interval.start_us);
+                let edited_b = edited_cursor + (b - interval.start_us);
+                ranges.push((edited_a, edited_b));
+            }
+            edited_cursor += duration;
+        }
+        ranges
+    }
+
     /// Maps a source recording timestamp `source_us` to its edited timeline position.
     /// Returns `None` if the source timestamp was cut/excluded.
     pub fn source_to_edited_us(&self, source_us: u64) -> Option<u64> {
@@ -194,5 +213,9 @@ mod tests {
         cut.ripple_cut_edited(1_000_000, 2_000_000).unwrap();
         assert_eq!(cut.total_edited_duration_us(), 6_000_000);
         assert_eq!(cut.edited_to_source_us(1_000_000), Some(5_000_000));
+        assert_eq!(
+            mapper.source_range_to_edited(1_000_000, 6_000_000),
+            vec![(1_000_000, 2_000_000), (2_000_000, 3_000_000)]
+        );
     }
 }

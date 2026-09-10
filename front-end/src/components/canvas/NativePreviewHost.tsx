@@ -4,15 +4,23 @@ import { api } from "../../lib/ipc";
 import { PreviewHitMode, PreviewStatus } from "../../lib/types";
 
 interface NativePreviewHostProps {
+  live?: boolean;
   windowLabel?: string;
   hitMode?: PreviewHitMode;
   className?: string;
+  surface?: "studio" | "hud";
+  fitAspectRatio?: number;
+  showStatus?: boolean;
 }
 
 export function NativePreviewHost({
+  live = false,
   windowLabel = "main",
   hitMode = "consume",
   className = "w-full max-w-4xl aspect-video",
+  surface = "studio",
+  fitAspectRatio,
+  showStatus = true,
 }: NativePreviewHostProps) {
   const previewAvailable = useProjectStore(s => s.previewAvailable);
   const playbackError = useProjectStore(s => s.playbackError);
@@ -51,38 +59,68 @@ export function NativePreviewHost({
       const key = JSON.stringify(viewport);
       if (key === lastGeometry) return;
       sending = true;
-      void api.previewLayout({ ...viewport, revision: ++revision })
+      const layout = surface === "hud" ? api.hudPreviewLayout : api.previewLayout;
+      void layout({ ...viewport, revision: ++revision })
         .then(next => { if (!cancelled) { lastGeometry = key; setStatus(next); setError(undefined); } })
         .catch(err => { if (!cancelled) setError(String(err)); })
         .finally(() => { sending = false; });
     };
-    void api.previewAttach(windowLabel, hitMode).then(attached => {
+    const attach = surface === "hud"
+      ? api.hudPreviewAttach(windowLabel, hitMode).then(() => api.hudPreviewStatus())
+      : api.previewAttach(windowLabel, hitMode);
+    void attach.then(attached => {
       generation = attached.generation;
-      if (cancelled) { void api.previewDetach(windowLabel, generation).catch(() => undefined); return; }
+      if (cancelled) {
+        if (surface === "hud") void api.hudClose().catch(() => undefined);
+        else void api.previewDetach(windowLabel, generation).catch(() => undefined);
+        return;
+      }
       setStatus(attached); setError(undefined);
       update();
     }).catch(err => { if (!cancelled) setError(String(err)); });
     return () => {
       cancelled = true;
       cancelAnimationFrame(animation);
-      if (generation !== undefined) void api.previewDetach(windowLabel, generation).catch(() => undefined);
+      if (generation !== undefined) {
+        if (surface === "hud") void api.hudClose().catch(() => undefined);
+        else void api.previewDetach(windowLabel, generation).catch(() => undefined);
+      }
     };
-  }, [windowLabel, hitMode]);
+  }, [windowLabel, hitMode, surface]);
 
   return (
-    <div className="w-full flex flex-col items-center gap-2">
+    <div className={`w-full flex flex-col items-center gap-2 ${fitAspectRatio || surface === "hud" ? "h-full min-h-0" : ""}`}>
       <div
-        ref={hostRef}
-        data-native-preview-host
-        className={`pointer-events-none rounded-xl border border-studio-800 bg-black/50 ${className}`}
-      />
-      <p className="text-xs text-studio-400 max-w-md text-center">
-        {error || playbackError
+        className={
+          fitAspectRatio || surface === "hud"
+            ? "w-full flex-1 min-h-0 flex items-center justify-center overflow-hidden"
+            : "contents"
+        }
+      >
+        <div
+          ref={hostRef}
+          data-native-preview-host
+          className={
+            surface === "hud"
+              ? `pointer-events-none shrink-0 w-full h-full ${className}`
+              : `pointer-events-none rounded-xl border border-studio-800 bg-black/50 ${fitAspectRatio ? "w-full h-full min-h-0" : `shrink-0 ${className}`}`
+          }
+          data-content-aspect-ratio={fitAspectRatio}
+        />
+      </div>
+      {showStatus && <p className="text-xs text-studio-400 max-w-md text-center shrink-0">
+        {error || (!live && playbackError)
           ? error || playbackError
           : status?.attached
-            ? previewAvailable ? "" : "Loading project preview…"
+            ? live
+              ? surface === "hud"
+                ? "Live camera from the capture session"
+                : "Live screen and selected webcam"
+              : previewAvailable
+                ? ""
+                : "Loading project preview…"
             : "Native preview surface is not attached."}
-      </p>
+      </p>}
     </div>
   );
 }

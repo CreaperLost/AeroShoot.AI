@@ -12,6 +12,9 @@ import QuartzCore
 private enum PreviewHitMode: Int32 {
   case consume = 0
   case circlePassthrough = 1
+  case passthrough = 2
+  case circleDragPassthrough = 3
+  case squircleDragPassthrough = 4
 }
 
 private final class AeroShootPreviewView: NSView {
@@ -30,6 +33,9 @@ private final class AeroShootPreviewView: NSView {
   override var wantsUpdateLayer: Bool { true }
 
   override func hitTest(_ point: NSPoint) -> NSView? {
+    if hitMode == .passthrough || hitMode == .circleDragPassthrough || hitMode == .squircleDragPassthrough {
+      return nil
+    }
     let local = convert(point, from: superview)
     if let clipRect, !clipRect.contains(local) { return nil }
     if hitMode == .circlePassthrough && !PreviewGeometry.circleContains(bounds: bounds, point: local) {
@@ -38,10 +44,31 @@ private final class AeroShootPreviewView: NSView {
     return super.hitTest(point)
   }
 
+  func applyShape() {
+    guard let layer else { return }
+    layer.masksToBounds = true
+    switch hitMode {
+    case .circlePassthrough, .circleDragPassthrough:
+      layer.cornerRadius = min(bounds.width, bounds.height) / 2
+    case .squircleDragPassthrough:
+      layer.cornerRadius = min(28, min(bounds.width, bounds.height) / 4)
+    case .consume, .passthrough:
+      layer.cornerRadius = 0
+    }
+    // HUD overlays are square/circle windows showing a 16:9 camera mailbox.
+    // Aspect-fit left a large empty (often white) disk with a squeezed image.
+    switch hitMode {
+    case .consume:
+      layer.contentsGravity = .resizeAspect
+    case .passthrough, .circlePassthrough, .circleDragPassthrough, .squircleDragPassthrough:
+      layer.contentsGravity = .resizeAspectFill
+    }
+  }
+
   override func updateLayer() {
     layer?.backgroundColor = fill.cgColor
     layer?.contents = image
-    layer?.contentsGravity = .resize
+    applyShape()
   }
 }
 
@@ -62,6 +89,18 @@ enum PreviewGeometry {
       y: (y * s).rounded(),
       width: (width * s).rounded(),
       height: (height * s).rounded()
+    )
+  }
+
+  /// DOM rectangles use a top-left origin. Most AppKit views use a bottom-left
+  /// origin, so convert the y-axis before asking AppKit to translate between
+  /// the webview and its parent.
+  static func webRect(css: NSRect, bounds: NSRect, isFlipped: Bool) -> NSRect {
+    NSRect(
+      x: bounds.minX + css.minX,
+      y: isFlipped ? bounds.minY + css.minY : bounds.maxY - css.maxY,
+      width: css.width,
+      height: css.height
     )
   }
 }
@@ -171,13 +210,18 @@ func previewSetGeometry(
     let web = parent.flatMap(findWebView) ?? parent
     let css = NSRect(x: x, y: y, width: width, height: height)
     if let web, let parent, web !== parent {
-      let flipped = NSRect(x: css.minX, y: css.minY, width: css.width, height: css.height)
-      surface.view.frame = web.convert(flipped, to: parent)
+      let webRect = PreviewGeometry.webRect(css: css, bounds: web.bounds, isFlipped: web.isFlipped)
+      surface.view.frame = web.convert(webRect, to: parent)
     } else {
-      surface.view.frame = css
+      let bounds = parent?.bounds ?? .zero
+      surface.view.frame = PreviewGeometry.webRect(
+        css: css,
+        bounds: bounds,
+        isFlipped: parent?.isFlipped ?? true)
     }
     surface.physical = PreviewGeometry.physical(
       x: x, y: y, width: width, height: height, scale: backingScale)
+    surface.view.applyShape()
     surface.view.needsDisplay = true
     return 0
   }
@@ -201,6 +245,7 @@ func previewSetHitMode(_ handle: UnsafeMutableRawPointer?, _ mode: Int32) -> Int
   guard let surface = takeSurface(handle) else { return 1 }
   return onMain {
     surface.view.hitMode = PreviewHitMode(rawValue: mode) ?? .consume
+    surface.view.applyShape()
     return 0
   }
 }
@@ -459,6 +504,15 @@ enum AeroShootPreviewTests {
       point: NSPoint(x: 1, y: 1)))
     let physical = PreviewGeometry.physical(x: 10, y: 20, width: 100, height: 50, scale: 2)
     assert(physical.width == 200 && physical.height == 100)
+    let css = NSRect(x: 10, y: 20, width: 100, height: 50)
+    assert(PreviewGeometry.webRect(
+      css: css,
+      bounds: NSRect(x: 0, y: 0, width: 320, height: 240),
+      isFlipped: false) == NSRect(x: 10, y: 170, width: 100, height: 50))
+    assert(PreviewGeometry.webRect(
+      css: css,
+      bounds: NSRect(x: 0, y: 0, width: 320, height: 240),
+      isFlipped: true) == css)
 
     let window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
@@ -517,6 +571,21 @@ enum AeroShootPreviewTests {
     assert(previewSetClip(hudHandle, 60, 0, 60, 120) == 0)
     assert(previewHitTest(hudHandle, 30, 60) == 0)
     assert(previewHitTest(hudHandle, 90, 60) == 1)
+    assert(previewSetHitMode(hudHandle, 3) == 0)
+    assert(previewHitTest(hudHandle, 60, 60) == 0)
+    if let stats = previewCopyStatsJson(hudHandle) {
+      let text = String(cString: stats)
+      free(stats)
+      assert(text.contains("\"hitMode\":3"))
+    }
+    let hudView = AeroShootPreviewView(frame: NSRect(x: 0, y: 0, width: 120, height: 120))
+    hudView.wantsLayer = true
+    hudView.hitMode = .circleDragPassthrough
+    hudView.updateLayer()
+    assert(hudView.layer?.contentsGravity == .resizeAspectFill)
+    hudView.hitMode = .consume
+    hudView.updateLayer()
+    assert(hudView.layer?.contentsGravity == .resizeAspect)
 
     previewDetach(handle)
     previewDetach(hudHandle)

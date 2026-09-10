@@ -12,9 +12,14 @@ import { PermissionBundle } from "../../lib/types";
 interface TopNavBarProps {
   permissions?: PermissionBundle;
   onOpenSettings?: () => void;
+  sessionLocked?: boolean;
 }
 
-export const TopNavBar: React.FC<TopNavBarProps> = ({ permissions, onOpenSettings }) => {
+export const TopNavBar: React.FC<TopNavBarProps> = ({
+  permissions,
+  onOpenSettings,
+  sessionLocked = false,
+}) => {
   const { activeScene, setActiveScene, fps, setFps, resolution, setResolution } = useSettingsStore();
 
   const isPermissionsWarning =
@@ -24,9 +29,9 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({ permissions, onOpenSetting
       permissions.microphone === "denied");
 
   return (
-    <header className="h-14 border-b border-studio-800/80 bg-studio-900/90 backdrop-blur-xl px-5 flex items-center justify-between select-none z-30 shrink-0">
+    <header className="studio-top-nav h-14 border-b border-studio-800/80 bg-studio-900/90 backdrop-blur-xl px-5 select-none z-30 shrink-0">
       {/* 1. Left: Brand & Studio Name */}
-      <div className="flex items-center space-x-3">
+      <div className="studio-brand flex min-w-0 items-center space-x-3">
         <div className="flex items-center justify-center w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-600 to-indigo-400 text-white font-black text-sm shadow-md shadow-indigo-600/30">
           ▲
         </div>
@@ -58,11 +63,22 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({ permissions, onOpenSetting
         </button>
 
         <button
-          onClick={() => setActiveScene("edit")}
+          type="button"
+          onClick={() => {
+            if (!sessionLocked) setActiveScene("edit");
+          }}
+          disabled={sessionLocked}
+          title={
+            sessionLocked
+              ? "Stop or recover the recording session before opening Edit Studio"
+              : "Edit Studio"
+          }
           className={`flex items-center space-x-2 px-4 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 ${
             activeScene === "edit"
               ? "bg-gradient-to-r from-indigo-600 to-indigo-500 text-white shadow-lg shadow-indigo-900/30 scale-[1.02]"
-              : "text-studio-400 hover:text-studio-200 hover:bg-studio-850/50"
+              : sessionLocked
+                ? "text-studio-600 cursor-not-allowed"
+                : "text-studio-400 hover:text-studio-200 hover:bg-studio-850/50"
           }`}
         >
           <Film className="w-3.5 h-3.5" />
@@ -71,7 +87,7 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({ permissions, onOpenSetting
       </div>
 
       {/* 3. Right: Quality Controls & Status */}
-      <div className="flex items-center space-x-3">
+      <div className="studio-quality flex items-center justify-self-end space-x-3">
         {/* FPS & Quality Toggle */}
         <div className="flex items-center bg-studio-950/60 border border-studio-800 rounded-lg p-0.5 text-[11px] font-mono">
           <button

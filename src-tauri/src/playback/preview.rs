@@ -37,6 +37,9 @@ pub struct PhysicalRect {
 pub enum PreviewHitMode {
     Consume,
     Circle,
+    PassThrough,
+    CirclePassThrough,
+    SquirclePassThrough,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -279,6 +282,9 @@ impl PreviewOwner {
                 x >= 0.0 && y >= 0.0 && x < viewport.width && y < viewport.height
             }
             PreviewHitMode::Circle => circle_consumes(viewport.width, viewport.height, x, y),
+            PreviewHitMode::PassThrough
+            | PreviewHitMode::CirclePassThrough
+            | PreviewHitMode::SquirclePassThrough => false,
         }
     }
 

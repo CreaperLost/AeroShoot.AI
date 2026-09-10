@@ -1,8 +1,21 @@
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import { X, Scissors, Check, Sliders, AlertCircle } from "lucide-react";
 import { useProjectStore } from "../../stores/projectStore";
 import { api } from "../../lib/ipc";
-import { SilenceConfig } from "../../lib/types";
+import { OpenedProject, SilenceConfig } from "../../lib/types";
+
+function preferredAudioTrackId(project: OpenedProject | null): string | undefined {
+  if (!project) return undefined;
+  const mic = project.tracks.find((track) => track.descriptor.trackType === "mic_audio");
+  const system = project.tracks.find((track) => track.descriptor.trackType === "system_audio");
+  return (mic ?? system)?.descriptor.id;
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === "string" && err.trim()) return err;
+  return "Silence detection failed.";
+}
 
 export const SilenceModal: React.FC = () => {
   const {
@@ -14,6 +27,7 @@ export const SilenceModal: React.FC = () => {
     applySilenceCuts,
     openedProject,
     applyOpenedProject,
+    silenceAnalysis,
   } = useProjectStore();
 
   const [config, setConfig] = useState<SilenceConfig>({
@@ -23,18 +37,55 @@ export const SilenceModal: React.FC = () => {
   });
 
   const [isDetecting, setIsDetecting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [diagnostics, setDiagnostics] = useState<string[]>([]);
+  const detectGeneration = useRef(0);
 
   if (!isSilenceModalOpen) return null;
 
+  const audioTrackId = preferredAudioTrackId(openedProject);
+
   const handleRunDetection = async () => {
+    if (!openedProject) {
+      setError("Open a project to detect silence.");
+      return;
+    }
+    if (!audioTrackId) {
+      setError("No microphone or system audio track is available.");
+      return;
+    }
+    const analyzedHandle = openedProject.projectHandle;
+    const analyzedRevision = openedProject.revision;
+    const generation = ++detectGeneration.current;
     setIsDetecting(true);
+    setError(null);
+    setDiagnostics([]);
     try {
-      const blocks = await api.detectSilence(config);
-      setSilenceBlocks(blocks);
+      const result = await api.detectSilence(analyzedHandle, audioTrackId, config);
+      if (generation !== detectGeneration.current) return;
+      const current = useProjectStore.getState().openedProject;
+      if (
+        !current ||
+        current.projectHandle !== analyzedHandle ||
+        current.revision !== analyzedRevision
+      ) {
+        return;
+      }
+      setSilenceBlocks(result.suggestions, {
+        projectHandle: analyzedHandle,
+        revision: analyzedRevision,
+      });
+      setDiagnostics(result.diagnostics ?? []);
+      if (result.suggestions.length === 0 && (result.diagnostics?.length ?? 0) > 0) {
+        setError(result.diagnostics.join(" · "));
+      }
     } catch (err) {
-      console.error("Failed to detect silence:", err);
+      if (generation !== detectGeneration.current) return;
+      setSilenceBlocks([]);
+      setDiagnostics([]);
+      setError(errorMessage(err));
     } finally {
-      setIsDetecting(false);
+      if (generation === detectGeneration.current) setIsDetecting(false);
     }
   };
 
@@ -135,13 +186,28 @@ export const SilenceModal: React.FC = () => {
             </div>
 
             <button
-              onClick={handleRunDetection}
-              disabled={isDetecting}
+              onClick={() => void handleRunDetection()}
+              disabled={isDetecting || !openedProject || !audioTrackId}
               className="w-full py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-semibold shadow-md transition-all"
             >
               {isDetecting ? "Scanning Audio Waveforms..." : "Scan & Preview Cuts"}
             </button>
           </div>
+
+          {error && (
+            <div className="p-4 rounded-xl bg-rose-950/40 border border-rose-600/40 flex items-start space-x-3 text-rose-200 text-xs">
+              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <span>{error}</span>
+            </div>
+          )}
+
+          {diagnostics.length > 0 && !error && (
+            <div className="p-4 rounded-xl bg-amber-950/30 border border-amber-600/30 text-amber-200 text-xs space-y-1">
+              {diagnostics.map((item) => (
+                <p key={item}>{item}</p>
+              ))}
+            </div>
+          )}
 
           {/* Detected Blocks Preview */}
           {activeSilenceBlocks.length > 0 && (
@@ -191,11 +257,11 @@ export const SilenceModal: React.FC = () => {
             </div>
           )}
 
-          {activeSilenceBlocks.length === 0 && !isDetecting && (
+          {activeSilenceBlocks.length === 0 && !isDetecting && !error && (
             <div className="p-4 rounded-xl bg-studio-850/60 border border-studio-800 flex items-center space-x-3 text-studio-400 text-xs">
               <AlertCircle className="w-4 h-4 text-studio-500 shrink-0" />
               <span>
-                Click &quot;Scan &amp; Preview Cuts&quot; to analyze audio tracks using SIMD-accelerated RMS scanning.
+                Click &quot;Scan &amp; Preview Cuts&quot; to analyze the open project&apos;s microphone or system audio.
               </span>
             </div>
           )}
@@ -211,19 +277,32 @@ export const SilenceModal: React.FC = () => {
           </button>
 
           <button
-            disabled={selectedCount === 0 || !openedProject}
+            disabled={selectedCount === 0 || !openedProject || !silenceAnalysis}
             onClick={() => {
-              if (!openedProject) return;
+              if (!openedProject || !silenceAnalysis) return;
+              if (
+                silenceAnalysis.projectHandle !== openedProject.projectHandle ||
+                silenceAnalysis.revision !== openedProject.revision
+              ) {
+                setSilenceBlocks([]);
+                setError("Silence suggestions are stale after a later edit. Scan again.");
+                return;
+              }
               const cuts = activeSilenceBlocks
                 .filter((block) => block.selected)
                 .map((block) => ({ startUs: block.startUs, endUs: block.endUs }));
               void api
-                .projectRippleCuts(openedProject.projectHandle, openedProject.revision, cuts)
+                .projectRippleCuts(
+                  silenceAnalysis.projectHandle,
+                  silenceAnalysis.revision,
+                  cuts,
+                )
                 .then((next) => {
                   applyOpenedProject(next);
                   applySilenceCuts();
+                  setError(null);
                 })
-                .catch((err) => console.error("Failed to apply cuts:", err));
+                .catch((err) => setError(errorMessage(err)));
             }}
             className="flex items-center space-x-2 px-5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-xs font-semibold shadow-lg transition-all"
           >

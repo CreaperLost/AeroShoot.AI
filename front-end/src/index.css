@@ -15,6 +15,167 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
+
+  input,
+  textarea {
+    user-select: text;
+    -webkit-user-select: text;
+  }
+
+  html.hud-root,
+  html.hud-root body,
+  body.hud-root {
+    background: transparent;
+    overflow: hidden;
+  }
+}
+
+@layer components {
+  .studio-top-nav {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    align-items: center;
+    gap: clamp(0.5rem, 1.5vw, 1.5rem);
+  }
+
+  .device-control-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.08fr) minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, 0.82fr) minmax(16rem, 1.15fr);
+    align-items: stretch;
+    gap: clamp(0.4rem, 0.8vw, 0.75rem);
+  }
+
+  .device-selectors-grid {
+    display: contents;
+  }
+
+  .device-control-card > div:nth-child(2) {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .device-control-card svg:last-child {
+    flex: 0 0 auto;
+  }
+
+  .ratio-control-grid {
+    display: grid;
+    grid-template-columns: auto repeat(4, minmax(0, 1fr));
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .project-destination-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(14rem, 0.65fr) auto;
+    align-items: center;
+    gap: 0.625rem;
+  }
+
+  .record-scene-grid {
+    display: grid;
+    grid-template-rows: auto auto auto minmax(0, 1fr);
+  }
+
+  .record-workspace-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) clamp(17rem, 24vw, 20rem);
+  }
+
+  .studio-inspector {
+    width: clamp(17rem, 24vw, 20rem);
+  }
+
+  .edit-studio-grid {
+    display: grid;
+    grid-template-rows: minmax(18rem, 1.65fr) minmax(12rem, 1fr);
+  }
+
+  @media (max-width: 1180px) {
+    .device-control-grid {
+      grid-template-columns: minmax(0, 1.08fr) minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 0.8fr) minmax(13rem, 1.05fr);
+      padding-inline: 0.75rem;
+    }
+
+    .device-control-card {
+      padding-inline: 0.55rem;
+      column-gap: 0.4rem;
+    }
+
+    .device-control-detail {
+      display: none;
+    }
+
+    .ratio-control-grid {
+      gap: 0;
+    }
+
+    .ratio-control-grid > span {
+      display: none;
+    }
+
+    .ratio-control-grid {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .record-workspace-grid {
+      grid-template-columns: minmax(0, 1fr) clamp(16rem, 27vw, 18rem);
+    }
+
+    .studio-inspector {
+      width: clamp(16rem, 27vw, 18rem);
+      padding: 1rem;
+    }
+  }
+
+  @media (max-width: 1020px) {
+    .studio-brand span:last-child,
+    .studio-quality > div:nth-child(2) span {
+      display: none;
+    }
+
+    .studio-top-nav {
+      padding-inline: 0.75rem;
+    }
+
+    .device-control-grid {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .ratio-control-grid {
+      grid-column: 1 / -1;
+    }
+
+    .project-destination-grid {
+      grid-template-columns: minmax(0, 1fr) minmax(12rem, 0.7fr);
+    }
+
+    .record-workspace-grid {
+      grid-template-columns: minmax(0, 1fr) 16rem;
+    }
+
+    .studio-inspector {
+      width: 16rem;
+    }
+  }
+
+  @media (max-height: 760px) {
+    .device-control-grid {
+      padding-block: 0.35rem;
+    }
+
+    .device-control-card {
+      padding-block: 0.35rem;
+    }
+
+    .project-destination-grid {
+      padding-block: 0.3rem;
+    }
+
+    .edit-studio-grid {
+      grid-template-rows: minmax(14rem, 1.55fr) minmax(10rem, 1fr);
+    }
+  }
 }
 
 /* Custom scrollbars */

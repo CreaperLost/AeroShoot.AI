@@ -278,6 +278,7 @@ fn export_matches_preview_at_cut_and_preserves_sources() {
         revision,
         retained_intervals: original,
         layout: Default::default(),
+        ..Default::default()
     };
     let mut preview = SceneEvaluator::new(root.clone(), document, tracks, 64, 64).unwrap();
     for index in [0u32, 1] {
@@ -443,4 +444,89 @@ fn cancellation_after_render_cleans_partial_file() {
     assert!(matches!(result, Err(ExportFailure::Cancelled { .. })));
     assert!(!dest.exists());
     assert!(!captured.temp.exists());
+}
+
+#[test]
+fn default_export_destination_and_bundle_refusal() {
+    use aeroshoot_lib::export::{default_destination, default_export_filename, is_inside_bundle};
+
+    // Test filename sanitization and extension handling
+    assert_eq!(default_export_filename("Launch Demo"), "Launch Demo.mp4");
+    assert_eq!(
+        default_export_filename("Launch Demo.mp4"),
+        "Launch Demo.mp4"
+    );
+    assert_eq!(
+        default_export_filename("Launch Demo.MP4"),
+        "Launch Demo.mp4"
+    );
+    assert_eq!(default_export_filename(""), "Untitled.mp4");
+    assert_eq!(default_export_filename("   "), "Untitled.mp4");
+    assert_eq!(
+        default_export_filename("Test/Slash:Colon*Star?"),
+        "TestSlashColonStar.mp4"
+    );
+
+    // Test default destination is next to the .aero folder
+    let dir = tempdir().unwrap();
+    let bundle_path = dir.path().join("My Project.aero");
+    fs::create_dir(&bundle_path).unwrap();
+    let dest = default_destination(&bundle_path, "My Project", 1);
+    assert_eq!(dest, dir.path().join("My Project.mp4"));
+    assert_eq!(dest.parent().unwrap(), dir.path());
+
+    // Test is_inside_bundle checks
+    assert!(is_inside_bundle(
+        &bundle_path.join("output.mp4"),
+        Some(&bundle_path)
+    ));
+    assert!(is_inside_bundle(
+        &bundle_path.join("media").join("screen.mp4"),
+        Some(&bundle_path)
+    ));
+    assert!(is_inside_bundle(&bundle_path, Some(&bundle_path)));
+    assert!(is_inside_bundle(
+        &dir.path().join("other.aero").join("out.mp4"),
+        Some(&bundle_path)
+    ));
+    assert!(!is_inside_bundle(
+        &dir.path().join("My Project.mp4"),
+        Some(&bundle_path)
+    ));
+    assert!(!is_inside_bundle(
+        &dir.path().join("export.mp4"),
+        Some(&bundle_path)
+    ));
+
+    // Test export_start_impl rejects destination inside bundle
+    let state = AppState::new_test(dir.path().into());
+    let (root, _screen, _mic) = two_color_project(dir.path(), "bundle_refusal");
+    let opened = open_project_impl(&state, root.to_string_lossy().into()).unwrap();
+
+    let inside = export_start_impl(
+        &state,
+        opened.project_handle.clone(),
+        settings(&root.join("inside.mp4")),
+    )
+    .unwrap();
+    assert_eq!(inside.state, ExportState::Failed);
+    assert!(matches!(
+        inside.failure,
+        Some(ExportFailure::SourcePath { .. })
+    ));
+    if let Some(ExportFailure::SourcePath { message }) = inside.failure {
+        assert!(message.contains("inside the project bundle"));
+    }
+
+    // Default destination (None requested) resolves next to the .aero folder
+    let mut default_settings = settings(&dir.path().join("dummy.mp4"));
+    default_settings.destination = None;
+    let prepared_dest =
+        aeroshoot_lib::export::resolve_destination(&root, "bundle_refusal", 1, None, &[]).unwrap();
+    assert_eq!(
+        prepared_dest,
+        fs::canonicalize(root.parent().unwrap())
+            .unwrap()
+            .join("bundle_refusal.mp4")
+    );
 }

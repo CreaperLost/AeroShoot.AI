@@ -95,3 +95,28 @@ fn native_audio_clock_advances_without_a_microphone() {
     std::thread::sleep(std::time::Duration::from_millis(30));
     assert!(output.position_frames().unwrap() >= first);
 }
+
+#[test]
+fn short_native_mp4_passes_recording_storage_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("short.mp4");
+    aeroshoot_lib::media::write_solid_h264(&path, 64, 64, 0.8, 0.2, 0.1).unwrap();
+    let info = aeroshoot_lib::project::media_validator::MediaValidator::validate(
+        &path,
+        aeroshoot_lib::project::TrackType::Screen,
+    )
+    .unwrap();
+    assert_eq!(info.sample_count, 6);
+    assert!(info.duration_us.abs_diff(200_000) < 20_000);
+    // Truncating encoded media must not be accepted as a completed recording.
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(std::fs::metadata(&path).unwrap().len() / 2)
+        .unwrap();
+    assert!(
+        aeroshoot_lib::project::media_validator::MediaValidator::validate(
+            &path,
+            aeroshoot_lib::project::TrackType::Screen
+        )
+        .is_err()
+    );
+}

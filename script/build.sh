@@ -211,7 +211,7 @@ build_desktop_release() {
   # Fallback: Direct cargo build --release + bundle assembly
   if [[ "$tauri_build_success" -eq 0 ]]; then
     echo "    Tauri CLI unavailable or exited non-zero; falling back to direct cargo release build..."
-    cargo build --release --manifest-path "$TAURI_DIR/Cargo.toml" --features tauri-app "$@"
+    cargo build --release --manifest-path "$TAURI_DIR/Cargo.toml" --features tauri-app,custom-protocol "$@"
 
     if [[ "$(uname -s)" == "Darwin" ]]; then
       assemble_macos_app_bundle

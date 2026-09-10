@@ -867,7 +867,8 @@ private final class Recorder: NSObject, SCStreamDelegate, SCStreamOutput, AVCapt
       guard
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
         let statusValue = attachments.first?[.status] as? Int,
-        SCFrameStatus(rawValue: statusValue) == .complete,
+        let status = SCFrameStatus(rawValue: statusValue),
+        status == .complete || status == .idle,
         CMSampleBufferGetImageBuffer(sampleBuffer) != nil
       else { return }
       timestampLog?.append(track: "screen", sample: sampleBuffer)
@@ -972,13 +973,10 @@ private enum MediaAppendOutcome {
 
 // MARK: - NativeClockCorrelation (Task 4)
 //
-// CoreMedia timestamps are not callback timestamps.  At session setup we
-// correlate each capture source's synchronization clock with the host clock
-// and retain the rational source anchor.  Samples are then mapped from their
-// original CMTime value/timescale; queue scheduling can therefore not change a
-// track's offset.  CMClockGetAnchorTime is used when available and the
-// CMSync conversion fallback is still performed at setup, never in a sample
-// callback.
+// SCStream and AVCaptureSession document that output PTS uses their
+// synchronizationClock. Convert that clock to host time, then subtract the
+// session epoch. Callback arrival time is not media time, and a device's
+// zero-timestamp startup buffer must never become a track's time origin.
 
 private final class NativeClockCorrelation {
   let sourceId: String
@@ -989,6 +987,8 @@ private final class NativeClockCorrelation {
   let hostAnchorValue: Int64
   let hostAnchorTimescale: Int32
   let hostAnchorUs: Int64
+  private let sessionHostEpoch: CMTime
+  private let sessionOffsetUs: UInt64
   private let lock = NSLock()
   private var lastHostUs: Int64
 
@@ -996,6 +996,8 @@ private final class NativeClockCorrelation {
     self.sourceId = sourceId
     self.sourceClock = sourceClock
     self.hostClock = CMClockGetHostTimeClock()
+    self.sessionHostEpoch = sessionHostEpoch
+    self.sessionOffsetUs = sessionOffsetUs
 
     var sourceAnchor = CMClockGetTime(sourceClock)
     // This API returns a native clock time correlated to its reference clock.
@@ -1024,7 +1026,7 @@ private final class NativeClockCorrelation {
     self.hostAnchorTimescale = Int32(max(hostTime.timescale, 1))
     let hostDeltaUs = NativeClockCorrelation.microseconds(CMTimeSubtract(hostTime, sessionHostEpoch))
     self.hostAnchorUs = Int64(clamping: sessionOffsetUs) &+ hostDeltaUs
-    self.lastHostUs = self.hostAnchorUs
+    self.lastHostUs = Int64(clamping: sessionOffsetUs)
   }
 
   private static func microseconds(_ time: CMTime) -> Int64 {
@@ -1040,23 +1042,25 @@ private final class NativeClockCorrelation {
     "{\"type\":\"clock_anchor\",\"source\":\"\(sourceId)\",\"native_value\":\(nativeAnchorValue),\"native_timescale\":\(nativeAnchorTimescale),\"host_value\":\(hostAnchorValue),\"host_timescale\":\(hostAnchorTimescale),\"host_anchor_us\":\(hostAnchorUs)}\n"
   }
 
-  func map(_ pts: CMTime) -> (hostUs: Int64, isDiscontinuity: Bool) {
+  func map(_ pts: CMTime) -> (hostUs: Int64, isDiscontinuity: Bool)? {
     lock.lock(); defer { lock.unlock() }
-    guard pts.isValid, pts.timescale > 0 else { return (lastHostUs, true) }
-    let delta = CMTimeSubtract(pts, CMTime(value: nativeAnchorValue, timescale: CMTimeScale(nativeAnchorTimescale)))
-    let deltaUs: Int64
-    if delta.isValid, delta.timescale > 0 {
-      deltaUs = NativeClockCorrelation.microseconds(delta)
-    } else {
-      deltaUs = 0
-    }
-    let (candidate, overflow) = hostAnchorUs.addingReportingOverflow(deltaUs)
-    let mapped = overflow ? (deltaUs >= 0 ? Int64.max : Int64.min) : candidate
-    let backwards = mapped < lastHostUs
-    let gap = !backwards && mapped - lastHostUs > 1_000_000
-    let output = backwards ? lastHostUs : mapped
-    lastHostUs = output
-    return (output, backwards || gap)
+    guard pts.isNumeric, pts.timescale > 0 else { return nil }
+    let hostPts = CMSyncConvertTime(pts, from: sourceClock, to: hostClock)
+    guard let mapped = Self.sessionMicroseconds(hostPts: hostPts,
+      sessionHostEpoch: sessionHostEpoch, sessionOffsetUs: sessionOffsetUs),
+      mapped >= lastHostUs else { return nil }
+    let gap = mapped - lastHostUs > 1_000_000
+    lastHostUs = mapped
+    return (mapped, gap)
+  }
+
+  static func sessionMicroseconds(hostPts: CMTime, sessionHostEpoch: CMTime,
+    sessionOffsetUs: UInt64) -> Int64? {
+    guard hostPts.isNumeric, sessionHostEpoch.isNumeric,
+      CMTimeCompare(hostPts, sessionHostEpoch) >= 0 else { return nil }
+    let deltaUs = microseconds(CMTimeSubtract(hostPts, sessionHostEpoch))
+    let (mapped, overflow) = Int64(clamping: sessionOffsetUs).addingReportingOverflow(deltaUs)
+    return overflow ? nil : mapped
   }
 }
 
@@ -1298,6 +1302,51 @@ private final class BoundedTimestampLog {
   }
 }
 
+private func videoFrameDuration(fps: Int) -> CMTime {
+  CMTime(value: 1, timescale: CMTimeScale(max(fps, 1)))
+}
+
+private func copySampleWithDuration(_ sample: CMSampleBuffer, duration: CMTime) -> CMSampleBuffer {
+  var timing = CMSampleTimingInfo(
+    duration: duration,
+    presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sample),
+    decodeTimeStamp: .invalid
+  )
+  var output: CMSampleBuffer?
+  let status = CMSampleBufferCreateCopyWithNewTiming(
+    allocator: nil,
+    sampleBuffer: sample,
+    sampleTimingEntryCount: 1,
+    sampleTimingArray: &timing,
+    sampleBufferOut: &output
+  )
+  if status == noErr, let output { return output }
+  return sample
+}
+
+private func sampleFromPixelBuffer(_ pixel: CVPixelBuffer, pts: CMTime, duration: CMTime) -> CMSampleBuffer? {
+  var format: CMFormatDescription?
+  guard CMVideoFormatDescriptionCreateForImageBuffer(
+    allocator: nil,
+    imageBuffer: pixel,
+    formatDescriptionOut: &format
+  ) == noErr, let format else {
+    return nil
+  }
+  var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+  var sample: CMSampleBuffer?
+  guard CMSampleBufferCreateReadyWithImageBuffer(
+    allocator: nil,
+    imageBuffer: pixel,
+    formatDescription: format,
+    sampleTiming: &timing,
+    sampleBufferOut: &sample
+  ) == noErr else {
+    return nil
+  }
+  return sample
+}
+
 // MARK: - RotatingMediaWriter (Task 2 + Task 3)
 //
 // One instance per track. Wraps an AVAssetWriter that produces a single
@@ -1317,7 +1366,9 @@ private final class BoundedTimestampLog {
 //      after successful completion
 //
 // append() returns MediaAppendOutcome (Task 3). finish(timeout:) returns the
-// typed finalization tuple (Task 3).
+// typed finalization tuple (Task 3). This class owns AVAssetWriter on the
+// capture/rotation queues. Rust TrackSegmentWriter never holds those
+// writer objects; it only publishes the finished temporary path.
 
 private final class RotatingMediaWriter {
   enum TrackKind { case video, audio }
@@ -1348,6 +1399,7 @@ private final class RotatingMediaWriter {
   private var currentMediaStartValue: Int64 = 0
   private var currentMediaTimescale: Int32 = 0
   private var currentHostAnchorUs: Int64 = 0
+  private var segmentOriginPts: CMTime?
   // Once AVAssetWriter reports a terminal failure, all later appends must
   // remain failures. Treating a failed input as backpressure lets callers
   // continue recording and can make a broken temp file look committable.
@@ -1403,7 +1455,7 @@ private final class RotatingMediaWriter {
         AVVideoAverageBitRateKey: max(4_000_000, videoWidth * videoHeight * max(videoFps, 1) / 5),
         AVVideoMaxKeyFrameIntervalDurationKey: 2,
         AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-        AVVideoAllowFrameReorderingKey: true
+        AVVideoAllowFrameReorderingKey: false
       ]
       let settings: [String: Any] = [
         AVVideoCodecKey: AVVideoCodecType.h264,
@@ -1441,6 +1493,7 @@ private final class RotatingMediaWriter {
       input = inp
     }
     started = false
+    segmentOriginPts = nil
   }
 
   private func paths(for fileNumber: String) -> (tmp: String, final: String, ext: String) {
@@ -1474,6 +1527,7 @@ private final class RotatingMediaWriter {
       terminalFailure = failure
       return .failed(code: failure.0, reason: failure.1)
     }
+    let justOpened = !started
     if !started {
       let startPTS = CMSampleBufferGetPresentationTimeStamp(sample)
       guard startPTS.isValid else {
@@ -1481,51 +1535,21 @@ private final class RotatingMediaWriter {
         terminalFailure = failure
         return .failed(code: failure.0, reason: failure.1)
       }
-      // Do not start a writer while its input is already unable to accept a
-      // sample. This is transient backpressure, not a writer failure.
-      guard input.isReadyForMoreMediaData else { return .backpressured }
-      currentMediaStartValue = startPTS.value
-      currentMediaTimescale = Int32(startPTS.timescale)
+      // Readiness is meaningful only AFTER startWriting/startSession. Checking
+      // it while the writer is .unknown prevents every track from ever starting.
+      // Rebase this segment onto t=0 so mdhd duration is media length, not boot
+      // uptime from a mach-absolute ScreenCaptureKit PTS.
+      segmentOriginPts = startPTS
+      currentMediaStartValue = 0
+      currentMediaTimescale = Int32(max(startPTS.timescale, 1))
       currentHostAnchorUs = hostUs
-      if kind == .video && forceNextKeyframe {
-        // Tag the sample with ForceKeyFrame so the encoder emits an IDR at the
-        // first frame of this segment. This is the canonical way to request a
-        // keyframe on a per-sample basis for VideoToolbox H.264.
-        if let tagged = tagSampleForKeyframe(sample) {
-          guard writer.startWriting() else {
-            lastError = writer.error
-            let failure = (Int32((writer.error as NSError?)?.code ?? -1), writer.error?.localizedDescription ?? "startWriting failed")
-            terminalFailure = failure
-            return .failed(code: failure.0, reason: failure.1)
-          }
-          writer.startSession(atSourceTime: startPTS)
-          guard writer.status == .writing else {
-            let failure = (Int32((writer.error as NSError?)?.code ?? -1), writer.error?.localizedDescription ?? "writer failed while starting session")
-            terminalFailure = failure
-            return .failed(code: failure.0, reason: failure.1)
-          }
-          started = true
-          let ready = input.isReadyForMoreMediaData
-          let appended = input.append(tagged)
-          forceNextKeyframe = false
-          if !ready {
-            return .backpressured
-          }
-          if !appended {
-            let failure = (Int32((writer.error as NSError?)?.code ?? -1), writer.error?.localizedDescription ?? "AVAssetWriterInput.append returned false")
-            terminalFailure = failure
-            return .failed(code: failure.0, reason: failure.1)
-          }
-          return .accepted
-        }
-      }
       guard writer.startWriting() else {
         lastError = writer.error
         let failure = (Int32((writer.error as NSError?)?.code ?? -1), writer.error?.localizedDescription ?? "startWriting failed")
         terminalFailure = failure
         return .failed(code: failure.0, reason: failure.1)
       }
-      writer.startSession(atSourceTime: startPTS)
+      writer.startSession(atSourceTime: .zero)
       guard writer.status == .writing else {
         let failure = (Int32((writer.error as NSError?)?.code ?? -1), writer.error?.localizedDescription ?? "writer failed while starting session")
         terminalFailure = failure
@@ -1533,16 +1557,68 @@ private final class RotatingMediaWriter {
       }
       started = true
     }
+    // The first sample of a session must actually land. Returning backpressure
+    // here used to drop the IDR and leave an empty, uncommittable segment.
+    // Do not park the capture callback queue: a 1s sleep dropped real-time
+    // frames and collapsed a 10s take into about 1s of media.
+    if !input.isReadyForMoreMediaData {
+      _ = waitUntilReady(input, timeout: justOpened ? 0.05 : 0.0)
+    }
     if !input.isReadyForMoreMediaData {
       return .backpressured
     }
-    if !input.append(sample) {
+    let origin = segmentOriginPts ?? CMSampleBufferGetPresentationTimeStamp(sample)
+    let timed = retimedSample(sample, origin: origin)
+    let toAppend: CMSampleBuffer
+    if kind == .video && forceNextKeyframe, let tagged = tagSampleForKeyframe(timed) {
+      forceNextKeyframe = false
+      toAppend = tagged
+    } else {
+      forceNextKeyframe = false
+      toAppend = timed
+    }
+    if !input.append(toAppend) {
       let reason = writer.error?.localizedDescription ?? "AVAssetWriterInput.append returned false"
       let failure = (Int32((writer.error as NSError?)?.code ?? -1), reason)
       terminalFailure = failure
       return .failed(code: failure.0, reason: failure.1)
     }
     return .accepted
+  }
+
+  private func retimedSample(_ sample: CMSampleBuffer, origin: CMTime) -> CMSampleBuffer {
+    let rawPts = CMSampleBufferGetPresentationTimeStamp(sample)
+    var pts = CMTimeSubtract(rawPts, origin)
+    if !pts.isValid || pts.value < 0 { pts = .zero }
+    var duration = CMSampleBufferGetDuration(sample)
+    if !duration.isValid || duration.value <= 0 {
+      duration = kind == .video
+        ? videoFrameDuration(fps: videoFps)
+        : CMTime(value: 1, timescale: 48_000)
+    }
+    var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+    var output: CMSampleBuffer?
+    let status = CMSampleBufferCreateCopyWithNewTiming(
+      allocator: nil,
+      sampleBuffer: sample,
+      sampleTimingEntryCount: 1,
+      sampleTimingArray: &timing,
+      sampleBufferOut: &output
+    )
+    if status == noErr, let output { return output }
+    return sample
+  }
+
+  private func waitUntilReady(_ input: AVAssetWriterInput, timeout: TimeInterval) -> Bool {
+    if input.isReadyForMoreMediaData { return true }
+    guard timeout > 0 else { return false }
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      Thread.sleep(forTimeInterval: 0.002)
+      if terminalFailure != nil { return false }
+      if input.isReadyForMoreMediaData { return true }
+    }
+    return input.isReadyForMoreMediaData
   }
 
   private func tagSampleForKeyframe(_ sample: CMSampleBuffer) -> CMSampleBuffer? {
@@ -1580,7 +1656,14 @@ private final class RotatingMediaWriter {
     guard FileManager.default.fileExists(atPath: path) else { return false }
     switch kind {
     case .video:
-      let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+      // AVFoundation does not sniff MP4 behind the .mp4.tmp extension.
+      // A uniquely named hard link supplies the correct type on macOS 13 too;
+      // it neither copies media nor publishes the final recording path.
+      let temporary = URL(fileURLWithPath: path)
+      let probe = temporary.deletingLastPathComponent().appendingPathComponent(".validate-\(UUID().uuidString).mp4")
+      do { try FileManager.default.linkItem(at: temporary, to: probe) } catch { return false }
+      defer { try? FileManager.default.removeItem(at: probe) }
+      let asset = AVURLAsset(url: probe)
       guard let track = asset.tracks(withMediaType: .video).first,
             let reader = try? AVAssetReader(asset: asset) else { return false }
       let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
@@ -1615,10 +1698,14 @@ private final class RotatingMediaWriter {
     input.markAsFinished()
     let semaphore = DispatchSemaphore(value: 0)
     writer.finishWriting { semaphore.signal() }
+    // The completion only signals this semaphore and never takes our lock.
+    // Keep append/finalization serialized until publication is complete;
+    // otherwise callbacks can append to an input already marked as finished.
     let waitResult = semaphore.wait(timeout: .now() + 15)
     self.input = nil
     self.writer = nil
     self.started = false
+    self.segmentOriginPts = nil
     self.lastError = writer.error
     let writerStatus = writer.status
 
@@ -1669,8 +1756,8 @@ private final class RotatingMediaWriter {
   // segments committed before stop returns" invariant.
   func finish(timeout: TimeInterval) -> (success: Bool, status: AVAssetWriter.Status, error: Error?) {
     lock.lock()
+    defer { lock.unlock() }
     guard let writer = writer, let input = input, started else {
-      lock.unlock()
       return (true, .completed, nil)
     }
     input.markAsFinished()
@@ -1680,14 +1767,14 @@ private final class RotatingMediaWriter {
     self.input = nil
     self.writer = nil
     self.started = false
+    self.segmentOriginPts = nil
     let err = writer.error
     let status = writer.status
-    lock.unlock()
     let success = waitResult == .success && status == .completed
     if waitResult == .timedOut {
-      lock.lock(); terminalFailure = (Int32(-4), "AVAssetWriter finishWriting timed out for track \(trackId)"); lock.unlock()
+      terminalFailure = (Int32(-4), "AVAssetWriter finishWriting timed out for track \(trackId)")
     } else if status != .completed {
-      lock.lock(); terminalFailure = (Int32((err as NSError?)?.code ?? status.rawValue), err?.localizedDescription ?? "AVAssetWriter did not complete for track \(trackId)"); lock.unlock()
+      terminalFailure = (Int32((err as NSError?)?.code ?? status.rawValue), err?.localizedDescription ?? "AVAssetWriter did not complete for track \(trackId)")
     }
     return (success, status, err)
   }
@@ -1701,6 +1788,7 @@ private final class RotatingMediaWriter {
     writer = nil
     input = nil
     started = false
+    segmentOriginPts = nil
   }
 }
 
@@ -1765,7 +1853,8 @@ private final class PerTrackRecorder {
     guard let clockCorrelation else {
       return .failed(code: -20, reason: "native clock correlation is unavailable for track \(trackId)")
     }
-    let mapped = clockCorrelation.map(pts)
+    guard sample.isValid, CMSampleBufferDataIsReady(sample),
+      let mapped = clockCorrelation.map(pts) else { return .backpressured }
     // Discontinuity detection beyond what the anchor tracks: large forward
     // gaps in media time that look like device reconnects.
     ptsLock.lock()
@@ -1822,11 +1911,11 @@ private final class PerTrackRecorder {
 
 private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
   let config: NativeConfig
-  let screenQueue = DispatchQueue(label: "ai.aeroshoot.active.screen", qos: .userInteractive)
-  let systemAudioQueue = DispatchQueue(label: "ai.aeroshoot.active.system", qos: .userInitiated)
-  let cameraQueue = DispatchQueue(label: "ai.aeroshoot.active.camera", qos: .userInteractive)
-  let micQueue = DispatchQueue(label: "ai.aeroshoot.active.mic", qos: .userInitiated)
-  let rotationQueue = DispatchQueue(label: "ai.aeroshoot.active.rotation", qos: .utility)
+  let screenQueue = DispatchQueue(label: "ai.aeroshoot.active.screen", qos: .userInteractive, autoreleaseFrequency: .workItem)
+  let systemAudioQueue = DispatchQueue(label: "ai.aeroshoot.active.system", qos: .userInitiated, autoreleaseFrequency: .workItem)
+  let cameraQueue = DispatchQueue(label: "ai.aeroshoot.active.camera", qos: .userInteractive, autoreleaseFrequency: .workItem)
+  let micQueue = DispatchQueue(label: "ai.aeroshoot.active.mic", qos: .userInitiated, autoreleaseFrequency: .workItem)
+  let rotationQueue = DispatchQueue(label: "ai.aeroshoot.active.rotation", qos: .utility, autoreleaseFrequency: .workItem)
   let sessionQueue = DispatchQueue(label: "ai.aeroshoot.active.session", qos: .userInitiated)
   private let stateLock = NSLock()
   private var stream: SCStream?
@@ -1844,6 +1933,8 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   private var lastStartError: Error?
   private var appendFailure: AeroShootEncoderResult?
   private var runtimeNotificationsInstalled = false
+  private var lastScreenPixel: CVPixelBuffer?
+  private let lastFrameLock = NSLock()
 
   init(config: NativeConfig) {
     self.config = config
@@ -1898,19 +1989,7 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
       return encoderResultFailed(code: Int32((error as NSError).code), message: "screen start failed: \(error.localizedDescription)")
     }
     if config.cameraId != nil || config.micId != nil {
-      do {
-        try startAVCapture()
-      } catch {
-        if let stream {
-          let semaphore = DispatchSemaphore(value: 0)
-          stream.stopCapture { _ in semaphore.signal() }
-          _ = semaphore.wait(timeout: .now() + 5)
-        }
-        NotificationCenter.default.removeObserver(self)
-        timestampLog?.shutdown()
-        timestampLog = nil
-        return encoderResultFailed(code: Int32((error as NSError).code), message: "AVCapture start failed: \(error.localizedDescription)")
-      }
+      startActiveAVCapture()
     }
 
     let mouse = MouseHookMac(sourceID: config.sourceId, width: config.width, height: config.height,
@@ -1936,11 +2015,13 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   }
 
   @objc private func handleAVCaptureRuntimeError(_ note: Notification) {
+    guard let session = note.object as? AVCaptureSession, session === cameraSession else { return }
     let err = (note.userInfo?[AVCaptureSessionErrorKey] as? Error)?.localizedDescription ?? "AVCaptureSession runtime error"
     latchRuntimeFailure(trackId: "session", code: -200, message: err)
   }
 
   @objc private func handleAVCaptureDidStop(_ note: Notification) {
+    guard let session = note.object as? AVCaptureSession, session === cameraSession else { return }
     // Surface unexpected stop; a clean stop is driven by aeroshoot_stop and
     // will not fire this notification on the happy path because we remove the
     // observer first.
@@ -1949,8 +2030,9 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
 
   @objc private func handleAVCaptureDeviceDisconnect(_ note: Notification) {
     // We do NOT silently switch devices (Task 6).
-    let device = note.object as? AVCaptureDevice
-    latchRuntimeFailure(trackId: "session", code: -202, message: "capture device disconnected: \(device?.localizedName ?? "unknown device")")
+    guard let device = note.object as? AVCaptureDevice,
+      cameraSession?.inputs.contains(where: { ($0 as? AVCaptureDeviceInput)?.device.uniqueID == device.uniqueID }) == true else { return }
+    latchRuntimeFailure(trackId: "session", code: -202, message: "capture device disconnected: \(device.localizedName)")
   }
 
   private func latchRuntimeFailure(trackId: String, code: Int32, message: String) {
@@ -2019,10 +2101,13 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     streamConfig.sampleRate = 48_000
     streamConfig.channelCount = 2
     streamConfig.excludesCurrentProcessAudio = true
-    if let sourceRect = config.sourceRect { streamConfig.sourceRect = sourceRect.cgRect }
-    if let destinationRect = config.destinationRect { streamConfig.destinationRect = destinationRect.cgRect }
+    // Do not set sourceRect. It is in points, while the compositor rects we
+    // persist are in pixels; applying both crops Retina captures and fights
+    // preservesAspectRatio, which shows up as a tiny or stretched preview.
     if #available(macOS 14.0, *) {
       streamConfig.preservesAspectRatio = config.preservesAspectRatio ?? true
+    } else if let destinationRect = config.destinationRect {
+      streamConfig.destinationRect = destinationRect.cgRect
     }
     let stream = SCStream(filter: filter, configuration: streamConfig, delegate: self)
     try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: screenQueue)
@@ -2043,11 +2128,9 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
       self?.stateLock.unlock()
       startSemaphore.signal()
     }
-    let waitResult = startSemaphore.wait(timeout: .now() + 5)
+    let waitResult = startSemaphore.wait(timeout: .now() + 15)
     if waitResult == .timedOut {
-      // Surface the timeout to the runtime-error channel and throw a Swift error
-      // so start() can return a typed failure.
-      invokeRuntimeErrorCallback(trackId: "screen", code: 301, message: "SCStream startCapture timed out after 5s")
+      invokeRuntimeErrorCallback(trackId: "screen", code: 301, message: "SCStream startCapture timed out after 15s")
       throw NSError(domain: "AeroShoot", code: 300, userInfo: [NSLocalizedDescriptionKey: "SCStream startCapture timed out"])
     }
     stateLock.lock()
@@ -2062,61 +2145,91 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
 
   // MARK: AVFoundation start
 
-  private func startAVCapture() throws {
+  // Camera and microphone are optional. A busy webcam (live preview not fully
+  // released) or a missing mic must not abort an otherwise valid screen recording.
+  // Negative runtime-error codes would fail the whole session, so optional-track
+  // problems use a recoverable code.
+  private func startActiveAVCapture() {
     let session = AVCaptureSession()
     session.beginConfiguration()
+    var cameraReady = false
+    var micReady = false
     if let id = config.cameraId {
-      guard let device = AVCaptureDevice(uniqueID: id) else {
-        throw NSError(domain: "AeroShoot", code: 8, userInfo: [NSLocalizedDescriptionKey: "Camera is no longer available"])
+      do {
+        guard let device = AVCaptureDevice(uniqueID: id) else {
+          throw NSError(domain: "AeroShoot", code: 8, userInfo: [NSLocalizedDescriptionKey: "Camera is no longer available"])
+        }
+        let input = try AVCaptureDeviceInput(device: device)
+        guard session.canAddInput(input) else {
+          throw NSError(domain: "AeroShoot", code: 9, userInfo: [NSLocalizedDescriptionKey: "Camera input cannot be added"])
+        }
+        session.addInput(input)
+        let output = AVCaptureVideoDataOutput()
+        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
+        output.alwaysDiscardsLateVideoFrames = true
+        output.setSampleBufferDelegate(self, queue: cameraQueue)
+        guard session.canAddOutput(output) else {
+          throw NSError(domain: "AeroShoot", code: 10, userInfo: [NSLocalizedDescriptionKey: "Camera output cannot be added"])
+        }
+        session.addOutput(output)
+        cameraReady = true
+      } catch {
+        invokeRuntimeErrorCallback(trackId: "webcam", code: 16, message: "Webcam start failed: \(error.localizedDescription); continuing without camera")
+        cameraTracker = nil
       }
-      let input = try AVCaptureDeviceInput(device: device)
-      guard session.canAddInput(input) else {
-        throw NSError(domain: "AeroShoot", code: 9, userInfo: [NSLocalizedDescriptionKey: "Camera input cannot be added"])
-      }
-      session.addInput(input)
-      let output = AVCaptureVideoDataOutput()
-      output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
-      output.alwaysDiscardsLateVideoFrames = true
-      output.setSampleBufferDelegate(self, queue: cameraQueue)
-      guard session.canAddOutput(output) else {
-        throw NSError(domain: "AeroShoot", code: 10, userInfo: [NSLocalizedDescriptionKey: "Camera output cannot be added"])
-      }
-      session.addOutput(output)
     }
     if let id = config.micId {
-      guard let device = AVCaptureDevice(uniqueID: id) else {
-        throw NSError(domain: "AeroShoot", code: 11, userInfo: [NSLocalizedDescriptionKey: "Microphone is no longer available"])
+      do {
+        guard let device = AVCaptureDevice(uniqueID: id) else {
+          throw NSError(domain: "AeroShoot", code: 11, userInfo: [NSLocalizedDescriptionKey: "Microphone is no longer available"])
+        }
+        let input = try AVCaptureDeviceInput(device: device)
+        guard session.canAddInput(input) else {
+          throw NSError(domain: "AeroShoot", code: 12, userInfo: [NSLocalizedDescriptionKey: "Microphone input cannot be added"])
+        }
+        session.addInput(input)
+        let output = AVCaptureAudioDataOutput()
+        output.setSampleBufferDelegate(self, queue: micQueue)
+        guard session.canAddOutput(output) else {
+          throw NSError(domain: "AeroShoot", code: 13, userInfo: [NSLocalizedDescriptionKey: "Microphone output cannot be added"])
+        }
+        session.addOutput(output)
+        micReady = true
+      } catch {
+        invokeRuntimeErrorCallback(trackId: "mic", code: 16, message: "Microphone start failed: \(error.localizedDescription); continuing without microphone")
+        micTracker = nil
       }
-      let input = try AVCaptureDeviceInput(device: device)
-      guard session.canAddInput(input) else {
-        throw NSError(domain: "AeroShoot", code: 12, userInfo: [NSLocalizedDescriptionKey: "Microphone input cannot be added"])
-      }
-      session.addInput(input)
-      let output = AVCaptureAudioDataOutput()
-      output.setSampleBufferDelegate(self, queue: micQueue)
-      guard session.canAddOutput(output) else {
-        throw NSError(domain: "AeroShoot", code: 13, userInfo: [NSLocalizedDescriptionKey: "Microphone output cannot be added"])
-      }
-      session.addOutput(output)
     }
     session.commitConfiguration()
-    if config.cameraId != nil { cameraQueue.suspend() }
-    if config.micId != nil { micQueue.suspend() }
+    if !cameraReady && !micReady { return }
+    if cameraReady { cameraQueue.suspend() }
+    if micReady { micQueue.suspend() }
     defer {
-      if config.cameraId != nil { cameraQueue.resume() }
-      if config.micId != nil { micQueue.resume() }
+      if cameraReady { cameraQueue.resume() }
+      if micReady { micQueue.resume() }
     }
     let semaphore = DispatchSemaphore(value: 0)
     sessionQueue.async { session.startRunning(); semaphore.signal() }
     guard semaphore.wait(timeout: .now() + 10) == .success, session.isRunning else {
-      throw NSError(domain: "AeroShoot", code: 15, userInfo: [NSLocalizedDescriptionKey: "AVCaptureSession start timed out or failed"])
+      invokeRuntimeErrorCallback(trackId: cameraReady ? "webcam" : "mic", code: 16, message: "AVCaptureSession start timed out or failed; continuing without camera/mic")
+      session.stopRunning()
+      cameraTracker = nil
+      micTracker = nil
+      return
     }
     guard let captureClock = session.synchronizationClock, let timestampLog else {
+      invokeRuntimeErrorCallback(trackId: cameraReady ? "webcam" : "mic", code: 16, message: "AVCaptureSession synchronization clock unavailable; continuing without camera/mic")
       session.stopRunning()
-      throw NSError(domain: "AeroShoot", code: 14, userInfo: [NSLocalizedDescriptionKey: "AVCaptureSession synchronization clock unavailable"])
+      cameraTracker = nil
+      micTracker = nil
+      return
     }
-    cameraTracker?.setCorrelation(NativeClockCorrelation(sourceId: "webcam", sourceClock: captureClock, sessionOffsetUs: config.sessionOffsetUs, sessionHostEpoch: sessionHostEpoch), journal: timestampLog)
-    micTracker?.setCorrelation(NativeClockCorrelation(sourceId: "mic", sourceClock: captureClock, sessionOffsetUs: config.sessionOffsetUs, sessionHostEpoch: sessionHostEpoch), journal: timestampLog)
+    if cameraReady {
+      cameraTracker?.setCorrelation(NativeClockCorrelation(sourceId: "webcam", sourceClock: captureClock, sessionOffsetUs: config.sessionOffsetUs, sessionHostEpoch: sessionHostEpoch), journal: timestampLog)
+    }
+    if micReady {
+      micTracker?.setCorrelation(NativeClockCorrelation(sourceId: "mic", sourceClock: captureClock, sessionOffsetUs: config.sessionOffsetUs, sessionHostEpoch: sessionHostEpoch), journal: timestampLog)
+    }
     cameraSession = session
   }
 
@@ -2164,10 +2277,27 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
       guard
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
         let statusValue = attachments.first?[.status] as? Int,
-        SCFrameStatus(rawValue: statusValue) == .complete,
-        CMSampleBufferGetImageBuffer(sampleBuffer) != nil
+        let status = SCFrameStatus(rawValue: statusValue)
       else { return }
-      let outcome = screenTracker?.append(sampleBuffer, journal: timestampLog!) ?? .backpressured
+      let duration = videoFrameDuration(fps: config.fps)
+      let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+      let toAppend: CMSampleBuffer?
+      if status == .complete, let image = CMSampleBufferGetImageBuffer(sampleBuffer) {
+        lastFrameLock.lock(); lastScreenPixel = image; lastFrameLock.unlock()
+        toAppend = copySampleWithDuration(sampleBuffer, duration: duration)
+      } else if status == .idle, pts.isValid {
+        // Unchanged displays are delivered as idle, not complete. Dropping them
+        // keeps only dirty frames, so a 10s take of a mostly-static demo encodes
+        // as about 1s. Repeat the last complete pixel buffer on the idle PTS.
+        lastFrameLock.lock(); let pixel = lastScreenPixel; lastFrameLock.unlock()
+        guard let pixel else { return }
+        toAppend = sampleFromPixelBuffer(pixel, pts: pts, duration: duration)
+      } else {
+        return
+      }
+      guard let toAppend else { return }
+      LivePreviewFrames.offer(toAppend, camera: false)
+      let outcome = screenTracker?.append(toAppend, journal: timestampLog!) ?? .backpressured
       handleAppendOutcome(outcome, tracker: screenTracker, isAudio: false)
     } else if outputType == .audio {
       let outcome = systemTracker?.append(sampleBuffer, journal: timestampLog!) ?? .backpressured
@@ -2185,9 +2315,12 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
 
   func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
     stateLock.lock(); let shouldAppend = !paused; stateLock.unlock()
-    guard shouldAppend else { return }
+    guard shouldAppend, sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
     if output is AVCaptureVideoDataOutput {
-      let outcome = cameraTracker?.append(sampleBuffer, journal: timestampLog!) ?? .backpressured
+      guard CMSampleBufferGetImageBuffer(sampleBuffer) != nil else { return }
+      let timed = copySampleWithDuration(sampleBuffer, duration: videoFrameDuration(fps: config.fps))
+      LivePreviewFrames.offer(timed, camera: true)
+      let outcome = cameraTracker?.append(timed, journal: timestampLog!) ?? .backpressured
       handleAppendOutcome(outcome, tracker: cameraTracker, isAudio: false)
     } else {
       let outcome = micTracker?.append(sampleBuffer, journal: timestampLog!) ?? .backpressured
@@ -2216,10 +2349,39 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   }
 
   // MARK: Pause / resume
+  //
+  // AVAssetWriter is owned on this recorder's capture/rotation queues, not by
+  // Rust TrackSegmentWriter. Pause must finish those containers and submit
+  // them to Rust before the Tauri command acknowledges Paused. Resume only
+  // clears the flag; the next sample opens a fresh writer.
 
   func setPaused(_ value: Bool) {
     stateLock.lock(); paused = value; stateLock.unlock()
     mouseHook?.setPaused(value)
+  }
+
+  func pauseAndFinalize() -> AeroShootEncoderResult {
+    setPaused(true)
+    screenQueue.sync {}
+    systemAudioQueue.sync {}
+    cameraQueue.sync {}
+    micQueue.sync {}
+    rotationQueue.sync {}
+    var firstFailure: AeroShootEncoderResult?
+    let tracks: [PerTrackRecorder] = [screenTracker, systemTracker, cameraTracker, micTracker].compactMap { $0 }
+    for tracker in tracks {
+      let res = tracker.rotateSegment()
+      if res.status != AEROSHOOT_ENCODER_OK() && firstFailure == nil {
+        firstFailure = res
+      }
+    }
+    if let firstFailure {
+      // Rust keeps Recording on this error. Restore sample admission so the
+      // displayed state matches the native encoder instead of a frozen capture.
+      setPaused(false)
+      return firstFailure
+    }
+    return encoderResultOK()
   }
 
   // MARK: Stop (Task 3 typed outcomes)
@@ -2542,6 +2704,26 @@ public func aeroshootMacOSSetPaused(_ handle: UnsafeMutableRawPointer?, _ paused
   }
 }
 
+@_cdecl("aeroshoot_macos_pause_and_finalize")
+public func aeroshootMacOSPauseAndFinalize(_ handle: UnsafeMutableRawPointer?, _ outResult: UnsafeMutableRawPointer?) {
+  let writeResult: (AeroShootEncoderResult) -> Void = { r in
+    guard let raw = outResult else { return }
+    raw.assumingMemoryBound(to: AeroShootEncoderResult.self).pointee = r
+  }
+  guard let handle else {
+    writeResult(encoderResultFailed(code: -10, message: "null handle"))
+    return
+  }
+  g_stateLock.lock()
+  guard g_activeRecorderHandle == handle, let recorder = g_activeRecorder else {
+    g_stateLock.unlock()
+    writeResult(encoderResultFailed(code: -10, message: "no active recording"))
+    return
+  }
+  g_stateLock.unlock()
+  writeResult(recorder.pauseAndFinalize())
+}
+
 @_cdecl("aeroshoot_macos_copy_stats_json")
 public func aeroshootMacOSCopyStatsJSON(_ handle: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>? {
   aeroshootCopyStatsJSON(handle)
@@ -2586,3 +2768,102 @@ public func aeroshootMacOSRegisterSegmentCallback(_ handle: UnsafeMutableRawPoin
 public func aeroshootMacOSRegisterRuntimeErrorCallback(_ handle: UnsafeMutableRawPointer?, _ cb: AeroShootRuntimeErrorCallback?) {
   aeroshootRegisterRuntimeErrorCallback(cb)
 }
+
+#if RECORDING_WRITER_TESTS
+// Exercise the actual capture writer, rather than a separate fixture encoder.
+enum RecordingWriterContracts {
+  static func run() throws {
+    let root = URL(fileURLWithPath: CommandLine.arguments[1])
+    aeroshootRegisterSegmentCallback { _, _, _, _, _, path in
+      guard let path else { return -1 }
+      let file = URL(fileURLWithPath: String(cString: path))
+      do { try FileManager.default.moveItem(at: file, to: file.deletingPathExtension()); return 0 }
+      catch { return -2 }
+    }
+    for id in ["screen", "webcam", "mic", "system"] {
+      let video = id == "screen" || id == "webcam"
+      let channels = id == "system" ? 2 : 1
+      let directory = root.appendingPathComponent(id)
+      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+      let writer = RotatingMediaWriter(trackId: id, kind: video ? .video : .audio,
+        directory: directory.path, videoWidth: 64, videoHeight: 64, videoFps: 30, audioChannels: channels)
+      for segment in 0..<2 {
+        for index in 0..<6 {
+          let pts = CMTime(value: Int64(300 + segment * 6 + index), timescale: 30)
+          var sample: CMSampleBuffer?
+          if video {
+            var pixel: CVPixelBuffer?
+            precondition(CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_32BGRA,
+              [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &pixel) == kCVReturnSuccess)
+            CVPixelBufferLockBaseAddress(pixel!, [])
+            memset(CVPixelBufferGetBaseAddress(pixel!)!, 120, CVPixelBufferGetDataSize(pixel!))
+            CVPixelBufferUnlockBaseAddress(pixel!, [])
+            var format: CMVideoFormatDescription?
+            CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixel!, formatDescriptionOut: &format)
+            var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30), presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+            precondition(CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pixel!, formatDescription: format!, sampleTiming: &timing, sampleBufferOut: &sample) == noErr)
+          } else {
+            var asbd = AudioStreamBasicDescription(mSampleRate: 48000, mFormatID: kAudioFormatLinearPCM,
+              mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
+              mBytesPerPacket: UInt32(channels * 2), mFramesPerPacket: 1, mBytesPerFrame: UInt32(channels * 2),
+              mChannelsPerFrame: UInt32(channels), mBitsPerChannel: 16, mReserved: 0)
+            var format: CMAudioFormatDescription?
+            CMAudioFormatDescriptionCreate(allocator: nil, asbd: &asbd, layoutSize: 0, layout: nil,
+              magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &format)
+            var block: CMBlockBuffer?
+            let bytes = 1600 * channels * 2
+            precondition(CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: bytes,
+              blockAllocator: nil, customBlockSource: nil, offsetToData: 0, dataLength: bytes, flags: 0, blockBufferOut: &block) == noErr)
+            CMBlockBufferFillDataBytes(with: 32, blockBuffer: block!, offsetIntoDestination: 0, dataLength: bytes)
+            var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 48000), presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+            var size = channels * 2
+            precondition(CMSampleBufferCreateReady(allocator: nil, dataBuffer: block, formatDescription: format,
+              sampleCount: 1600, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+              sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample) == noErr)
+          }
+          var accepted = false
+          for _ in 0..<100 {
+            switch writer.append(sample!, hostUs: Int64(segment * 200000 + index * 33333)) {
+              case .accepted: accepted = true
+              case .backpressured: Thread.sleep(forTimeInterval: 0.005)
+              case let .failed(_, reason): fatalError("\(id): \(reason)")
+            }
+            if accepted { break }
+          }
+          precondition(accepted, "\(id) never accepted its first sample")
+        }
+        let result = writer.commitSegment()
+        precondition(result.status == AEROSHOOT_ENCODER_OK(), "\(id) commit status \(result.status), error \(result.error_code)")
+        let file = directory.appendingPathComponent(String(format: "%06d.%@", segment + 1, video ? "mp4" : "wav"))
+        let asset = AVURLAsset(url: file)
+        precondition(asset.tracks.count == 1 && asset.duration.seconds > 0.15, "\(id) missing media")
+      }
+    }
+    print("Capture writer passed: two committed segments each for screen, webcam, mic and system")
+
+    // Real recordings began with webcam PTS=0, followed by host uptime.
+    // Discard that startup buffer; all tracks share the session's host epoch.
+    let boot = CMTime(value: 193_799_000_000, timescale: 1_000_000)
+    let later = CMTime(value: 193_800_000_000, timescale: 1_000_000)
+    let startup = NativeClockCorrelation.sessionMicroseconds(hostPts: .zero,
+      sessionHostEpoch: boot, sessionOffsetUs: 50_000)
+    let start = NativeClockCorrelation.sessionMicroseconds(hostPts: boot,
+      sessionHostEpoch: boot, sessionOffsetUs: 50_000)
+    let next = NativeClockCorrelation.sessionMicroseconds(hostPts: later,
+      sessionHostEpoch: boot, sessionOffsetUs: 50_000)
+    precondition(startup == nil, "zero-time device startup buffer must be discarded")
+    precondition(start == 50_000, "first sample must sit on the session clock, not boot uptime")
+    precondition(next == 1_050_000, "media deltas must stay session-relative")
+    let clock = CMClockGetHostTimeClock()
+    let correlation = NativeClockCorrelation(sourceId: "webcam", sourceClock: clock,
+      sessionOffsetUs: 50_000, sessionHostEpoch: boot)
+    precondition(correlation.map(.zero) == nil)
+    precondition(correlation.map(boot)?.hostUs == 50_000)
+    precondition(correlation.map(later)?.hostUs == 1_050_000)
+    precondition(correlation.map(.invalid) == nil)
+    precondition(correlation.map(.positiveInfinity) == nil)
+    precondition(correlation.map(boot) == nil, "backward device timestamps must not reach the writer")
+    print("Clock mapping passed: startup zero rejected; synchronized PTS stays session-relative")
+  }
+}
+#endif

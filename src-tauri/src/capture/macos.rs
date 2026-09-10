@@ -5,11 +5,13 @@ use crate::project::manifest::TrackType;
 use crate::project::segment_writer::TrackSegmentWriter;
 use crate::session::SessionEvent;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::{Condvar, OnceLock};
 use std::time::Duration;
@@ -141,6 +143,10 @@ extern "C" {
         error_out: *mut *mut c_char,
     ) -> *mut c_void;
     fn aeroshoot_macos_set_paused(handle: *mut c_void, paused: bool);
+    fn aeroshoot_macos_pause_and_finalize(
+        handle: *mut c_void,
+        out_result: *mut AeroShootEncoderResult,
+    );
     fn aeroshoot_macos_copy_stats_json(handle: *mut c_void) -> *mut c_char;
     /// Old stop symbol — kept for source compatibility; the new
     /// `aeroshoot_macos_stop_capture` returns a typed result.
@@ -235,6 +241,21 @@ mod stub_swift_ffi {
     }
     #[no_mangle]
     pub extern "C" fn aeroshoot_macos_set_paused(_handle: *mut c_void, _paused: bool) {}
+    #[no_mangle]
+    pub extern "C" fn aeroshoot_macos_pause_and_finalize(
+        _handle: *mut c_void,
+        out_result: *mut AeroShootEncoderResult,
+    ) {
+        if !out_result.is_null() {
+            unsafe {
+                *out_result = AeroShootEncoderResult {
+                    status: AeroShootEncoderStatus::Ok,
+                    error_code: 0,
+                    error_message: [0i8; 256],
+                };
+            }
+        }
+    }
     #[no_mangle]
     pub extern "C" fn aeroshoot_macos_copy_stats_json(_handle: *mut c_void) -> *mut c_char {
         dup_cstr(r#"{"droppedFrames":0,"audioBufferUnderflows":0,"lastError":null}"#)
@@ -448,6 +469,10 @@ struct SegmentTarget {
     epoch: crate::session::SessionEpoch,
     journal: Option<std::sync::Arc<crate::project::journal::ProjectJournal>>,
     project_root: Option<std::path::PathBuf>,
+    /// Long-lived per-track writers so a journal failure after publish can
+    /// be retried. A throwaway writer would drop `pending_publication`.
+    writers: Arc<Mutex<HashMap<String, TrackSegmentWriter>>>,
+    closed: Arc<AtomicBool>,
 }
 
 /// Install the global callback targets for the duration of a session.
@@ -470,7 +495,21 @@ pub(crate) fn install_callback_targets(
         epoch,
         journal,
         project_root,
+        writers: Arc::new(Mutex::new(HashMap::new())),
+        closed: Arc::new(AtomicBool::new(false)),
     });
+}
+
+/// Drain native publication writers before clearing callback targets.
+/// Sets `closed` first so a racing callback cannot recreate a throwaway writer.
+pub(crate) fn take_native_segment_writers() -> Vec<TrackSegmentWriter> {
+    let guard = SEGMENT_TARGET.lock().unwrap();
+    let Some(target) = guard.as_ref() else {
+        return Vec::new();
+    };
+    target.closed.store(true, Ordering::SeqCst);
+    let mut writers = target.writers.lock().unwrap();
+    writers.drain().map(|(_, writer)| writer).collect()
 }
 
 /// Clear the global callback targets. Safe to call from any thread.
@@ -493,7 +532,12 @@ unsafe extern "C" fn c_segment_callback(
     media_start_value: i64,
     file_path: *const c_char,
 ) -> c_int {
-    // Contain panics at the foreign ABI boundary and report failure to Swift.
+    // Swift owns AVAssetWriter on capture/rotation queues and calls this
+    // synchronously after finishWriting. Rust reuses a per-track writer on
+    // SegmentTarget so a journal failure after publish stays retryable.
+    // Errors return a non-zero code so Swift latches terminalFailure instead
+    // of treating publication as OK. Contain panics at the foreign ABI
+    // boundary and report failure to Swift.
     std::panic::catch_unwind(|| {
         if track_id.is_null() || file_path.is_null() || segment_index < 0 || timescale <= 0 {
             return -600;
@@ -504,6 +548,9 @@ unsafe extern "C" fn c_segment_callback(
         let Some(target) = target else {
             return -600;
         };
+        if target.closed.load(Ordering::SeqCst) {
+            return -600;
+        }
         let (Some(journal), Some(root)) = (&target.journal, &target.project_root) else {
             return -600;
         };
@@ -514,16 +561,24 @@ unsafe extern "C" fn c_segment_callback(
             "mic" => TrackType::MicAudio,
             _ => return -600,
         };
-        let writer = TrackSegmentWriter::new(root, id.to_string(), kind, String::new());
+        let mut writers = target.writers.lock().unwrap();
+        if target.closed.load(Ordering::SeqCst) {
+            return -600;
+        }
+        let writer = writers.entry(id.to_string()).or_insert_with(|| {
+            TrackSegmentWriter::new(root, id.to_string(), kind, String::new())
+        });
         match writer.commit_native_segment(
             Path::new(path.as_ref()),
             segment_index as u32,
             host_anchor_us,
             timescale as u32,
             media_start_value,
+            target.epoch.current_elapsed_us(),
             journal,
         ) {
             Ok(_) => {
+                drop(writers);
                 target.diagnostics.apply(&SessionEvent::SegmentRotated {
                     track_id: id.to_string(),
                     segment_index: segment_index as u32,
@@ -534,6 +589,7 @@ unsafe extern "C" fn c_segment_callback(
                 0
             }
             Err(error) => {
+                drop(writers);
                 target.diagnostics.apply(&SessionEvent::RuntimeError {
                     track_id: id.to_string(),
                     error_code: -600,
@@ -704,6 +760,25 @@ impl MacCaptureSession {
         }
     }
 
+    /// Stop sample admission, drain capture queues, and finalize the current
+    /// native AVAssetWriter containers (submit to Rust) before the caller
+    /// acknowledges Pause. Resume is `set_paused(false)` and opens a new writer
+    /// on the next sample.
+    pub fn pause_and_finalize(&self) -> Result<(), (i32, String)> {
+        let Some(handle) = self.handle else {
+            return Ok(());
+        };
+        let mut result = AeroShootEncoderResult {
+            status: AeroShootEncoderStatus::Ok,
+            error_code: 0,
+            error_message: [0; 256],
+        };
+        unsafe {
+            aeroshoot_macos_pause_and_finalize(handle.as_ptr(), &mut result);
+        }
+        decode_encoder_result(result)
+    }
+
     pub fn stats(&self) -> NativeCaptureStats {
         let Some(handle) = self.handle else {
             return NativeCaptureStats::default();
@@ -771,6 +846,7 @@ impl Drop for MacCaptureSession {
 mod tests {
     use super::*;
     use crate::session::{SessionDiagnostics, SessionStateMachine};
+    use std::fs;
     use std::sync::Arc;
 
     #[test]
@@ -784,10 +860,22 @@ mod tests {
     fn permission_bundle_is_three_packed_i32s() {
         assert_eq!(std::mem::size_of::<AeroShootPermissionBundle>(), 12);
         assert_eq!(std::mem::align_of::<AeroShootPermissionBundle>(), 4);
-        assert_eq!(AeroShootPermissionState::from_c(2), AeroShootPermissionState::Authorized);
-        assert_eq!(AeroShootPermissionState::from_c(3), AeroShootPermissionState::Denied);
-        assert_eq!(AeroShootPermissionState::from_c(1), AeroShootPermissionState::NotDetermined);
-        assert_eq!(AeroShootPermissionState::from_c(99), AeroShootPermissionState::Unknown);
+        assert_eq!(
+            AeroShootPermissionState::from_c(2),
+            AeroShootPermissionState::Authorized
+        );
+        assert_eq!(
+            AeroShootPermissionState::from_c(3),
+            AeroShootPermissionState::Denied
+        );
+        assert_eq!(
+            AeroShootPermissionState::from_c(1),
+            AeroShootPermissionState::NotDetermined
+        );
+        assert_eq!(
+            AeroShootPermissionState::from_c(99),
+            AeroShootPermissionState::Unknown
+        );
         let status = permission_status(AeroShootPermissionBundle {
             screen_recording: 2,
             camera: 2,
@@ -851,6 +939,52 @@ mod tests {
         assert_eq!(LAST_RUNTIME_ERROR_CODE.load(Ordering::SeqCst), 17);
         assert_eq!(diagnostics.gaps_total(), 1);
 
+        clear_callback_targets();
+    }
+
+    #[test]
+    fn native_callback_keeps_pending_publication_after_journal_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = crate::project::ProjectJournal::open_or_create(dir.path()).unwrap();
+        let journal = Arc::new(journal);
+        fs::create_dir_all(dir.path().join("media/mic")).unwrap();
+        let temp = dir.path().join("media/mic/000001.wav.tmp");
+        let data = crate::fixtures::generate_valid_wav_segment(100_000, 48_000, 1);
+        fs::write(&temp, &data).unwrap();
+        journal.inject_fail_next_appends(1);
+
+        let diagnostics = Arc::new(SessionDiagnostics::new());
+        install_callback_targets(
+            diagnostics.clone(),
+            Arc::new(SessionStateMachine::new()),
+            crate::session::SessionEpoch::now(),
+            Some(journal.clone()),
+            Some(dir.path().to_path_buf()),
+        );
+
+        let track = CString::new("mic").unwrap();
+        let path = CString::new(temp.to_string_lossy().as_ref()).unwrap();
+        let status = unsafe {
+            c_segment_callback(track.as_ptr(), 0, 0, 48_000, 0, path.as_ptr())
+        };
+        assert_eq!(status, -600);
+        assert!(dir.path().join("media/mic/000001.wav").exists());
+        assert!(journal.read_all().unwrap().is_empty());
+
+        let mut writers = take_native_segment_writers();
+        assert_eq!(writers.len(), 1);
+        assert!(
+            writers[0].has_pending_publication(),
+            "throwaway callback writers must not drop pending publication"
+        );
+
+        let committed = writers[0]
+            .finalize(100_000, journal.as_ref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.relative_path, "media/mic/000001.wav");
+        assert_eq!(journal.read_all().unwrap().len(), 1);
+        assert!(!writers[0].has_pending_publication());
         clear_callback_targets();
     }
 }

@@ -1,9 +1,12 @@
 //! Bounded, non-repairing project inspection. Source files are never modified.
 use super::{
+    display_name_from_input,
     journal::JournalRecord,
+    layout::EditLayout,
     manifest::{ProjectManifest, TrackDescriptor},
     revision::{self, EditDocument, EditHistory},
 };
+use crate::zoom::ZoomKeyframe;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -62,6 +65,14 @@ pub struct OpenedProject {
     pub preview_available: bool,
     pub undo_available: bool,
     pub redo_available: bool,
+    #[serde(default)]
+    pub zooms: Vec<ZoomKeyframe>,
+    #[serde(default)]
+    pub dismissed_zoom_ids: Vec<String>,
+    #[serde(default)]
+    pub layout: EditLayout,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -410,6 +421,8 @@ impl ProjectReader {
         }
         let retained = history.current.retained_intervals.clone();
         let edited_duration_us = history.current.edited_duration_us()?;
+        let mut zooms = history.current.zooms.clone();
+        crate::zoom::attach_zoom_edited_ranges(&mut zooms, &history.current.mapper()?);
         Ok(Self {
             summary: OpenedProject {
                 project_handle: uuid::Uuid::new_v4().to_string(),
@@ -423,6 +436,10 @@ impl ProjectReader {
                 preview_available: false,
                 undo_available: history.undo_available(),
                 redo_available: history.redo_available(),
+                zooms,
+                dismissed_zoom_ids: history.current.dismissed_zoom_ids.clone(),
+                layout: history.current.layout.clone(),
+                project_path: Some(root.to_string_lossy().into_owned()),
             },
             segments,
             root,
@@ -481,6 +498,100 @@ impl ProjectReader {
         Ok(self.summary.clone())
     }
 
+    pub fn accept_zooms(
+        &mut self,
+        expected_revision: u64,
+        suggestions: &[crate::zoom::ZoomSuggestion],
+    ) -> Result<OpenedProject, String> {
+        self.history
+            .accept_zooms(expected_revision, suggestions, &self.root)?;
+        self.sync_summary();
+        Ok(self.summary.clone())
+    }
+
+    pub fn dismiss_zooms(
+        &mut self,
+        expected_revision: u64,
+        ids: &[String],
+    ) -> Result<OpenedProject, String> {
+        self.history
+            .dismiss_zooms(expected_revision, ids, &self.root)?;
+        self.sync_summary();
+        Ok(self.summary.clone())
+    }
+
+    pub fn update_zoom(
+        &mut self,
+        expected_revision: u64,
+        patch: crate::zoom::ZoomKeyframe,
+    ) -> Result<OpenedProject, String> {
+        self.history
+            .update_zoom(expected_revision, patch, &self.root)?;
+        self.sync_summary();
+        Ok(self.summary.clone())
+    }
+
+    pub fn add_manual_zoom(
+        &mut self,
+        expected_revision: u64,
+        edited_start_us: u64,
+        edited_end_us: u64,
+        center_x: f64,
+        center_y: f64,
+        scale: f64,
+    ) -> Result<OpenedProject, String> {
+        self.history.add_manual_zoom(
+            expected_revision,
+            edited_start_us,
+            edited_end_us,
+            center_x,
+            center_y,
+            scale,
+            &self.root,
+        )?;
+        self.sync_summary();
+        Ok(self.summary.clone())
+    }
+
+    pub fn delete_zoom(
+        &mut self,
+        expected_revision: u64,
+        id: &str,
+    ) -> Result<OpenedProject, String> {
+        self.history.delete_zoom(expected_revision, id, &self.root)?;
+        self.sync_summary();
+        Ok(self.summary.clone())
+    }
+
+    pub fn update_layout(
+        &mut self,
+        expected_revision: u64,
+        layout: EditLayout,
+    ) -> Result<OpenedProject, String> {
+        self.history
+            .update_layout(expected_revision, layout, &self.root)?;
+        self.sync_summary();
+        Ok(self.summary.clone())
+    }
+
+    pub fn rename_project(&mut self, new_name: &str) -> Result<OpenedProject, String> {
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() {
+            return Err("Project name cannot be empty".into());
+        }
+        let clean_name = display_name_from_input(trimmed);
+        if clean_name == self.summary.manifest.project_name {
+            return Ok(self.summary.clone());
+        }
+        let mut manifest = self.summary.manifest.clone();
+        manifest.project_name = clean_name;
+        manifest
+            .save_with_backup(&self.root.join("manifest.json"))
+            .map_err(|e| e.to_string())?;
+        self.summary.manifest = manifest;
+        Ok(self.summary.clone())
+    }
+
     fn sync_summary(&mut self) {
         self.summary.revision = self.history.current.revision;
         self.summary.retained_intervals = self.history.current.retained_intervals.clone();
@@ -491,5 +602,12 @@ impl ProjectReader {
             .unwrap_or(self.summary.edited_duration_us);
         self.summary.undo_available = self.history.undo_available();
         self.summary.redo_available = self.history.redo_available();
+        let mut zooms = self.history.current.zooms.clone();
+        if let Ok(mapper) = self.history.current.mapper() {
+            crate::zoom::attach_zoom_edited_ranges(&mut zooms, &mapper);
+        }
+        self.summary.zooms = zooms;
+        self.summary.dismissed_zoom_ids = self.history.current.dismissed_zoom_ids.clone();
+        self.summary.layout = self.history.current.layout.clone();
     }
 }

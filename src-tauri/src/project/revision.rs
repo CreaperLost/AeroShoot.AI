@@ -1,10 +1,17 @@
 //! Versioned edit document (`project.json`). Source media is never rewritten.
+use super::layout::validate_layout;
 use super::reader::{open_regular, safe_path, RetainedInterval};
 use crate::timeline::{SourceInterval, TimelineMapper};
+use crate::zoom::{
+    attach_zoom_edited_ranges, validate_zooms, ZoomKeyframe, ZoomSource, ZoomSuggestion,
+    MAX_DISMISSED_ZOOMS, MAX_ZOOMS,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
+
+pub use super::layout::EditLayout;
 
 pub const EDIT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_EDIT_BYTES: u64 = 1_048_576;
@@ -14,34 +21,29 @@ pub const MAX_CUTS_PER_REVISION: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct EditLayout {
-    #[serde(default = "default_aspect")]
-    pub aspect_ratio: String,
-    #[serde(default)]
-    pub padding_px: u32,
-}
-
-fn default_aspect() -> String {
-    "16:9".into()
-}
-
-impl Default for EditLayout {
-    fn default() -> Self {
-        Self {
-            aspect_ratio: default_aspect(),
-            padding_px: 0,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct EditDocument {
     pub schema_version: u32,
     pub revision: u64,
     pub retained_intervals: Vec<RetainedInterval>,
     #[serde(default)]
     pub layout: EditLayout,
+    #[serde(default)]
+    pub zooms: Vec<ZoomKeyframe>,
+    #[serde(default)]
+    pub dismissed_zoom_ids: Vec<String>,
+}
+
+impl Default for EditDocument {
+    fn default() -> Self {
+        Self {
+            schema_version: EDIT_SCHEMA_VERSION,
+            revision: 0,
+            retained_intervals: Vec::new(),
+            layout: EditLayout::default(),
+            zooms: Vec::new(),
+            dismissed_zoom_ids: Vec::new(),
+        }
+    }
 }
 
 impl EditDocument {
@@ -52,6 +54,8 @@ impl EditDocument {
             revision: 0,
             retained_intervals: retained,
             layout: EditLayout::default(),
+            zooms: Vec::new(),
+            dismissed_zoom_ids: Vec::new(),
         })
     }
 
@@ -65,6 +69,16 @@ impl EditDocument {
                 })
                 .collect(),
         )
+    }
+
+    pub fn zoom_suggestions(&self) -> Vec<ZoomSuggestion> {
+        self.zooms.iter().map(ZoomKeyframe::as_suggestion).collect()
+    }
+
+    pub fn attach_zoom_ranges(&mut self) -> Result<(), String> {
+        let mapper = self.mapper()?;
+        attach_zoom_edited_ranges(&mut self.zooms, &mapper);
+        Ok(())
     }
 
     pub fn edited_duration_us(&self) -> Result<u64, String> {
@@ -114,12 +128,18 @@ pub fn load_edit_document(root: &Path) -> Result<Option<EditDocument>, String> {
         ));
     }
     validate_retained(&document.retained_intervals)?;
+    validate_layout(&document.layout)?;
+    validate_zooms(&document.zooms)?;
+    validate_dismissed(&document.dismissed_zoom_ids)?;
     document.mapper()?;
     Ok(Some(document))
 }
 
 pub fn save_edit_document(root: &Path, document: &EditDocument) -> Result<(), String> {
     validate_retained(&document.retained_intervals)?;
+    validate_layout(&document.layout)?;
+    validate_zooms(&document.zooms)?;
+    validate_dismissed(&document.dismissed_zoom_ids)?;
     if document.schema_version != EDIT_SCHEMA_VERSION {
         return Err("Unsupported edit schema version".into());
     }
@@ -141,6 +161,19 @@ pub fn save_edit_document(root: &Path, document: &EditDocument) -> Result<(), St
     // reporting a failed edit after publication would leave memory and disk divergent.
     if let Ok(directory) = fs::File::open(root) {
         let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+fn validate_dismissed(ids: &[String]) -> Result<(), String> {
+    if ids.len() > MAX_DISMISSED_ZOOMS {
+        return Err("Too many dismissed zoom ids".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for id in ids {
+        if id.is_empty() || id.len() > 128 || !seen.insert(id) {
+            return Err("Invalid dismissed zoom id".into());
+        }
     }
     Ok(())
 }
@@ -214,12 +247,23 @@ impl EditHistory {
         next_retained: Vec<RetainedInterval>,
         persist_root: &Path,
     ) -> Result<&EditDocument, String> {
+        let mut next = self.current.clone();
+        next.retained_intervals = next_retained;
+        self.commit_next(expected_revision, persist_root, next)
+    }
+
+    pub fn commit_next(
+        &mut self,
+        expected_revision: u64,
+        persist_root: &Path,
+        mut next: EditDocument,
+    ) -> Result<&EditDocument, String> {
         if expected_revision != self.current.revision {
             return Err("Stale edit revision".into());
         }
-        validate_retained(&next_retained)?;
+        validate_retained(&next.retained_intervals)?;
         TimelineMapper::try_new(
-            next_retained
+            next.retained_intervals
                 .iter()
                 .enumerate()
                 .map(|(i, interval)| {
@@ -227,13 +271,16 @@ impl EditHistory {
                 })
                 .collect(),
         )?;
-        let mut next = self.current.clone();
+        validate_layout(&next.layout)?;
+        validate_zooms(&next.zooms)?;
+        validate_dismissed(&next.dismissed_zoom_ids)?;
+        next.schema_version = EDIT_SCHEMA_VERSION;
         next.revision = self
             .current
             .revision
             .checked_add(1)
             .ok_or("Revision overflow")?;
-        next.retained_intervals = next_retained;
+        next.attach_zoom_ranges()?;
         persist_revision(persist_root, expected_revision, &next)?;
         self.undo.push(self.current.clone());
         if self.undo.len() > MAX_UNDO {
@@ -242,6 +289,173 @@ impl EditHistory {
         self.redo.clear();
         self.current = next;
         Ok(&self.current)
+    }
+
+    pub fn update_layout(
+        &mut self,
+        expected_revision: u64,
+        layout: EditLayout,
+        persist_root: &Path,
+    ) -> Result<&EditDocument, String> {
+        if expected_revision != self.current.revision {
+            return Err("Stale edit revision".into());
+        }
+        validate_layout(&layout)?;
+        if layout == self.current.layout {
+            return Ok(&self.current);
+        }
+        let mut next = self.current.clone();
+        next.layout = layout;
+        self.commit_next(expected_revision, persist_root, next)
+    }
+
+    pub fn accept_zooms(
+        &mut self,
+        expected_revision: u64,
+        suggestions: &[ZoomSuggestion],
+        persist_root: &Path,
+    ) -> Result<&EditDocument, String> {
+        if suggestions.is_empty() {
+            return Err("No zoom suggestions selected".into());
+        }
+        let mut next = self.current.clone();
+        let existing: std::collections::BTreeSet<_> =
+            next.zooms.iter().map(|z| z.id.clone()).collect();
+        let dismissed: std::collections::BTreeSet<_> =
+            next.dismissed_zoom_ids.iter().cloned().collect();
+        for suggestion in suggestions {
+            if existing.contains(&suggestion.id) || dismissed.contains(&suggestion.id) {
+                continue;
+            }
+            next.zooms.push(ZoomKeyframe::from_suggestion(
+                suggestion.clone(),
+                ZoomSource::Generated,
+            ));
+        }
+        if next.zooms.len() == self.current.zooms.len() {
+            return Err("Those zoom suggestions are already applied or dismissed".into());
+        }
+        if next.zooms.len() > MAX_ZOOMS {
+            return Err("Too many zoom keyframes".into());
+        }
+        next.zooms
+            .sort_by(|a, b| a.source_start_us.cmp(&b.source_start_us).then(a.id.cmp(&b.id)));
+        self.commit_next(expected_revision, persist_root, next)
+    }
+
+    pub fn dismiss_zooms(
+        &mut self,
+        expected_revision: u64,
+        ids: &[String],
+        persist_root: &Path,
+    ) -> Result<&EditDocument, String> {
+        if ids.is_empty() {
+            return Err("No zoom ids selected".into());
+        }
+        let mut next = self.current.clone();
+        let remove: std::collections::BTreeSet<_> = ids.iter().cloned().collect();
+        next.zooms.retain(|z| !remove.contains(&z.id));
+        for id in ids {
+            if !next.dismissed_zoom_ids.iter().any(|d| d == id) {
+                next.dismissed_zoom_ids.push(id.clone());
+            }
+        }
+        if next.zooms == self.current.zooms
+            && next.dismissed_zoom_ids == self.current.dismissed_zoom_ids
+        {
+            return Err("Those zoom ids are already dismissed".into());
+        }
+        self.commit_next(expected_revision, persist_root, next)
+    }
+
+    pub fn update_zoom(
+        &mut self,
+        expected_revision: u64,
+        patch: ZoomKeyframe,
+        persist_root: &Path,
+    ) -> Result<&EditDocument, String> {
+        let mut next = self.current.clone();
+        let Some(existing) = next.zooms.iter_mut().find(|z| z.id == patch.id) else {
+            return Err("Unknown zoom keyframe".into());
+        };
+        existing.source_start_us = patch.source_start_us;
+        existing.source_end_us = patch.source_end_us;
+        existing.center_x = patch.center_x;
+        existing.center_y = patch.center_y;
+        existing.scale = patch.scale;
+        existing.transition_us = patch.transition_us;
+        // Moving/resizing a generated zoom keeps its id so regeneration cannot
+        // replace it, and marks it manual so a later accept cannot reset it.
+        existing.source = ZoomSource::Manual;
+        self.commit_next(expected_revision, persist_root, next)
+    }
+
+    pub fn add_manual_zoom(
+        &mut self,
+        expected_revision: u64,
+        edited_start_us: u64,
+        edited_end_us: u64,
+        center_x: f64,
+        center_y: f64,
+        scale: f64,
+        persist_root: &Path,
+    ) -> Result<&EditDocument, String> {
+        if edited_end_us <= edited_start_us {
+            return Err("Zoom must be a half-open edited range".into());
+        }
+        let mapper = self.current.mapper()?;
+        let source_start = mapper
+            .edited_to_source_us(edited_start_us)
+            .ok_or("Zoom start is not on retained media")?;
+        let source_end_sample = mapper
+            .edited_to_source_us(edited_end_us.saturating_sub(1))
+            .ok_or("Zoom end is not on retained media")?;
+        let source_end = source_end_sample.saturating_add(1);
+        if source_end <= source_start {
+            return Err("Zoom range does not map onto source time".into());
+        }
+        let duration = source_end - source_start;
+        if duration < 3 {
+            return Err("Zoom range is too short".into());
+        }
+        let transition_us = (duration / 5).clamp(1, 400_000).min(duration.saturating_sub(1));
+        let mut next = self.current.clone();
+        let id = format!("m-{}-{}", source_start, next.zooms.len());
+        next.zooms.push(ZoomKeyframe {
+            id,
+            source_start_us: source_start,
+            source_end_us: source_end,
+            center_x,
+            center_y,
+            scale,
+            transition_us,
+            origin: crate::zoom::ZoomOrigin::Click,
+            contributing_event_seqs: Vec::new(),
+            source: ZoomSource::Manual,
+            edited_ranges: Vec::new(),
+        });
+        next.zooms
+            .sort_by(|a, b| a.source_start_us.cmp(&b.source_start_us).then(a.id.cmp(&b.id)));
+        self.commit_next(expected_revision, persist_root, next)
+    }
+
+    pub fn delete_zoom(
+        &mut self,
+        expected_revision: u64,
+        id: &str,
+        persist_root: &Path,
+    ) -> Result<&EditDocument, String> {
+        let mut next = self.current.clone();
+        let Some(index) = next.zooms.iter().position(|z| z.id == id) else {
+            return Err("Unknown zoom keyframe".into());
+        };
+        let removed = next.zooms.remove(index);
+        if removed.source == ZoomSource::Generated
+            && !next.dismissed_zoom_ids.iter().any(|d| d == id)
+        {
+            next.dismissed_zoom_ids.push(id.to_string());
+        }
+        self.commit_next(expected_revision, persist_root, next)
     }
 
     pub fn ripple_cuts(
@@ -410,5 +624,88 @@ mod tests {
         let loaded = load_edit_document(dir.path()).unwrap().unwrap();
         assert_eq!(loaded.revision, 3);
         assert_eq!(loaded.retained_intervals[0].end_us, 2_000_000);
+    }
+
+    #[test]
+    fn zoom_edits_undo_and_do_not_revive_dismissed_or_overwrite_manual() {
+        use crate::zoom::{ZoomOrigin, ZoomSuggestion};
+        let dir = tempdir().unwrap();
+        let mut history = EditHistory::new(
+            EditDocument::from_retained(vec![RetainedInterval {
+                start_us: 0,
+                end_us: 10_000_000,
+            }])
+            .unwrap(),
+        );
+        let suggestion = ZoomSuggestion {
+            id: "z-1-n1".into(),
+            source_start_us: 1_000_000,
+            source_end_us: 3_000_000,
+            center_x: 0.4,
+            center_y: 0.4,
+            scale: 2.0,
+            transition_us: 400_000,
+            origin: ZoomOrigin::Click,
+            contributing_event_seqs: vec![1],
+            edited_ranges: Vec::new(),
+        };
+        history
+            .accept_zooms(0, &[suggestion.clone()], dir.path())
+            .unwrap();
+        assert_eq!(history.current.zooms.len(), 1);
+        assert_eq!(history.current.zooms[0].source, ZoomSource::Generated);
+        let mut moved = history.current.zooms[0].clone();
+        moved.source_start_us = 1_200_000;
+        moved.source_end_us = 3_200_000;
+        history.update_zoom(1, moved, dir.path()).unwrap();
+        assert_eq!(history.current.zooms[0].source, ZoomSource::Manual);
+        history
+            .accept_zooms(2, &[suggestion.clone()], dir.path())
+            .unwrap_err();
+        history.dismiss_zooms(2, &["z-1-n1".into()], dir.path()).unwrap();
+        assert!(history.current.zooms.is_empty());
+        history
+            .accept_zooms(3, &[suggestion], dir.path())
+            .unwrap_err();
+        history.undo(3, dir.path()).unwrap();
+        assert_eq!(history.current.zooms.len(), 1);
+        assert_eq!(history.current.zooms[0].source, ZoomSource::Manual);
+        let loaded = load_edit_document(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.zooms[0].source_start_us, 1_200_000);
+        assert_eq!(loaded.revision, 4);
+    }
+
+    #[test]
+    fn layout_edits_undo_and_reopen() {
+        let dir = tempdir().unwrap();
+        let mut history = EditHistory::new(
+            EditDocument::from_retained(vec![RetainedInterval {
+                start_us: 0,
+                end_us: 1_000_000,
+            }])
+            .unwrap(),
+        );
+        let mut layout = EditLayout::default();
+        layout.aspect_ratio = "9:16".into();
+        layout.padding_px = 24;
+        layout.background_type = "solid".into();
+        layout.color_start = "#ff0000".into();
+        layout.webcam_mirror = false;
+        layout.webcam_position = "top-left".into();
+        history.update_layout(0, layout.clone(), dir.path()).unwrap();
+        assert_eq!(history.current.revision, 1);
+        assert_eq!(history.current.layout.aspect_ratio, "9:16");
+        history.undo(1, dir.path()).unwrap();
+        assert_eq!(history.current.layout.aspect_ratio, "16:9");
+        history.redo(2, dir.path()).unwrap();
+        let loaded = load_edit_document(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.layout.padding_px, 24);
+        assert_eq!(loaded.layout.color_start, "#ff0000");
+        assert!(!loaded.layout.webcam_mirror);
+        assert_eq!(loaded.revision, 3);
+        let mut bad = layout;
+        bad.padding_px = 999;
+        assert!(history.update_layout(3, bad, dir.path()).is_err());
+        assert_eq!(history.current.revision, 3);
     }
 }

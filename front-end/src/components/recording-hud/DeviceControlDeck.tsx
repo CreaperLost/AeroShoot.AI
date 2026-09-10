@@ -50,16 +50,16 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
   return (
     <div
       ref={containerRef}
-      className="w-full bg-studio-900/80 border-b border-studio-800/80 px-6 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs z-20 select-none backdrop-blur-md"
+      className="device-control-grid w-full bg-studio-900/80 border-b border-studio-800/80 px-5 py-2.5 text-xs z-20 select-none backdrop-blur-md"
     >
-      <div className="flex flex-wrap items-center gap-2.5">
+      <div className="device-selectors-grid">
         {/* 1. PHYSICAL DISPLAY SELECTOR */}
-        <div className="relative">
+        <div className="relative min-w-0">
           <button
             type="button"
             disabled={disabled}
             onClick={() => setOpenDropdown(openDropdown === "source" ? null : "source")}
-            className={`flex items-center space-x-2.5 px-3 py-2 rounded-xl border transition-all ${
+            className={`device-control-card flex w-full min-w-0 items-center space-x-2.5 px-3 py-2 rounded-xl border transition-all ${
               openDropdown === "source"
                 ? "bg-studio-800 border-indigo-500/80 text-white shadow-lg shadow-indigo-500/10"
                 : "bg-studio-850/80 hover:bg-studio-800 border-studio-750 text-studio-200"
@@ -77,7 +77,7 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
               </span>
             </div>
             {selectedSource && (
-              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-studio-800 border border-studio-700 text-studio-400">
+              <span className="device-control-detail text-[10px] font-mono px-1.5 py-0.5 rounded bg-studio-800 border border-studio-700 text-studio-400">
                 {selectedSource.width}×{selectedSource.height}
               </span>
             )}
@@ -135,12 +135,12 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
         </div>
 
         {/* 2. MICROPHONE / AUDIO SELECTOR */}
-        <div className="relative">
+        <div className="relative min-w-0">
           <button
             type="button"
             disabled={disabled}
             onClick={() => setOpenDropdown(openDropdown === "mic" ? null : "mic")}
-            className={`flex items-center space-x-2.5 px-3 py-2 rounded-xl border transition-all ${
+            className={`device-control-card flex w-full min-w-0 items-center space-x-2.5 px-3 py-2 rounded-xl border transition-all ${
               openDropdown === "mic"
                 ? "bg-studio-800 border-amber-500/80 text-white shadow-lg shadow-amber-500/10"
                 : "bg-studio-850/80 hover:bg-studio-800 border-studio-750 text-studio-200"
@@ -163,7 +163,7 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
             </div>
             {/* Live audio level visualizer bar */}
             {selectedMic && (
-              <div className="flex items-end space-x-0.5 h-3.5 px-1 py-0.5 bg-studio-800/80 rounded border border-studio-700/60">
+              <div className="device-control-detail flex items-end space-x-0.5 h-3.5 px-1 py-0.5 bg-studio-800/80 rounded border border-studio-700/60">
                 <div className="w-0.5 h-1.5 bg-emerald-400 rounded-full animate-bounce" style={{ animationDuration: "600ms" }} />
                 <div className="w-0.5 h-3 bg-emerald-400 rounded-full animate-bounce" style={{ animationDuration: "450ms" }} />
                 <div className="w-0.5 h-2 bg-emerald-400 rounded-full animate-bounce" style={{ animationDuration: "750ms" }} />
@@ -217,12 +217,12 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
         </div>
 
         {/* 3. WEBCAMERA SELECTOR (Unified card with 'No Camera' option) */}
-        <div className="relative">
+        <div className="relative min-w-0">
           <button
             type="button"
             disabled={disabled}
             onClick={() => setOpenDropdown(openDropdown === "camera" ? null : "camera")}
-            className={`flex items-center space-x-2.5 px-3 py-2 rounded-xl border transition-all ${
+            className={`device-control-card flex w-full min-w-0 items-center space-x-2.5 px-3 py-2 rounded-xl border transition-all ${
               openDropdown === "camera"
                 ? "bg-studio-800 border-indigo-500/80 text-white shadow-lg shadow-indigo-500/10"
                 : settings.cameraBubble.enabled
@@ -341,7 +341,7 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
           type="button"
           disabled={disabled}
           onClick={() => settings.setCaptureSystemAudio(!settings.captureSystemAudio)}
-          className={`flex items-center space-x-2 px-3 py-2 rounded-xl border transition-all ${
+          className={`device-control-card flex w-full min-w-0 items-center space-x-2 px-3 py-2 rounded-xl border transition-all ${
             settings.captureSystemAudio
               ? "bg-emerald-600/20 border-emerald-500/50 text-emerald-200 shadow-sm shadow-emerald-950"
               : "bg-studio-850/80 hover:bg-studio-800 border-studio-750 text-studio-400"
@@ -365,7 +365,7 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
       </div>
 
       {/* 5. ASPECT RATIO SELECTOR (Direct, immediate effect!) */}
-      <div className="flex items-center space-x-2 bg-studio-950/70 p-1 rounded-xl border border-studio-800">
+      <div className="ratio-control-grid min-w-0 bg-studio-950/70 p-1 rounded-xl border border-studio-800">
         <span className="text-[11px] font-semibold text-studio-400 uppercase px-2 font-mono">
           Ratio
         </span>

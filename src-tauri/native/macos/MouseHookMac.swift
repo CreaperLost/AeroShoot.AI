@@ -36,7 +36,14 @@ final class MouseHookMac {
   private let epochUs: Int64
   private let offsetUs: UInt64
   private var permissionLost = false
+  private var userDisabled = false
   private let capacity = 2048
+  /// Live capture always uses a 100 ms geometry poll. Do not tighten this
+  /// without a measured adapter; H2 keeps the interval as uncertainty.
+  static let geometrySamplingIntervalUs: UInt64 = 100_000
+#if MOUSE_CONTRACT_TESTS
+  var listenAccessOverride: Bool?
+#endif
 
   init(sourceID: String, width: Int, height: Int, epoch: CMTime, offsetUs: UInt64) {
     self.sourceID = sourceID; outputWidth = width; outputHeight = height
@@ -54,6 +61,13 @@ final class MouseHookMac {
     let host = CMClockGetTime(CMClockGetHostTimeClock())
     let us = CMTimeConvertScale(host, timescale: 1_000_000, method: .roundTowardZero).value
     return UInt64(max(0, Int64(clamping: offsetUs) + us - epochUs))
+  }
+
+  private func hasListenAccess() -> Bool {
+#if MOUSE_CONTRACT_TESTS
+    if let override = listenAccessOverride { return override }
+#endif
+    return CGPreflightListenEventAccess()
   }
 
   private func gap(_ reason: String, _ start: UInt64, _ end: UInt64, count: UInt64 = 0) -> [String: Any] {
@@ -82,7 +96,7 @@ final class MouseHookMac {
     lock.lock()
     enqueue(gap("initial_button_state_unknown", now(), now()), at: now())
     lock.unlock()
-    guard CGPreflightListenEventAccess() else {
+    guard hasListenAccess() else {
       lock.lock(); enqueue(gap("input_monitoring_unavailable", now(), now()), at: now()); lock.unlock()
       drain(); return
     }
@@ -135,13 +149,20 @@ final class MouseHookMac {
     let time = sessionTime(event.timestamp)
     lock.lock(); defer { lock.unlock() }
     guard !stopping, failure == nil else { return }
-    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+    if type == .tapDisabledByUserInput {
       enqueue(gap("event_tap_disabled", time, time), at: time)
-      // Authorization is rechecked on the worker, not inside the tap callback.
-      permissionLost = type == .tapDisabledByTimeout
+      // Explicit user disable: record the gap, do not re-enable or prompt.
+      userDisabled = true
+      permissionLost = false
       return
     }
-    guard !paused, let bounds = geometry, let id = geometryID else { return }
+    if type == .tapDisabledByTimeout {
+      enqueue(gap("event_tap_disabled", time, time), at: time)
+      // Authorization is rechecked on the worker, not inside the tap callback.
+      permissionLost = true
+      return
+    }
+    guard !userDisabled, !paused, let bounds = geometry, let id = geometryID else { return }
     let point = event.location
     let x = (point.x - bounds.minX) / bounds.width
     let y = (point.y - bounds.minY) / bounds.height
@@ -189,14 +210,18 @@ final class MouseHookMac {
     let time = now()
     if permissionLost {
       permissionLost = false
-      if CGPreflightListenEventAccess(), let tap { CGEvent.tapEnable(tap: tap, enable: true) }
-      else { enqueue(gap("input_monitoring_revoked", time, time), at: time) }
+      if hasListenAccess() {
+        if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+      } else {
+        enqueue(gap("input_monitoring_revoked", time, time), at: time)
+      }
     }
     guard bounds != geometry || metrics != displayMetrics else { return }
     displayMetrics = metrics
     // A geometry change is a discontinuity at polling resolution. Do not
     // imply frame-exact window tracking between these 100 ms observations.
-    enqueue(gap("geometry_changed", time > 100_000 ? time - 100_000 : 0, time), at: time)
+    let uncertainty = MouseHookMac.geometrySamplingIntervalUs
+    enqueue(gap("geometry_changed", time > uncertainty ? time - uncertainty : 0, time), at: time)
     geometry = bounds
     geometryID = nil
     guard let bounds else { return }
@@ -209,7 +234,7 @@ final class MouseHookMac {
       "coordinate_space": "quartz_global", "source_id": sourceID,
       "bounds": ["x": bounds.minX, "y": bounds.minY, "width": bounds.width, "height": bounds.height],
       "output_width": outputWidth, "output_height": outputHeight,
-      "sampling_interval_us": 100_000, "cursor_mode": "baked"]
+      "sampling_interval_us": MouseHookMac.geometrySamplingIntervalUs, "cursor_mode": "baked"]
     if metrics.count == 3 {
       revision["physical_width"] = metrics[0]
       revision["physical_height"] = metrics[1]
@@ -256,7 +281,11 @@ final class MouseHookMac {
     lock.unlock()
     if let runLoop { CFRunLoopStop(runLoop) }
     exited.wait()
-    timer?.cancel(); timer = nil
+    if let timer {
+      timer.setEventHandler {}
+      timer.cancel()
+    }
+    self.timer = nil
     worker.sync { drain() }
     lock.lock(); defer { lock.unlock() }
     return failure
@@ -272,17 +301,58 @@ func mousePermission(_ request: Bool) -> Bool {
 }
 
 #if MOUSE_CONTRACT_TESTS
+private let capturedLock = NSLock()
+private var capturedJSON: [String] = []
+private func capturingSink(_ ptr: UnsafePointer<CChar>?) -> Int32 {
+  guard let ptr else { return -1 }
+  capturedLock.lock(); capturedJSON.append(String(cString: ptr)); capturedLock.unlock()
+  return 0
+}
+
 extension MouseHookMac {
+  private func gapReasons() -> [String] {
+    records.compactMap { record in
+      (record["payload"] as? [String: Any])?["reason"] as? String
+    }
+  }
+
+  private func eventKinds() -> [String] {
+    records.compactMap { record in
+      (record["payload"] as? [String: Any])?["kind"] as? String
+    }
+  }
+
   static func runContractTests() {
-    let hook = MouseHookMac(sourceID: "display:0", width: 1920, height: 1080,
+    testSessionClockAndUnclampedGeometry()
+    testOverflowEmitsGapNotFabricatedClicks()
+    testPauseUserDisableTimeoutAndStop()
+    testDeniedAndRevokedPermissionGaps()
+    testUnsupportedApplicationGeometry()
+    testGeometryUncertaintyInterval()
+    testNoCallbacksAfterStop()
+    print("Mouse telemetry contracts passed (no event tap installed)")
+  }
+
+  private static func makeHook(sourceID: String = "display:0") -> MouseHookMac {
+    MouseHookMac(sourceID: sourceID, width: 1920, height: 1080,
       epoch: CMTime(value: 1, timescale: 1), offsetUs: 100)
-    assert(hook.sessionTime(1_500_000_000) == 500_100)
-    hook.geometry = CGRect(x: -1920, y: -100, width: 1920, height: 1080)
-    hook.geometryID = "g1"
+  }
+
+  private static func makeEvent() -> CGEvent {
     let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
       mouseCursorPosition: CGPoint(x: -2400, y: 1520), mouseButton: .left)!
     event.timestamp = 1_500_000_000
+    return event
+  }
+
+  private static func testSessionClockAndUnclampedGeometry() {
+    let hook = makeHook()
+    assert(hook.sessionTime(1_500_000_000) == 500_100)
+    hook.geometry = CGRect(x: -1920, y: -100, width: 1920, height: 1080)
+    hook.geometryID = "g1"
+    let event = makeEvent()
     hook.receive(.mouseMoved, event)
+    assert(hook.records[0]["t_us"] as? UInt64 == 500_100)
     assert(hook.records[0]["norm_x"] as? CGFloat == -0.25)
     assert(hook.records[0]["norm_y"] as? CGFloat == 1.5)
     assert(hook.records[0]["inside_source"] as? Bool == false)
@@ -294,10 +364,31 @@ extension MouseHookMac {
     hook.receive(.otherMouseUp, event)
     let down = hook.records[1]["payload"] as! [String: Any]
     assert(down["kind"] as? String == "button_down" && down["button"] as? Int64 == 4)
+  }
+
+  private static func testOverflowEmitsGapNotFabricatedClicks() {
+    let hook = makeHook()
+    hook.geometry = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    hook.geometryID = "g1"
+    let event = makeEvent()
     for _ in 0..<10_000 { hook.receive(.leftMouseDown, event) }
     assert(hook.records.count < hook.capacity)
     assert(hook.lost != nil)
-    hook.records.removeAll(); hook.lost = nil
+    capturedLock.lock(); capturedJSON.removeAll(); capturedLock.unlock()
+    registerMouseSink(capturingSink)
+    hook.drain()
+    capturedLock.lock(); let flushed = capturedJSON; capturedLock.unlock()
+    assert(flushed.contains { $0.contains("\"queue_overflow\"") })
+    assert(!flushed.contains { $0.contains("\"kind\":\"click\"") })
+    assert(hook.records.isEmpty)
+    assert(hook.lost == nil)
+  }
+
+  private static func testPauseUserDisableTimeoutAndStop() {
+    let hook = makeHook()
+    hook.geometry = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    hook.geometryID = "g1"
+    let event = makeEvent()
     hook.setPaused(true)
     hook.receive(.mouseMoved, event)
     assert(hook.records.isEmpty)
@@ -305,13 +396,90 @@ extension MouseHookMac {
     assert((hook.records[0]["payload"] as? [String: Any])?["reason"] as? String == "recording_paused")
     hook.receive(.tapDisabledByUserInput, event)
     assert(!hook.permissionLost)
+    assert(hook.userDisabled)
+    let afterDisable = hook.records.count
+    hook.receive(.leftMouseDown, event)
+    assert(hook.records.count == afterDisable)
     hook.receive(.tapDisabledByTimeout, event)
     assert(hook.permissionLost)
-    // An unavailable sink latches a failure instead of discarding silently.
     registerMouseSink(nil)
     hook.drain()
     assert(hook.stop() != nil)
-    print("Mouse telemetry contracts passed (no event tap installed)")
+  }
+
+  private static func testDeniedAndRevokedPermissionGaps() {
+    capturedLock.lock(); capturedJSON.removeAll(); capturedLock.unlock()
+    registerMouseSink(capturingSink)
+    let denied = makeHook()
+    denied.listenAccessOverride = false
+    denied.start()
+    assert(denied.tap == nil)
+    capturedLock.lock(); let flushed = capturedJSON; capturedLock.unlock()
+    assert(flushed.contains { $0.contains("input_monitoring_unavailable") })
+    assert(!flushed.contains { $0.contains("\"kind\":\"button_down\"") })
+    assert(!flushed.contains { $0.contains("\"kind\":\"click\"") })
+    _ = denied.stop()
+
+    let revoked = makeHook()
+    revoked.listenAccessOverride = false
+    revoked.permissionLost = true
+    revoked.refreshGeometry()
+    assert(revoked.gapReasons().contains("input_monitoring_revoked"))
+    assert(!revoked.eventKinds().contains("button_down"))
+    let authorized = makeHook()
+    authorized.listenAccessOverride = true
+    authorized.permissionLost = true
+    authorized.refreshGeometry()
+    assert(!authorized.gapReasons().contains("input_monitoring_revoked"))
+  }
+
+  private static func testUnsupportedApplicationGeometry() {
+    capturedLock.lock(); capturedJSON.removeAll(); capturedLock.unlock()
+    registerMouseSink(capturingSink)
+    let hook = makeHook(sourceID: "application:com.example")
+    hook.listenAccessOverride = true
+    hook.start()
+    assert(hook.tap == nil)
+    capturedLock.lock(); let flushed = capturedJSON; capturedLock.unlock()
+    assert(flushed.contains { $0.contains("unsupported_source_geometry") })
+    assert(!flushed.contains { $0.contains("\"kind\":\"button_down\"") })
+    _ = hook.stop()
+  }
+
+  private static func testGeometryUncertaintyInterval() {
+    let hook = makeHook()
+    hook.geometry = CGRect(x: -1920, y: -100, width: 1920, height: 1080)
+    hook.refreshGeometry()
+    let changed = hook.records.first { record in
+      (record["payload"] as? [String: Any])?["reason"] as? String == "geometry_changed"
+    }
+    assert(changed != nil)
+    let payload = changed?["payload"] as! [String: Any]
+    let start = payload["start_us"] as! UInt64
+    let end = payload["end_us"] as! UInt64
+    assert(end >= start)
+    if end >= MouseHookMac.geometrySamplingIntervalUs {
+      assert(end - start == MouseHookMac.geometrySamplingIntervalUs)
+    }
+  }
+
+  private static func testNoCallbacksAfterStop() {
+    let hook = makeHook()
+    hook.geometry = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    hook.geometryID = "g1"
+    let event = makeEvent()
+    capturedLock.lock(); capturedJSON.removeAll(); capturedLock.unlock()
+    registerMouseSink(capturingSink)
+    hook.receive(.leftMouseDown, event)
+    assert(hook.stop() == nil)
+    capturedLock.lock(); let afterStop = capturedJSON.count; capturedLock.unlock()
+    hook.receive(.leftMouseDown, event)
+    hook.receive(.mouseMoved, event)
+    hook.drain()
+    capturedLock.lock(); let later = capturedJSON; capturedLock.unlock()
+    assert(hook.records.isEmpty)
+    assert(later.filter { $0.contains("button_down") }.count
+      == later.prefix(afterStop).filter { $0.contains("button_down") }.count)
   }
 }
 #endif

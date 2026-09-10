@@ -236,7 +236,7 @@ pub struct SceneEvaluator {
     root: PathBuf,
     document: EditDocument,
     tracks: Vec<(TrackSummary, Vec<SegmentSummary>)>,
-    compositor: Compositor,
+    compositor: Option<Compositor>,
     width: u32,
     height: u32,
 }
@@ -253,13 +253,41 @@ impl SceneEvaluator {
             root,
             document,
             tracks,
-            compositor: Compositor::new()?,
+            compositor: Some(Compositor::new()?),
+            width,
+            height,
+        })
+    }
+
+    /// CPU-only evaluator for contract tests that must not require a GPU adapter.
+    pub fn new_cpu(
+        root: PathBuf,
+        document: EditDocument,
+        tracks: Vec<(TrackSummary, Vec<SegmentSummary>)>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            root,
+            document,
+            tracks,
+            compositor: None,
             width,
             height,
         })
     }
 
     pub fn preview_at(&mut self, edited_us: u64) -> Result<VideoFrame, String> {
+        let scene = self.scene_at(edited_us)?;
+        let mut frame = match self.compositor.as_mut() {
+            Some(compositor) => compositor.composite(&scene)?,
+            None => Compositor::composite_cpu(&scene)?,
+        };
+        frame.pts_us = edited_us;
+        Ok(frame)
+    }
+
+    pub fn scene_at(&self, edited_us: u64) -> Result<Scene, String> {
         let mapper = self.document.mapper()?;
         let duration_us = mapper.total_edited_duration_us();
         let ended = edited_us >= duration_us;
@@ -303,16 +331,30 @@ impl SceneEvaluator {
             }
         }
 
-        let scene = Scene::from_layout(
+        let has_screen = screen.is_some();
+        let wallpaper = crate::render::load_wallpaper_frame(
+            &self.root,
+            &self.document.layout,
             self.width,
             self.height,
-            self.document.layout.padding_px,
+        )?;
+        let mut scene = Scene::from_layout_with_wallpaper(
+            self.width,
+            self.height,
+            &self.document.layout,
             screen,
             webcam,
+            wallpaper,
         )?;
-        let mut frame = self.compositor.composite(&scene)?;
-        frame.pts_us = edited_us;
-        Ok(frame)
+        let zooms = self.document.zoom_suggestions();
+        let config = crate::zoom::eval_config_for(&self.document.zooms);
+        let camera = crate::zoom::evaluate_at_edited(&zooms, &mapper, edited_us, &config)
+            .unwrap_or_else(crate::zoom::CameraTransform::identity);
+        if has_screen {
+            let (uv_x, uv_y, uv_w, uv_h) = camera.uv_rect();
+            scene.apply_screen_uv(uv_x, uv_y, uv_w, uv_h);
+        }
+        Ok(scene)
     }
 }
 
@@ -366,14 +408,77 @@ pub fn validate_settings(settings: &ExportSettings) -> Result<(), ExportFailure>
     Ok(())
 }
 
-pub fn default_destination(project_root: &Path, project_name: &str, revision: u64) -> PathBuf {
+pub fn default_export_filename(project_name: &str) -> String {
+    let mut out = String::new();
+    for ch in project_name.chars() {
+        if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            continue;
+        }
+        out.push(ch);
+    }
+    let out = out.trim().trim_matches('.').to_string();
+    let stem = if out.is_empty() || out == "." || out == ".." {
+        "Untitled"
+    } else if let Some(stripped) = out
+        .strip_suffix(".mp4")
+        .or_else(|| out.strip_suffix(".MP4"))
+    {
+        stripped
+    } else {
+        &out
+    };
+    format!("{stem}.mp4")
+}
+
+pub fn is_inside_bundle(path: &Path, bundle_root: Option<&Path>) -> bool {
+    if let Some(bundle) = bundle_root {
+        if let Ok(canonical_bundle) = fs::canonicalize(bundle) {
+            if let Some(parent) = path.parent() {
+                if let Ok(canonical_parent) = fs::canonicalize(parent) {
+                    if canonical_parent.starts_with(&canonical_bundle) {
+                        return true;
+                    }
+                }
+            }
+            if let Ok(canonical_path) = fs::canonicalize(path) {
+                if canonical_path.starts_with(&canonical_bundle) {
+                    return true;
+                }
+            }
+        }
+        if path.starts_with(bundle) {
+            return true;
+        }
+        if let Some(parent) = path.parent() {
+            if parent.starts_with(bundle) {
+                return true;
+            }
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        for component in parent.components() {
+            let name = component.as_os_str().to_string_lossy();
+            if name.to_ascii_lowercase().ends_with(".aero") {
+                return true;
+            }
+        }
+    }
+
+    if path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .ends_with(".aero")
+    {
+        return true;
+    }
+
+    false
+}
+
+pub fn default_destination(project_root: &Path, project_name: &str, _revision: u64) -> PathBuf {
     let parent = project_root.parent().unwrap_or(project_root);
-    let safe: String = project_name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    let stem = if safe.is_empty() { "export" } else { &safe };
-    parent.join(format!("{stem}-r{revision}.mp4"))
+    parent.join(default_export_filename(project_name))
 }
 
 pub fn resolve_destination(
@@ -415,7 +520,7 @@ pub fn resolve_destination(
         message: "Export destination is missing a file name".into(),
     })?;
     let resolved = canonical_parent.join(file_name);
-    if resolved.starts_with(&project_root) {
+    if resolved.starts_with(&project_root) || is_inside_bundle(&resolved, Some(&project_root)) {
         return Err(ExportFailure::SourcePath {
             message: "Export destination cannot be inside the project bundle".into(),
         });
@@ -539,6 +644,22 @@ pub fn prepare_job(
             ExportState::Failed,
             Some(failure),
         ));
+    }
+    let mut settings = settings;
+    match document.layout.fit_export_size(settings.width, settings.height) {
+        Ok((width, height)) => {
+            settings.width = width;
+            settings.height = height;
+        }
+        Err(message) => {
+            return Err(status_from(
+                &job_id,
+                &document,
+                &settings,
+                ExportState::Failed,
+                Some(ExportFailure::InvalidSettings { message }),
+            ));
+        }
     }
     let dest = match resolve_destination(
         root,
@@ -772,6 +893,12 @@ pub fn run_export(
         if pts_us >= duration_us {
             break;
         }
+        let frame = evaluator
+            .preview_at(pts_us)
+            .map_err(|message| ExportFailure::Native { message })?;
+        session
+            .write_video(pts_us, &frame)
+            .map_err(|message| ExportFailure::Native { message })?;
         if channels > 0 {
             let end =
                 ((index as u128 + 1) * SAMPLE_RATE as u128 / captured.settings.fps as u128) as u64;
@@ -793,12 +920,6 @@ pub fn run_export(
                 audio_frame += count as u64;
             }
         }
-        let frame = evaluator
-            .preview_at(pts_us)
-            .map_err(|message| ExportFailure::Native { message })?;
-        session
-            .write_video(pts_us, &frame)
-            .map_err(|message| ExportFailure::Native { message })?;
         on_progress(index + 1, frames);
     }
     session

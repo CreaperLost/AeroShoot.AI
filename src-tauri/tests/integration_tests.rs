@@ -3,8 +3,9 @@ use aeroshoot_lib::capture::{
 };
 use aeroshoot_lib::commands::{
     get_permission_status_impl, pause_recording_impl, resume_recording_impl, start_recording_impl,
-    stop_recording_impl, AppState, DevicesResult, SessionStateResult, SessionStatusResult,
-    StartRecordingOptions, StartRecordingResult, StopRecordingResult,
+    stop_recording_impl, window_title_for_project, window_title_for_recording, AppState,
+    DevicesResult, SessionStateResult, SessionStatusResult, StartRecordingOptions,
+    StartRecordingResult, StopRecordingResult,
 };
 use aeroshoot_lib::dsp::{SilenceConfig, SilenceCutInterval};
 use aeroshoot_lib::fixtures::generate_valid_fmp4_segment;
@@ -16,6 +17,7 @@ use aeroshoot_lib::project::{
 };
 use aeroshoot_lib::session::{ClockDriftEstimator, SessionState};
 use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -45,17 +47,36 @@ fn test_ipc_serialization_contracts_match_frontend() {
     assert_eq!(opts.camera_id, Some("cam-facetime".into()));
     assert_eq!(opts.capture_system_audio, true);
     assert_eq!(opts.fps, 60);
+    assert_eq!(opts.project_name, None);
+    assert_eq!(opts.project_dir, None);
+
+    let named_json = r#"{
+        "sourceId": "screen-1",
+        "captureSystemAudio": false,
+        "fps": 30,
+        "resolution": "1080p",
+        "projectName": "Demo Take",
+        "projectDir": "/tmp/aeroshoot-projects"
+    }"#;
+    let named: StartRecordingOptions = serde_json::from_str(named_json).unwrap();
+    assert_eq!(named.project_name.as_deref(), Some("Demo Take"));
+    assert_eq!(
+        named.project_dir.as_deref(),
+        Some("/tmp/aeroshoot-projects")
+    );
 
     // 2. StartRecordingResult serializes with camelCase
     let start_res = StartRecordingResult {
         session_id: "test-sess".into(),
         state: SessionState::Recording,
         started_at_us: 123456789,
+        project_path: Some("/tmp/example.aero".into()),
     };
     let start_json = serde_json::to_string(&start_res).unwrap();
     assert!(start_json.contains("\"sessionId\":\"test-sess\""));
     assert!(start_json.contains("\"startedAtUs\":123456789"));
     assert!(start_json.contains("\"state\":\"recording\""));
+    assert!(start_json.contains("\"projectPath\":\"/tmp/example.aero\""));
 
     // 3. SessionStateResult serializes as { state: "paused" }
     let state_res = SessionStateResult {
@@ -85,6 +106,7 @@ fn test_ipc_serialization_contracts_match_frontend() {
         last_runtime_error: None,
         gaps_total: 0,
         timestamp_records_dropped: 0,
+        project_path: None,
     };
     let status_json = serde_json::to_string(&status_res).unwrap();
     assert!(status_json.contains("\"elapsedUs\":2500000"));
@@ -113,6 +135,7 @@ fn test_ipc_serialization_contracts_match_frontend() {
         threshold_db: -38.0,
         min_duration_ms: 400,
         padding_ms: 50,
+        ..SilenceConfig::default()
     };
     let sil_json = serde_json::to_string(&sil_cfg).unwrap();
     assert!(sil_json.contains("\"thresholdDb\":-38.0"));
@@ -125,6 +148,8 @@ fn test_ipc_serialization_contracts_match_frontend() {
         end_us: 2000,
         duration_ms: 1,
         selected: true,
+        source_start_us: 1000,
+        source_end_us: 2000,
     };
     let cut_json = serde_json::to_string(&cut).unwrap();
     assert!(cut_json.contains("\"startUs\":1000"));
@@ -143,6 +168,9 @@ fn test_repeated_recording_sessions_and_retries() {
         capture_system_audio: false,
         fps: 30,
         resolution: "1080p".into(),
+        layout: None,
+        project_name: None,
+        project_dir: None,
     };
 
     // Cycle 1: Start
@@ -365,10 +393,11 @@ fn test_exclusive_project_creation_and_snapshot_backups() {
     let session_id = "sess-exclusive-1";
 
     let mut bundle = ProjectBundle::create_new(dir.path(), session_id, "Proj A").unwrap();
+    assert_eq!(bundle.root_path().file_name().unwrap(), "Proj A.aero");
     assert!(bundle.root_path().join(".lock").exists());
 
-    // Duplicate creation must be rejected
-    let dup = ProjectBundle::create_new(dir.path(), session_id, "Proj A Dup");
+    // Duplicate creation of the same named bundle must be rejected
+    let dup = ProjectBundle::create_new(dir.path(), session_id, "Proj A");
     assert!(matches!(dup, Err(ProjectError::AlreadyExists(_))));
 
     // Updating manifest creates .bak retaining prior revision
@@ -398,6 +427,9 @@ fn test_pause_intervals_persisted_and_net_duration() {
         capture_system_audio: false,
         fps: 30,
         resolution: "1080p".into(),
+        layout: None,
+        project_name: None,
+        project_dir: None,
     };
 
     let _ = start_recording_impl(&state, opts).unwrap();
@@ -418,9 +450,7 @@ fn test_pause_intervals_persisted_and_net_duration() {
     assert_eq!(stop_res.state, SessionState::Completed);
 
     // Check project bundle manifest and journal
-    let bundle_path = dir
-        .path()
-        .join(format!("Project_Session_{}.aero", stop_res.session_id));
+    let bundle_path = PathBuf::from(&stop_res.project_path);
     let recovery_report = RecoveryEngine::scan_and_recover(&bundle_path).unwrap();
 
     assert_eq!(recovery_report.pause_intervals.len(), 1);
@@ -512,6 +542,9 @@ fn test_p1_finding_2_concurrent_start_calls_serialized() {
         capture_system_audio: false,
         fps: 30,
         resolution: "1080p".into(),
+        layout: None,
+        project_name: None,
+        project_dir: None,
     };
 
     let mut handles = Vec::new();
@@ -559,16 +592,17 @@ fn test_p1_finding_3_stop_recording_failure_propagation() {
         capture_system_audio: false,
         fps: 30,
         resolution: "1080p".into(),
+        layout: None,
+        project_name: None,
+        project_dir: None,
     };
 
     let start_res = start_recording_impl(&state, opts).unwrap();
     assert_eq!(start_res.state, SessionState::Recording);
 
     // Intentionally cause storage failure:
-    // Remove the media/screen directory so segment writer flush/sync/rename fails
-    let proj_bundle_dir = dir
-        .path()
-        .join(format!("Project_Session_{}.aero", start_res.session_id));
+    let default_name = aeroshoot_lib::project::default_project_name();
+    let proj_bundle_dir = dir.path().join(format!("{default_name}.aero"));
     let screen_media_dir = proj_bundle_dir.join("media").join("screen");
     fs::remove_dir_all(&screen_media_dir).unwrap();
 
@@ -766,6 +800,9 @@ fn test_p2_finding_9_monotonic_segment_timestamps_no_immediate_fabricated_commit
         capture_system_audio: false,
         fps: 30,
         resolution: "1080p".into(),
+        layout: None,
+        project_name: None,
+        project_dir: None,
     };
 
     let start_res = start_recording_impl(&state, opts).unwrap();
@@ -777,9 +814,7 @@ fn test_p2_finding_9_monotonic_segment_timestamps_no_immediate_fabricated_commit
     assert_eq!(stop_res.state, SessionState::Completed);
 
     // Read journal records
-    let bundle_path = dir
-        .path()
-        .join(format!("Project_Session_{}.aero", stop_res.session_id));
+    let bundle_path = PathBuf::from(&stop_res.project_path);
     let journal = ProjectJournal::open_or_create(&bundle_path).unwrap();
     let records = journal.read_all().unwrap();
 
@@ -904,10 +939,81 @@ fn test_permission_status_and_override() {
         capture_system_audio: false,
         fps: 30,
         resolution: "1080p".into(),
+        layout: None,
+        project_name: None,
+        project_dir: None,
     };
     let start_res = start_recording_impl(&state, opts);
     assert!(
         start_res.is_err(),
         "Start recording must fail when screen recording permission is denied"
     );
+}
+
+#[test]
+fn test_window_title_recording_and_project_distinction() {
+    // Distinguishable title when recording "Launch Demo"
+    assert_eq!(
+        window_title_for_recording(Some("Launch Demo")),
+        "AeroShoot \u{2014} Launch Demo"
+    );
+    // Trimming extra whitespace
+    assert_eq!(
+        window_title_for_recording(Some("  Launch Demo  ")),
+        "AeroShoot \u{2014} Launch Demo"
+    );
+    // Fallback to dated Untitled for unnamed recording
+    let default_title = format!(
+        "AeroShoot \u{2014} {}",
+        aeroshoot_lib::project::default_project_name()
+    );
+    assert_eq!(window_title_for_recording(None), default_title);
+    assert_eq!(window_title_for_recording(Some("")), default_title);
+
+    // Distinguishable title when editing "Launch Demo"
+    assert_eq!(
+        window_title_for_project(Some("Launch Demo")),
+        "AeroShoot \u{2014} Launch Demo"
+    );
+    // When no project is open in editor
+    assert_eq!(window_title_for_project(None), "AeroShoot");
+    assert_eq!(window_title_for_project(Some("")), "AeroShoot");
+}
+
+#[test]
+fn test_dated_untitled_recording_avoids_collisions_without_typing() {
+    let dir = tempdir().unwrap();
+    let state = AppState::new_test(dir.path().to_path_buf());
+
+    let opts = StartRecordingOptions {
+        source_id: "screen-main".into(),
+        camera_id: None,
+        mic_id: None,
+        capture_system_audio: false,
+        fps: 30,
+        resolution: "1080p".into(),
+        layout: None,
+        project_name: None,
+        project_dir: None,
+    };
+
+    let default_name = aeroshoot_lib::project::default_project_name();
+
+    // Session 1 with blank name: creates "Untitled <Date>.aero"
+    let start1 = start_recording_impl(&state, opts.clone()).unwrap();
+    assert_eq!(start1.state, SessionState::Recording);
+    let stop1 = stop_recording_impl(&state).unwrap();
+    assert!(stop1
+        .project_path
+        .ends_with(&format!("{default_name}.aero")));
+    assert!(dir.path().join(format!("{default_name}.aero")).is_dir());
+
+    // Session 2 with blank name on the same day: disambiguates to "Untitled <Date> 2.aero"
+    let start2 = start_recording_impl(&state, opts.clone()).unwrap();
+    assert_eq!(start2.state, SessionState::Recording);
+    let stop2 = stop_recording_impl(&state).unwrap();
+    assert!(stop2
+        .project_path
+        .ends_with(&format!("{default_name} 2.aero")));
+    assert!(dir.path().join(format!("{default_name} 2.aero")).is_dir());
 }

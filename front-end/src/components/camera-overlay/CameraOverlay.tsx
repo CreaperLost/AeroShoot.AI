@@ -67,12 +67,16 @@ export const CameraOverlay: React.FC<{ cameraName?: string }> = ({ cameraName })
   // Shape class mapping
   const getShapeStyle = (shape: CameraBubbleShape) => {
     switch (shape) {
+      case "rect":
+        return "rounded-md";
       case "circle":
         return "rounded-full";
       case "squircle":
         return "rounded-[24px]";
       case "rect_16_9":
         return "rounded-xl";
+      default:
+        return "rounded-md";
     }
   };
 

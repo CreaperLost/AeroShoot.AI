@@ -5,6 +5,44 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+/// Live geometry poll / uncertainty interval. H2 does not tighten this without
+/// a measured adapter.
+pub const GEOMETRY_SAMPLING_INTERVAL_US: u64 = 100_000;
+
+pub const GAP_INPUT_MONITORING_UNAVAILABLE: &str = "input_monitoring_unavailable";
+pub const GAP_INPUT_MONITORING_REVOKED: &str = "input_monitoring_revoked";
+pub const GAP_EVENT_TAP_UNAVAILABLE: &str = "event_tap_unavailable";
+pub const GAP_EVENT_TAP_DISABLED: &str = "event_tap_disabled";
+pub const GAP_QUEUE_OVERFLOW: &str = "queue_overflow";
+pub const GAP_UNSUPPORTED_SOURCE_GEOMETRY: &str = "unsupported_source_geometry";
+pub const GAP_GEOMETRY_CHANGED: &str = "geometry_changed";
+pub const GAP_RECORDING_PAUSED: &str = "recording_paused";
+pub const GAP_INITIAL_BUTTON_STATE_UNKNOWN: &str = "initial_button_state_unknown";
+
+/// Honest boolean pair for Input Monitoring. This is not a capture
+/// `PermissionStatus` bundle (screen/camera/microphone string states).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MouseTelemetryPermission {
+    pub supported: bool,
+    pub authorized: bool,
+}
+
+impl MouseTelemetryPermission {
+    pub fn macos(authorized: bool) -> Self {
+        Self {
+            supported: true,
+            authorized,
+        }
+    }
+
+    pub fn unsupported() -> Self {
+        Self {
+            supported: false,
+            authorized: false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MousePayload {
@@ -42,13 +80,13 @@ pub struct MouseEvent {
     pub version: u32,
     pub seq: u64,
     pub t_us: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub norm_x: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub norm_y: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inside_source: Option<bool>,
     pub payload: MousePayload,
     // Visibility and modifiers are unknown in this adapter, not fabricated.
@@ -140,6 +178,7 @@ impl NativeMouseLogger {
                     || record.geometry_id.len() > 128
                     || record.coordinate_space != "quartz_global"
                     || record.cursor_mode != "baked"
+                    || record.sampling_interval_us != GEOMETRY_SAMPLING_INTERVAL_US
                     || record.bounds.width <= 0.0
                     || record.bounds.height <= 0.0
                     || record.output_width == 0
@@ -280,5 +319,72 @@ mod tests {
         std::os::unix::fs::symlink(external.path(), dir.path().join("telemetry")).unwrap();
         assert!(NativeMouseLogger::create(dir.path()).is_err());
         assert!(!external.path().join("events.jsonl").exists());
+    }
+
+    #[test]
+    fn permission_payload_is_boolean_pair_not_capture_bundle() {
+        let denied = serde_json::to_value(MouseTelemetryPermission::macos(false)).unwrap();
+        assert_eq!(denied["supported"], true);
+        assert_eq!(denied["authorized"], false);
+        assert!(denied.get("screenRecording").is_none());
+        assert!(denied.get("screen_recording").is_none());
+        assert!(denied.get("camera").is_none());
+        assert!(denied.get("microphone").is_none());
+        let unsupported = serde_json::to_value(MouseTelemetryPermission::unsupported()).unwrap();
+        assert_eq!(unsupported, json!({"supported": false, "authorized": false}));
+    }
+
+    #[test]
+    fn permission_and_health_gaps_round_trip_without_geometry_or_clicks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut logger = NativeMouseLogger::create(dir.path()).unwrap();
+        logger.append(&geometry().to_string()).unwrap();
+        for (seq, reason) in [
+            GAP_INITIAL_BUTTON_STATE_UNKNOWN,
+            GAP_INPUT_MONITORING_UNAVAILABLE,
+            GAP_INPUT_MONITORING_REVOKED,
+            GAP_EVENT_TAP_UNAVAILABLE,
+            GAP_EVENT_TAP_DISABLED,
+            GAP_UNSUPPORTED_SOURCE_GEOMETRY,
+            GAP_QUEUE_OVERFLOW,
+            GAP_GEOMETRY_CHANGED,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let t = 1_000 + seq as u64;
+            let gap = json!({
+                "record":"event","version":2,"seq":seq,"t_us":t,
+                "payload":{"kind":"gap","reason":reason,"start_us":t.saturating_sub(100_000),"end_us":t,"dropped_events":0}
+            });
+            logger.append(&gap.to_string()).unwrap();
+        }
+        logger.finish().unwrap();
+        let text = std::fs::read_to_string(dir.path().join("telemetry/events.jsonl")).unwrap();
+        assert!(!text.contains("button_down"));
+        assert!(!text.contains("\"kind\":\"click\""));
+        for reason in [
+            GAP_INPUT_MONITORING_UNAVAILABLE,
+            GAP_INPUT_MONITORING_REVOKED,
+            GAP_QUEUE_OVERFLOW,
+        ] {
+            assert!(text.contains(reason));
+        }
+    }
+
+    #[test]
+    fn rejects_tighter_geometry_sampling_and_replace_cursor_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut logger = NativeMouseLogger::create(dir.path()).unwrap();
+        let mut tight = geometry();
+        tight["sampling_interval_us"] = json!(1_000);
+        assert!(logger.append(&tight.to_string()).is_err());
+        let mut replace = geometry();
+        replace["cursor_mode"] = json!("replace");
+        assert!(logger.append(&replace.to_string()).is_err());
+        logger.append(&geometry().to_string()).unwrap();
+        let geo_text = std::fs::read_to_string(dir.path().join("telemetry/geometry.jsonl")).unwrap();
+        assert!(geo_text.contains("\"sampling_interval_us\":100000"));
+        assert!(geo_text.contains("\"cursor_mode\":\"baked\""));
     }
 }

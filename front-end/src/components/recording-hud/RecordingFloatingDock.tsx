@@ -6,6 +6,7 @@ interface RecordingFloatingDockProps {
   sessionState: SessionState;
   elapsedMs: number;
   canStart: boolean;
+  sessionOwned?: boolean;
   disabledReason?: string;
   onStart: () => void;
   onPause: () => void;
@@ -17,6 +18,7 @@ export const RecordingFloatingDock: React.FC<RecordingFloatingDockProps> = ({
   sessionState,
   elapsedMs,
   canStart,
+  sessionOwned = false,
   disabledReason,
   onStart,
   onPause,
@@ -26,6 +28,8 @@ export const RecordingFloatingDock: React.FC<RecordingFloatingDockProps> = ({
   const isRecording = sessionState === "recording";
   const isPaused = sessionState === "paused";
   const isTransitioning = sessionState === "preparing" || sessionState === "stopping";
+  const showRecoveryStop =
+    sessionOwned && (sessionState === "error" || sessionState === "stopping");
 
   const formatElapsed = (ms: number) => {
     const totalSecs = Math.floor(ms / 1000);
@@ -62,7 +66,18 @@ export const RecordingFloatingDock: React.FC<RecordingFloatingDockProps> = ({
       </div>
 
       {/* Main Trigger Button */}
-      {!isRecording && !isPaused ? (
+      {showRecoveryStop ? (
+        <button
+          type="button"
+          onClick={onStop}
+          disabled={sessionState === "stopping"}
+          className="flex items-center space-x-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-rose-700/80 to-rose-600 hover:from-rose-600 hover:to-rose-500 disabled:opacity-50 border border-rose-500/50 text-white text-sm font-semibold transition-all shadow-lg shadow-rose-950/50"
+          title="Retry stop and keep the recoverable project"
+        >
+          <Square className="w-3.5 h-3.5 fill-white" />
+          <span>{sessionState === "stopping" ? "Stopping..." : "Retry Stop"}</span>
+        </button>
+      ) : !isRecording && !isPaused ? (
         <div className="flex items-center space-x-2">
           <button
             type="button"

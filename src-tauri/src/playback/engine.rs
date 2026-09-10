@@ -64,6 +64,61 @@ fn tick(
     pending: &Arc<AtomicBool>,
     last_frame: &mut Option<(u64, u64, u64)>,
 ) -> Result<(), (u64, String)> {
+    if state.live_preview.load(Ordering::Acquire) {
+        *runtime = None;
+        if pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let surface = state.preview.lock().status();
+        let hud_surface = state.hud_preview.lock().status();
+        let recording = state.active_session.read().is_some();
+        let hud_visible = hud_surface.attached
+            && hud_surface.visible
+            && state.hud.lock().desired_visible(recording);
+        let studio_frame = if surface.attached && surface.visible {
+            crate::capture::preview::frame()
+        } else {
+            None
+        };
+        let hud_frame = if hud_visible {
+            crate::capture::preview::camera_frame()
+        } else {
+            None
+        };
+        if studio_frame.is_none() && hud_frame.is_none() {
+            return Ok(());
+        }
+        pending.store(true, Ordering::Release);
+        let done = Arc::clone(pending);
+        let app_copy = app.clone();
+        let generation = surface.generation;
+        let hud_generation = hud_surface.generation;
+        if app
+            .run_on_main_thread(move || {
+                let state = app_copy.state::<AppState>();
+                if state.live_preview.load(Ordering::Acquire) {
+                    if let Some(frame) = studio_frame {
+                        let mut surface = state.preview.lock();
+                        if surface.status().generation == generation {
+                            let _ = surface.present_frame(&frame, generation);
+                        }
+                    }
+                    if let Some(frame) = hud_frame {
+                        let mut surface = state.hud_preview.lock();
+                        if surface.status().generation == hud_generation {
+                            let _ = surface.present_frame(&frame, hud_generation);
+                        }
+                    }
+                }
+                done.store(false, Ordering::Release);
+            })
+            .is_err()
+        {
+            pending.store(false, Ordering::Release);
+        }
+        thread::sleep(Duration::from_millis(50));
+        return Ok(());
+    }
     let status = state.playback.lock().status().map_err(|e| (0, e))?;
     if matches!(status.state, PlaybackState::Closed | PlaybackState::Error) {
         *runtime = None;
@@ -88,7 +143,9 @@ fn tick(
         };
         let lease = crate::project::reader::acquire_read_lease(&root).map_err(error)?;
         let mixer = AudioMixer::new(&root, &document, &tracks).map_err(error)?;
-        let evaluator = SceneEvaluator::new(root, document, tracks, 1920, 1080).map_err(error)?;
+        let (width, height) = document.layout.preview_dimensions().map_err(error)?;
+        let evaluator =
+            SceneEvaluator::new(root, document, tracks, width, height).map_err(error)?;
         *runtime = Some(Runtime {
             generation,
             evaluator,
@@ -192,10 +249,12 @@ fn tick(
     app.run_on_main_thread(move || {
         let state = app_copy.state::<AppState>();
         let mut owner = state.playback.lock();
-        if owner.status().is_ok_and(|s| {
-            s.generation == generation
-                && !matches!(s.state, PlaybackState::Closed | PlaybackState::Error)
-        }) {
+        if !state.live_preview.load(Ordering::Acquire)
+            && owner.status().is_ok_and(|s| {
+                s.generation == generation
+                    && !matches!(s.state, PlaybackState::Closed | PlaybackState::Error)
+            })
+        {
             let mut surface = state.preview.lock();
             let current = surface.status();
             if current.attached && current.generation == surface_generation && current.visible {

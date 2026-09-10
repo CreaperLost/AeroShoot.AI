@@ -1,7 +1,10 @@
 pub mod event;
 pub mod native;
+pub mod reader;
 
 pub use event::{GeometryRecord, TelemetryEvent, TelemetryKind};
+pub use native::{MouseTelemetryPermission, NativeMouseLogger};
+pub use reader::{CanonicalEvent, CanonicalGeometry, CanonicalKind, TelemetryStream};
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};

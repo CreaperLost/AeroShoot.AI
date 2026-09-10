@@ -110,6 +110,8 @@ pub enum JournalError {
     Serde(#[from] serde_json::Error),
     #[error("Corrupt journal: unparseable line {0}: {1}")]
     CorruptLine(usize, String),
+    #[error("injected failure: {0}")]
+    Injected(&'static str),
 }
 
 /// Durable, append-only journal writer managing journal.jsonl with crash tail repair
@@ -117,6 +119,7 @@ pub struct ProjectJournal {
     path: PathBuf,
     file: Mutex<File>,
     next_seq: Mutex<u64>,
+    fail_next_appends: Mutex<u32>,
 }
 
 impl ProjectJournal {
@@ -141,7 +144,14 @@ impl ProjectJournal {
             path,
             file: Mutex::new(file),
             next_seq: Mutex::new(next_seq),
+            fail_next_appends: Mutex::new(0),
         })
+    }
+
+    /// Contract-test hook: the next `n` `append` calls fail without writing.
+    /// Does not consume sequence numbers. Production callers leave this at 0.
+    pub fn inject_fail_next_appends(&self, n: u32) {
+        *self.fail_next_appends.lock().unwrap() = n;
     }
 
     /// Repairs an incomplete final line left by sudden termination/crash.
@@ -174,6 +184,13 @@ impl ProjectJournal {
     }
 
     pub fn append(&self, mut record: JournalRecord) -> Result<u64, JournalError> {
+        {
+            let mut remaining = self.fail_next_appends.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(JournalError::Injected("journal append"));
+            }
+        }
         let mut seq_guard = self.next_seq.lock().unwrap();
         let current_seq = *seq_guard;
 

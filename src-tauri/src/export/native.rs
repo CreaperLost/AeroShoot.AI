@@ -5,7 +5,7 @@ use std::path::Path;
 use std::ptr::NonNull;
 
 #[cfg(all(target_os = "macos", not(stub_swift_ffi)))]
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 
 #[cfg(all(target_os = "macos", not(stub_swift_ffi)))]
 extern "C" {
@@ -35,6 +35,8 @@ extern "C" {
     ) -> c_int;
     fn aeroshoot_export_finish(handle: *mut c_void, duration_us: i64) -> c_int;
     fn aeroshoot_export_abort(handle: *mut c_void);
+    fn aeroshoot_export_copy_error(handle: *mut c_void) -> *mut c_char;
+    fn aeroshoot_macos_free_string(value: *mut c_char);
     fn aeroshoot_media_duration_us(path: *const c_char) -> i64;
 }
 
@@ -47,6 +49,22 @@ pub struct NativeExport {
 unsafe impl Send for NativeExport {}
 
 impl NativeExport {
+    #[cfg(all(target_os = "macos", not(stub_swift_ffi)))]
+    fn last_error(&self, fallback: &str) -> String {
+        let Some(handle) = self.handle else {
+            return fallback.into();
+        };
+        unsafe {
+            let pointer = aeroshoot_export_copy_error(handle.as_ptr());
+            let Some(pointer) = NonNull::new(pointer) else {
+                return fallback.into();
+            };
+            let detail = CStr::from_ptr(pointer.as_ptr()).to_string_lossy().into_owned();
+            aeroshoot_macos_free_string(pointer.as_ptr());
+            format!("{fallback}: {detail}")
+        }
+    }
+
     pub fn begin(
         path: &Path,
         width: u32,
@@ -111,7 +129,7 @@ impl NativeExport {
             if code == 0 {
                 Ok(())
             } else {
-                Err("Native export video append failed".into())
+                Err(self.last_error("Native export video append failed"))
             }
         }
         #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
@@ -148,7 +166,7 @@ impl NativeExport {
             if code == 0 {
                 Ok(())
             } else {
-                Err("Native export audio append failed".into())
+                Err(self.last_error("Native export audio append failed"))
             }
         }
         #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
@@ -261,6 +279,11 @@ mod stub_export_ffi {
 
     #[no_mangle]
     pub extern "C" fn aeroshoot_export_abort(_handle: *mut c_void) {}
+
+    #[no_mangle]
+    pub extern "C" fn aeroshoot_export_copy_error(_handle: *mut c_void) -> *mut c_char {
+        std::ptr::null_mut()
+    }
 
     #[no_mangle]
     pub extern "C" fn aeroshoot_media_duration_us(_path: *const c_char) -> i64 {

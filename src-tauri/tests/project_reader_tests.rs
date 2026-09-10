@@ -297,6 +297,9 @@ fn stop_response_resolves_real_bundle_and_retry_preserves_identity() {
             capture_system_audio: false,
             fps: 30,
             resolution: "1080p".into(),
+            layout: None,
+            project_name: None,
+            project_dir: None,
         },
     )
     .unwrap();
@@ -322,4 +325,53 @@ fn empty_bundle_opens_with_no_fabricated_tracks() {
     assert_eq!(summary.source_duration_us, 0);
     assert_eq!(summary.edited_duration_us, 0);
     assert!(!summary.preview_available);
+}
+
+#[test]
+fn test_rename_updates_manifest_only_and_preserves_media() {
+    let dir = tempdir().unwrap();
+    let state = AppState::new_test(dir.path().into());
+    let path = fixture(dir.path(), "rename-test", 100_000, 1);
+    let media_path = path.join("media/mic/000001.wav");
+    assert!(media_path.is_file());
+    let media_bytes_before = fs::read(&media_path).unwrap();
+
+    let opened = open(&state, &path);
+    assert_eq!(opened.manifest.project_name, "rename-test");
+
+    // Stale handle rejected
+    assert!(project_rename_impl(&state, "wrong-handle".into(), "New Name".into()).is_err());
+
+    // Empty or whitespace-only name rejected
+    assert!(project_rename_impl(&state, opened.project_handle.clone(), "".into()).is_err());
+    assert!(project_rename_impl(&state, opened.project_handle.clone(), "   ".into()).is_err());
+
+    // Successful rename
+    let updated = project_rename_impl(
+        &state,
+        opened.project_handle.clone(),
+        "My Renamed Project".into(),
+    )
+    .unwrap();
+    assert_eq!(updated.manifest.project_name, "My Renamed Project");
+
+    // Check manifest on disk
+    let manifest_content = fs::read_to_string(path.join("manifest.json")).unwrap();
+    let on_disk: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
+    assert_eq!(on_disk["projectName"], "My Renamed Project");
+
+    // Prior revision backup exists
+    assert!(path.join("manifest.bak").is_file());
+
+    // Media file is completely untouched (same path, same bytes)
+    assert!(media_path.is_file());
+    assert_eq!(fs::read(&media_path).unwrap(), media_bytes_before);
+
+    // Bundle directory path is unchanged
+    assert!(path.is_dir());
+
+    // Reopen confirms persistence
+    close_project_impl(&state, opened.project_handle).unwrap();
+    let reopened = open(&state, &path);
+    assert_eq!(reopened.manifest.project_name, "My Renamed Project");
 }

@@ -92,7 +92,8 @@ pub struct ElstInfo {
     /// Media time of the first non-empty edit entry, in media-clock ticks.
     /// `None` when the first entry is an empty edit (`media_time == -1`).
     pub first_media_time: Option<i64>,
-    /// Segment duration of the first non-empty edit entry, in media-clock ticks.
+    /// Segment duration of the first non-empty edit entry, in **movie**
+    /// timescale ticks (ISO/IEC 14496-12). Must not be converted with `mdhd`.
     pub first_segment_duration: i64,
 }
 
@@ -145,12 +146,14 @@ impl MediaValidator {
         let mut offset = 0u64;
         let mut has_ftyp_or_styp = false;
         let mut has_moov = false;
-        let mut moof_info: Option<(u64, u64)> = None; // (offset, size)
+        let mut moofs: Vec<(u64, u64)> = Vec::new();
         let mut mdat_info: Option<(u64, u64)> = None;
 
-        let valid_boxes: [&[u8; 4]; 10] = [
+        // AVAssetWriter also emits mfra/sidx after finishWriting. Rejecting them
+        // used to fail a valid 2s rotation and leave only the first fragment.
+        const VALID_BOXES: &[&[u8; 4]] = &[
             b"ftyp", b"moov", b"moof", b"mdat", b"free", b"styp", b"skip", b"wide", b"pdin",
-            b"uuid",
+            b"uuid", b"mfra", b"sidx", b"ssix", b"meta",
         ];
 
         while offset < len {
@@ -172,7 +175,7 @@ impl MediaValidator {
             let box_size_raw = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
             let box_type = [header[4], header[5], header[6], header[7]];
 
-            if !valid_boxes.iter().any(|&b| b == &box_type) {
+            if !VALID_BOXES.iter().any(|&b| b == &box_type) {
                 return Err(MediaValidationError::InvalidMp4Box(
                     String::from_utf8_lossy(&box_type).into_owned(),
                 ));
@@ -201,7 +204,7 @@ impl MediaValidator {
             match &box_type {
                 b"ftyp" | b"styp" => has_ftyp_or_styp = true,
                 b"moov" => has_moov = true,
-                b"moof" => moof_info = Some((offset, box_size)),
+                b"moof" => moofs.push((offset, box_size)),
                 b"mdat" => mdat_info = Some((offset, box_size)),
                 _ => {}
             }
@@ -222,9 +225,6 @@ impl MediaValidator {
         }
 
         // Fragmented media must have both moof and mdat
-        let (moof_offset, moof_size) = moof_info.ok_or_else(|| {
-            MediaValidationError::MissingRequiredBoxes("Missing moof movie fragment".into())
-        })?;
         let (_mdat_offset, mdat_size) = mdat_info.ok_or_else(|| {
             MediaValidationError::MissingRequiredBoxes("Missing mdat media data".into())
         })?;
@@ -280,40 +280,79 @@ impl MediaValidator {
         let (mdhd, elst) = Self::parse_moov(&moov_bytes)
             .map_err(|e| MediaValidationError::InvalidMdhdBox(moov_bytes.len() as u64, 0, e))?;
 
-        // Read the moof bytes for tfdt + trun parsing.
-        file.seek(SeekFrom::Start(moof_offset))
-            .map_err(|e| MediaValidationError::Io(e.to_string()))?;
-        let mut moof_bytes = vec![0u8; moof_size as usize];
-        file.read_exact(&mut moof_bytes)
-            .map_err(|e| MediaValidationError::Io(e.to_string()))?;
+        // AVAssetWriter finalizes recordings as ordinary MP4 (stbl) even when
+        // movieFragmentInterval left leftover moof boxes. Prefer the sample
+        // table whenever it actually contains samples.
+        if let Some(mdat) = mdat_info {
+            if let Ok((ticks, count)) = regular_sample_table(&moov_bytes, mdat) {
+                let duration_ticks = if mdhd.duration_ticks > 0 {
+                    (mdhd.duration_ticks as u64).max(ticks)
+                } else {
+                    ticks
+                };
+                let duration_us = mdhd.ticks_to_us(duration_ticks as i64);
+                return Ok(MediaValidationInfo {
+                    container_format: "mp4".into(),
+                    size_bytes: len,
+                    start_us: 0,
+                    end_us: duration_us,
+                    duration_us,
+                    sample_count: count,
+                    is_keyframe_start: true,
+                    media_timescale: mdhd.timescale,
+                    media_start_value: 0,
+                    host_anchor_us: 0,
+                });
+            }
+        }
 
-        let (media_start_ticks, sample_duration_ticks, sample_count, is_keyframe) =
-            Self::parse_moof_fragment(&moof_bytes)?;
+        if moofs.is_empty() {
+            return Err(MediaValidationError::MissingRequiredBoxes(
+                "No sample table or media fragment".into(),
+            ));
+        }
 
-        if sample_count == 0 {
-            return Err(MediaValidationError::EmptyMediaFragment(0));
+        let mut total_duration_ticks: i64 = 0;
+        let mut total_samples: u64 = 0;
+        let mut media_start_ticks: i64 = 0;
+        let mut is_keyframe = false;
+        for (index, &(moof_offset, moof_size)) in moofs.iter().enumerate() {
+            file.seek(SeekFrom::Start(moof_offset))
+                .map_err(|e| MediaValidationError::Io(e.to_string()))?;
+            let mut moof_bytes = vec![0u8; moof_size as usize];
+            file.read_exact(&mut moof_bytes)
+                .map_err(|e| MediaValidationError::Io(e.to_string()))?;
+            let (start, sample_duration_ticks, sample_count, keyframe) =
+                Self::parse_moof_fragment(&moof_bytes)?;
+            if sample_count == 0 {
+                return Err(MediaValidationError::EmptyMediaFragment(0));
+            }
+            if index == 0 {
+                media_start_ticks = start;
+                is_keyframe = keyframe;
+            }
+            total_duration_ticks = total_duration_ticks
+                .saturating_add((sample_duration_ticks as i64).saturating_mul(sample_count as i64));
+            total_samples = total_samples.saturating_add(sample_count);
         }
 
         if !is_keyframe {
             return Err(MediaValidationError::NotKeyframeStart);
         }
 
-        // The effective presentation start is the edit list's media_time (if
-        // it points into a real sample) or the fragment's tfdt otherwise.
+        // elst.media_time is in the media timescale; elst.segment_duration is
+        // in the *movie* timescale and must not be converted with mdhd.
         let effective_start_ticks: i64 = match elst.and_then(|e| e.first_media_time) {
             Some(media_time) if media_time >= 0 => media_time,
             _ => media_start_ticks,
         };
-
-        // duration: prefer the edit list's segment duration when present,
-        // otherwise the per-trun sample duration.
-        let effective_duration_ticks: i64 = match elst {
-            Some(e) if e.first_segment_duration > 0 => e.first_segment_duration,
-            _ => sample_duration_ticks as i64,
+        let duration_ticks = if mdhd.duration_ticks > total_duration_ticks {
+            mdhd.duration_ticks
+        } else {
+            total_duration_ticks
         };
-
         let start_us = mdhd.ticks_to_us(effective_start_ticks);
-        let duration_us = mdhd.ticks_to_us(effective_duration_ticks);
+        let duration_us = mdhd.ticks_to_us(duration_ticks);
         let end_us = start_us.saturating_add(duration_us);
 
         Ok(MediaValidationInfo {
@@ -322,7 +361,7 @@ impl MediaValidator {
             start_us,
             end_us,
             duration_us,
-            sample_count,
+            sample_count: total_samples,
             is_keyframe_start: is_keyframe,
             media_timescale: mdhd.timescale,
             media_start_value: effective_start_ticks,
@@ -859,6 +898,28 @@ mod tests {
     }
 
     #[test]
+    fn test_accepts_mfra_and_sums_fragment_sample_durations() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("000001.mp4");
+        let mut bytes = generate_valid_fmp4_segment(0, 2_000_000, true);
+        let moof_at = bytes
+            .windows(4)
+            .position(|w| w == b"moof")
+            .map(|i| i - 4)
+            .expect("fixture moof");
+        let fragments = bytes[moof_at..].to_vec();
+        bytes.extend_from_slice(&fragments);
+        bytes.extend_from_slice(&8u32.to_be_bytes());
+        bytes.extend_from_slice(b"mfra");
+        std::fs::write(&file_path, &bytes).unwrap();
+
+        let info = MediaValidator::validate(&file_path, TrackType::Screen).unwrap();
+        assert_eq!(info.sample_count, 2);
+        assert_eq!(info.duration_us, 4_000_000);
+        assert_eq!(info.end_us, 4_000_000);
+    }
+
+    #[test]
     fn test_rejects_fmp4_not_starting_with_keyframe() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("non_keyframe.mp4");
@@ -992,4 +1053,141 @@ mod tests {
         assert_eq!(info.ticks_to_us(48_000), 1_000_000);
         assert_eq!(info.ticks_to_us(-48_000), 0, "negative ticks clamp to 0");
     }
+}
+
+/// Validate sample counts, durations, sync start and every chunk's byte extent.
+fn regular_sample_table(moov: &[u8], mdat: (u64, u64)) -> Result<(u64, u64), String> {
+    fn word(bytes: &[u8], at: usize) -> Result<u32, String> {
+        let value = bytes.get(at..at + 4).ok_or("Truncated sample table")?;
+        Ok(u32::from_be_bytes(value.try_into().unwrap()))
+    }
+    fn children(bytes: &[u8]) -> Result<Vec<(&[u8], &[u8])>, String> {
+        let mut result = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let size = word(bytes, at)? as usize;
+            if size < 8 || size > bytes.len() - at {
+                return Err("Invalid sample-table box".into());
+            }
+            result.push((&bytes[at + 4..at + 8], &bytes[at + 8..at + size]));
+            at += size;
+        }
+        Ok(result)
+    }
+    let mut level = moov.get(8..).ok_or("Truncated moov")?;
+    for name in [b"trak", b"mdia", b"minf", b"stbl"] {
+        level = children(level)?
+            .into_iter()
+            .find(|(kind, _)| *kind == name)
+            .ok_or("Missing video sample table")?
+            .1;
+    }
+    let tables = children(level)?;
+    let table = |name: &[u8]| -> Result<&[u8], String> {
+        tables
+            .iter()
+            .find(|(kind, _)| *kind == name)
+            .map(|(_, data)| *data)
+            .ok_or("Missing sample table".into())
+    };
+    let sizes = table(b"stsz")?;
+    let count = word(sizes, 8)? as usize;
+    if count == 0 || count > 1_000_000 {
+        return Err("Invalid sample count".into());
+    }
+    let fixed = word(sizes, 4)? as u64;
+    let mut sample_sizes = Vec::with_capacity(count);
+    for i in 0..count {
+        let size = if fixed > 0 {
+            fixed
+        } else {
+            word(sizes, 12 + i * 4)? as u64
+        };
+        if size == 0 {
+            return Err("Empty sample".into());
+        }
+        sample_sizes.push(size);
+    }
+    let timing = table(b"stts")?;
+    let entries = word(timing, 4)? as usize;
+    if entries > count {
+        return Err("Invalid timing table".into());
+    }
+    let mut timed = 0u64;
+    let mut ticks = 0u64;
+    for i in 0..entries {
+        let n = word(timing, 8 + i * 8)? as u64;
+        let duration = word(timing, 12 + i * 8)? as u64;
+        if duration == 0 {
+            return Err("Zero sample duration".into());
+        }
+        timed += n;
+        ticks = ticks.checked_add(n * duration).ok_or("Duration overflow")?;
+    }
+    if timed != count as u64 || ticks > i64::MAX as u64 {
+        return Err("Inconsistent sample timing".into());
+    }
+    if let Ok(sync) = table(b"stss") {
+        if word(sync, 4)? == 0 || word(sync, 8)? != 1 {
+            return Err("First sample is not a keyframe".into());
+        }
+    }
+    let (offsets, wide) = match table(b"stco") {
+        Ok(v) => (v, false),
+        Err(_) => (table(b"co64")?, true),
+    };
+    let chunks = word(offsets, 4)? as usize;
+    if chunks == 0 || chunks > count {
+        return Err("Invalid chunk count".into());
+    }
+    let mapping = table(b"stsc")?;
+    let runs = word(mapping, 4)? as usize;
+    if runs == 0 || runs > chunks || word(mapping, 8)? != 1 {
+        return Err("Invalid sample-to-chunk mapping".into());
+    }
+    let mut rows = Vec::with_capacity(runs);
+    for i in 0..runs {
+        let first = word(mapping, 8 + i * 12)? as usize;
+        let per_chunk = word(mapping, 12 + i * 12)? as usize;
+        if first == 0
+            || first > chunks
+            || per_chunk == 0
+            || word(mapping, 16 + i * 12)? == 0
+            || rows.last().is_some_and(|&(prev, _)| first <= prev)
+        {
+            return Err("Invalid chunk run".into());
+        }
+        rows.push((first, per_chunk));
+    }
+    let mut consumed = 0usize;
+    let mut run = 0;
+    for chunk in 1..=chunks {
+        while run + 1 < rows.len() && rows[run + 1].0 <= chunk {
+            run += 1;
+        }
+        let end = consumed.checked_add(rows[run].1).ok_or("Sample overflow")?;
+        let bytes: u64 = sample_sizes
+            .get(consumed..end)
+            .ok_or("Too many chunk samples")?
+            .iter()
+            .sum();
+        let at = 8 + (chunk - 1) * if wide { 8 } else { 4 };
+        let offset = if wide {
+            ((word(offsets, at)? as u64) << 32) | word(offsets, at + 4)? as u64
+        } else {
+            word(offsets, at)? as u64
+        };
+        if offset < mdat.0 + 8
+            || offset
+                .checked_add(bytes)
+                .is_none_or(|end| end > mdat.0 + mdat.1)
+        {
+            return Err("Chunk exceeds media payload".into());
+        }
+        consumed = end;
+    }
+    if consumed != count {
+        return Err("Missing chunk samples".into());
+    }
+    Ok((ticks, count as u64))
 }

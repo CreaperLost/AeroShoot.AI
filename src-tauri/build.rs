@@ -21,6 +21,8 @@ fn main() {
 
 fn build_macos_capture_bridge() {
     let source = PathBuf::from("native/macos/AeroShootCapture.swift");
+    let live_source = PathBuf::from("native/macos/AeroShootLivePreview.swift");
+    println!("cargo:rerun-if-changed={}", live_source.display());
     let mouse_source = PathBuf::from("native/macos/MouseHookMac.swift");
     let preview_source = PathBuf::from("native/macos/AeroShootPreview.swift");
     let media_source = PathBuf::from("native/macos/AeroShootMedia.swift");
@@ -55,6 +57,7 @@ fn build_macos_capture_bridge() {
             "AeroShootCapture",
         ])
         .arg(&source)
+        .arg(&live_source)
         .arg(&mouse_source)
         .arg(&preview_source)
         .arg(&media_source)

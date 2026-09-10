@@ -17,9 +17,19 @@ import {
   AudioDevice,
   SessionState,
   SilenceConfig,
-  SilenceBlock,
+  SilenceDetectionResult,
   PermissionBundle,
   PermissionState,
+  MouseTelemetryPermission,
+  ZoomGeneration,
+  ZoomConfig,
+  ProjectZoom,
+  ManualZoomInput,
+  EditLayout,
+  WindowIdentity,
+  HudSnapshot,
+  HudSettingsPatch,
+  HudCameraInfo,
 } from "./types";
 
 declare global {
@@ -101,6 +111,24 @@ function normalizePermissionBundle(raw: unknown): PermissionBundle {
     screenRecording: toState(r.screenRecording ?? r.screen_recording),
     camera: toState(r.camera),
     microphone: toState(r.microphone),
+  };
+}
+
+/**
+ * Mouse telemetry is a boolean pair. Do not run it through
+ * `normalizePermissionBundle` — that path is screen/camera/microphone.
+ */
+function normalizeMouseTelemetryPermission(raw: unknown): MouseTelemetryPermission {
+  if (!raw || typeof raw !== "object") {
+    return { supported: false, authorized: false };
+  }
+  const r = raw as Record<string, unknown>;
+  if ("screenRecording" in r || "screen_recording" in r) {
+    return { supported: false, authorized: false };
+  }
+  return {
+    supported: r.supported === true,
+    authorized: r.authorized === true,
   };
 }
 
@@ -207,6 +235,37 @@ export async function getBrowserDevices(): Promise<{ cameras: CameraDevice[]; mi
 // Emulation layer
 let mockSessionState: SessionState = "idle";
 let mockSessionStartUs = 0;
+let mockHudRevision = 0;
+let mockHud: HudSnapshot = {
+  revision: 0,
+  settings: {
+    enabled: true,
+    shape: "circle",
+    size: "md",
+    mirror: true,
+    borderColor: "#6366f1",
+    borderWidth: 3,
+    shadow: false,
+  },
+  cameraId: null,
+  cameraName: null,
+  cameraAvailable: false,
+  hudAttached: false,
+  hudVisible: true,
+  exclusionEstablished: false,
+  hideDuringRecord: true,
+  sessionRecording: false,
+  captureSessionAlive: false,
+  startedIndependentCapture: false,
+  hitMode: "circle_pass_through",
+  diagnostics: [],
+};
+
+function bumpMockHud(patch: Partial<HudSnapshot> = {}): HudSnapshot {
+  mockHudRevision += 1;
+  mockHud = { ...mockHud, ...patch, revision: mockHudRevision };
+  return mockHud;
+}
 
 async function emulateCommand<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   console.log(`[Synthetic Backend] ${cmd}`, args);
@@ -237,11 +296,23 @@ async function emulateCommand<T>(cmd: string, args?: Record<string, unknown>): P
       mockSessionState = "recording";
       return Promise.resolve({ state: mockSessionState } as unknown as T);
 
+    case "capture_preview_configure":
+      return Promise.resolve(undefined as unknown as T);
+
     case "open_project":
     case "close_project":
+    case "project_rename":
     case "project_segments":
     case "project_waveform":
+    case "project_zoom_suggestions":
+    case "project_zoom_accept":
+    case "project_zoom_dismiss":
+    case "project_zoom_update":
+    case "project_zoom_add":
+    case "project_zoom_delete":
+    case "project_layout_update":
     case "project_ripple_cuts":
+    case "detect_silence":
     case "project_undo":
     case "project_redo":
     case "playback_status":
@@ -279,18 +350,6 @@ async function emulateCommand<T>(cmd: string, args?: Record<string, unknown>): P
         audioBufferUnderflows: 0,
       } as unknown as T);
 
-    case "detect_silence": {
-      const config = (args?.config as SilenceConfig) || { thresholdDb: -38, minDurationMs: 400, paddingMs: 50 };
-      console.log("[Synthetic DSP] Analyzing audio with threshold:", config.thresholdDb);
-      // Generate synthetic silence blocks for testing jump-cuts
-      const syntheticBlocks: SilenceBlock[] = [
-        { id: "sb-1", startUs: 4_200_000, endUs: 5_800_000, durationMs: 1600, selected: true },
-        { id: "sb-2", startUs: 12_100_000, endUs: 13_500_000, durationMs: 1400, selected: true },
-        { id: "sb-3", startUs: 21_000_000, endUs: 22_200_000, durationMs: 1200, selected: true },
-      ];
-      return Promise.resolve(syntheticBlocks as unknown as T);
-    }
-
     case "mouse_telemetry_permission":
       return { supported: false, authorized: false } as T;
 
@@ -317,6 +376,121 @@ async function emulateCommand<T>(cmd: string, args?: Record<string, unknown>): P
 
     case "pick_project_folder":
       throw new Error("Opening a project folder requires the desktop app.");
+
+    case "pick_save_directory":
+      throw new Error("Choosing a save location requires the desktop app.");
+
+    case "pick_export_destination":
+      throw new Error("Choosing an export destination requires the desktop app.");
+
+    case "pick_wallpaper_source":
+      throw new Error("Choosing a wallpaper file requires the desktop app.");
+
+    case "window_identity":
+      return Promise.resolve({
+        label: "main",
+        uiRoot: "studio",
+        rejected: false,
+      } as unknown as T);
+
+    case "hud_snapshot":
+      return Promise.resolve(mockHud as unknown as T);
+
+    case "hud_update": {
+      const expected = Number(args?.expectedRevision ?? -1);
+      if (expected !== mockHud.revision) {
+        return Promise.reject(new Error("Stale HUD settings revision"));
+      }
+      const patch = (args?.patch ?? {}) as HudSettingsPatch;
+      const settings = { ...mockHud.settings, ...patch };
+      return Promise.resolve(
+        bumpMockHud({
+          settings,
+          hitMode:
+            settings.shape === "circle"
+              ? "circle_pass_through"
+              : settings.shape === "squircle"
+                ? "squircle_pass_through"
+                : "pass_through",
+        }) as unknown as T,
+      );
+    }
+
+    case "hud_reconcile_cameras": {
+      const cameras = (args?.cameras as HudCameraInfo[] | undefined) ?? [];
+      const requestedId = args?.selectedCameraId as string | null | undefined;
+      const currentId = requestedId ?? mockHud.cameraId;
+      const found = currentId ? cameras.find((c) => c.id === currentId) : cameras[0];
+      return Promise.resolve(
+        bumpMockHud({
+          cameraId: found?.id ?? currentId,
+          cameraName: found?.name ?? null,
+          cameraAvailable: Boolean(found),
+        }) as unknown as T,
+      );
+    }
+
+    case "hud_preview_attach":
+      if (args?.windowLabel !== "camera_overlay") {
+        return Promise.reject(new Error("HUD preview can only attach to 'camera_overlay'"));
+      }
+      return Promise.resolve(
+        bumpMockHud({ hudAttached: true, startedIndependentCapture: false }) as unknown as T,
+      );
+
+    case "hud_preview_layout":
+    case "hud_preview_status":
+      return Promise.resolve({
+        attached: mockHud.hudAttached,
+        windowLabel: mockHud.hudAttached ? "camera_overlay" : null,
+        generation: 1,
+        layoutRevision: 0,
+        arrangement: "child_overlay",
+        supported: false,
+        presentedKind: "none",
+        copiesPerPresent: 1,
+        copies: 0,
+        presentedBytes: 0,
+        backingScale: 1,
+        physical: null,
+        visible: mockHud.hudVisible,
+        occluded: !mockHud.hudVisible,
+        hitMode: mockHud.hitMode,
+        diagnostics: [],
+      } as unknown as T);
+
+    case "hud_close":
+      return Promise.resolve(
+        bumpMockHud({
+          hudAttached: false,
+          hudVisible: false,
+          startedIndependentCapture: false,
+          captureSessionAlive: mockSessionState === "recording" || mockSessionState === "paused",
+          sessionRecording: mockSessionState === "recording" || mockSessionState === "paused",
+        }) as unknown as T,
+      );
+
+    case "hud_set_visible":
+      return Promise.resolve(
+        bumpMockHud({
+          hudVisible:
+            Boolean(args?.visible) &&
+            mockHud.settings.enabled &&
+            (mockSessionState === "recording" || mockSessionState === "paused"),
+        }) as unknown as T,
+      );
+
+    case "set_window_title": {
+      const title = args?.title as string | undefined;
+      if (typeof document !== "undefined" && typeof title === "string") {
+        document.title = title;
+      }
+      return Promise.resolve({} as T);
+    }
+
+    case "show_in_finder":
+      console.log("[Synthetic] show_in_finder:", args?.path);
+      return Promise.resolve({} as T);
 
     default:
       return Promise.resolve({} as T);
@@ -359,12 +533,13 @@ export const api = {
     return getBrowserDevices();
   },
   /**
-   * Returns the current OS-level permission state. The native bridge currently
-   * ships a boolean triple; we normalize to a typed `PermissionBundle` for the
-   * rest of the UI.
+   * Input Monitoring preflight/request. Returns `{ supported, authorized }`
+   * booleans — not a capture PermissionBundle.
    */
-  mouseTelemetryPermission: (request = false): Promise<{ supported: boolean; authorized: boolean }> =>
-    invokeTauri("mouse_telemetry_permission", { request }),
+  mouseTelemetryPermission: async (request = false): Promise<MouseTelemetryPermission> => {
+    const raw = await invokeTauri<unknown>("mouse_telemetry_permission", { request });
+    return normalizeMouseTelemetryPermission(raw);
+  },
 
   getPermissionStatus: async (): Promise<PermissionBundle> => {
     const raw = await invokeTauri<unknown>("get_permission_status");
@@ -405,7 +580,16 @@ export const api = {
     captureSystemAudio: boolean;
     fps: number;
     resolution: string;
-  }) => invokeTauri<{ sessionId: string; state: SessionState; startedAtUs: number }>("start_recording", { options }),
+    layout?: EditLayout;
+    projectName?: string;
+    projectDir?: string;
+  }) =>
+    invokeTauri<{
+      sessionId: string;
+      state: SessionState;
+      startedAtUs: number;
+      projectPath?: string;
+    }>("start_recording", { options }),
   pauseRecording: () => invokeTauri<{ state: SessionState }>("pause_recording"),
   resumeRecording: () => invokeTauri<{ state: SessionState }>("resume_recording"),
   openProject: (path: string) => invokeTauri<OpenedProject>("open_project", { path }),
@@ -426,6 +610,53 @@ export const api = {
       endUs,
       bucketCount,
     }),
+  projectZoomSuggestions: (projectHandle: string, config?: ZoomConfig) =>
+    invokeTauri<ZoomGeneration>(
+      "project_zoom_suggestions",
+      config ? { projectHandle, config } : { projectHandle },
+    ),
+  projectZoomAccept: (projectHandle: string, expectedRevision: number, ids: string[]) =>
+    invokeTauri<OpenedProject>("project_zoom_accept", {
+      projectHandle,
+      expectedRevision,
+      ids,
+    }),
+  projectZoomDismiss: (projectHandle: string, expectedRevision: number, ids: string[]) =>
+    invokeTauri<OpenedProject>("project_zoom_dismiss", {
+      projectHandle,
+      expectedRevision,
+      ids,
+    }),
+  projectZoomUpdate: (projectHandle: string, expectedRevision: number, zoom: ProjectZoom) =>
+    invokeTauri<OpenedProject>("project_zoom_update", {
+      projectHandle,
+      expectedRevision,
+      zoom,
+    }),
+  projectZoomAdd: (projectHandle: string, expectedRevision: number, input: ManualZoomInput) =>
+    invokeTauri<OpenedProject>("project_zoom_add", {
+      projectHandle,
+      expectedRevision,
+      input,
+    }),
+  projectZoomDelete: (projectHandle: string, expectedRevision: number, id: string) =>
+    invokeTauri<OpenedProject>("project_zoom_delete", {
+      projectHandle,
+      expectedRevision,
+      id,
+    }),
+  projectLayoutUpdate: (
+    projectHandle: string,
+    expectedRevision: number,
+    layout: EditLayout,
+    wallpaperSource?: string,
+  ) =>
+    invokeTauri<OpenedProject>(
+      "project_layout_update",
+      wallpaperSource
+        ? { projectHandle, expectedRevision, layout, wallpaperSource }
+        : { projectHandle, expectedRevision, layout },
+    ),
   projectRippleCuts: (
     projectHandle: string,
     expectedRevision: number,
@@ -440,6 +671,8 @@ export const api = {
     invokeTauri<OpenedProject>("project_undo", { projectHandle, expectedRevision }),
   projectRedo: (projectHandle: string, expectedRevision: number) =>
     invokeTauri<OpenedProject>("project_redo", { projectHandle, expectedRevision }),
+  projectRename: (projectHandle: string, newName: string) =>
+    invokeTauri<OpenedProject>("project_rename", { projectHandle, newName }),
   playbackStatus: (projectHandle: string) =>
     invokeTauri<PlaybackStatus>("playback_status", { projectHandle }),
   playbackPlay: (projectHandle: string) =>
@@ -456,10 +689,25 @@ export const api = {
     invokeTauri<PreviewStatus>("preview_present_fixed", { r, g, b, generation }),
   previewPresentFixture: (path: string, generation = 0) =>
     invokeTauri<PreviewStatus>("preview_present_fixture", { path, generation }),
+  capturePreviewConfigure: (enabled: boolean, sourceId?: string, cameraId?: string) =>
+    invokeTauri<void>("capture_preview_configure", { enabled, sourceId: sourceId ?? null, cameraId: cameraId ?? null }),
   previewStatus: () => invokeTauri<PreviewStatus>("preview_status"),
   previewHitTest: (x: number, y: number) => invokeTauri<boolean>("preview_hit_test", { x, y }),
   previewDetach: (windowLabel: string, generation?: number) =>
     invokeTauri<PreviewStatus>("preview_detach", { windowLabel, generation }),
+  windowIdentity: () => invokeTauri<WindowIdentity>("window_identity"),
+  hudSnapshot: () => invokeTauri<HudSnapshot>("hud_snapshot"),
+  hudUpdate: (expectedRevision: number, patch: HudSettingsPatch) =>
+    invokeTauri<HudSnapshot>("hud_update", { expectedRevision, patch }),
+  hudReconcileCameras: (cameras: HudCameraInfo[], selectedCameraId?: string | null) =>
+    invokeTauri<HudSnapshot>("hud_reconcile_cameras", { cameras, selectedCameraId }),
+  hudPreviewAttach: (windowLabel: string, hitMode: PreviewHitMode = "circle_pass_through") =>
+    invokeTauri<HudSnapshot>("hud_preview_attach", { windowLabel, hitMode }),
+  hudPreviewLayout: (viewport: PreviewViewport) =>
+    invokeTauri<PreviewStatus>("hud_preview_layout", { viewport }),
+  hudPreviewStatus: () => invokeTauri<PreviewStatus>("hud_preview_status"),
+  hudClose: () => invokeTauri<HudSnapshot>("hud_close"),
+  hudSetVisible: (visible: boolean) => invokeTauri<HudSnapshot>("hud_set_visible", { visible }),
   mediaInteropStatus: () => invokeTauri<MediaInteropStatus>("media_interop_status"),
   mediaRunParity: () => invokeTauri<MediaParityReport>("media_run_parity"),
   exportStart: (projectHandle: string, settings: ExportSettings) =>
@@ -476,11 +724,37 @@ export const api = {
       audioBufferUnderflows: number;
       gapsTotal: number;
       timestampRecordsDropped: number;
+      lastRuntimeError?: { message: string };
+      projectPath?: string;
     }>("get_session_status"),
-  detectSilence: (config: SilenceConfig) => invokeTauri<SilenceBlock[]>("detect_silence", { config }),
+  detectSilence: (projectHandle: string, trackId: string, config: SilenceConfig) =>
+    invokeTauri<SilenceDetectionResult>("detect_silence", { projectHandle, trackId, config }),
   applyJumpCuts: (silenceBlockIds: string[]) =>
     invokeTauri<{ affectedIntervalsCount: number }>("apply_jump_cuts", { silenceBlockIds }),
   saveProject: (projectData: unknown) => invokeTauri<{ success: boolean }>("save_project", { projectData }),
   getDefaultProjectsDir: () => invokeTauri<string>("get_default_projects_dir"),
   pickProjectFolder: () => invokeTauri<string | null>("pick_project_folder"),
+  pickSaveDirectory: () => invokeTauri<string | null>("pick_save_directory"),
+  pickExportDestination: (projectHandle?: string) =>
+    invokeTauri<string | null>("pick_export_destination", { projectHandle: projectHandle ?? null }),
+  pickWallpaperSource: () => invokeTauri<string | null>("pick_wallpaper_source"),
+  showInFinder: (path: string): Promise<void> =>
+    invokeTauri<void>("show_in_finder", { path }),
+  setWindowTitle: async (title: string): Promise<void> => {
+    if (typeof document !== "undefined") {
+      document.title = title;
+    }
+    if (isTauriEnvironment()) {
+      try {
+        await invokeTauri<void>("set_window_title", { title });
+      } catch {
+        try {
+          const { getCurrentWindow } = await import("@tauri-apps/api/window");
+          await getCurrentWindow().setTitle(title);
+        } catch (err) {
+          console.warn("[Tauri] Failed to set window title:", err);
+        }
+      }
+    }
+  },
 };

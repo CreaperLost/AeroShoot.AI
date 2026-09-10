@@ -4,6 +4,9 @@ import { RecordScene } from "./components/scenes/RecordScene";
 import { EditStudioScene } from "./components/scenes/EditStudioScene";
 import { SilenceModal } from "./components/silence-modal/SilenceModal";
 import { useSettingsStore } from "./stores/settingsStore";
+import { useWindowTitle } from "./hooks/useWindowTitle";
+import { useHudSettings } from "./hooks/useHudSettings";
+import { useRecording } from "./hooks/useRecording";
 import { api } from "./lib/ipc";
 import {
   CaptureSource,
@@ -23,7 +26,10 @@ const ZERO_PERMISSIONS: PermissionBundle = {
 let didAutoRequestScreen = false;
 
 export const App: React.FC = () => {
-  const { activeScene, reconcileSelections } = useSettingsStore();
+  useWindowTitle();
+  useHudSettings();
+  const recording = useRecording();
+  const { activeScene, reconcileSelections, cameraBubble } = useSettingsStore();
 
   const [sources, setSources] = useState<CaptureSource[]>([]);
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
@@ -75,6 +81,13 @@ export const App: React.FC = () => {
         loadedDevices.cameras,
         loadedDevices.mics,
       );
+      void api
+        .hudReconcileCameras(
+          loadedDevices.cameras.map((camera) => ({ id: camera.id, name: camera.name })),
+          useSettingsStore.getState().selectedCameraId,
+        )
+        .then((snapshot) => useSettingsStore.getState().applyHudSnapshot(snapshot))
+        .catch(() => undefined);
     } catch (err) {
       console.error("[App] Error loading sources and devices:", err);
     }
@@ -122,17 +135,21 @@ export const App: React.FC = () => {
     };
   }, [loadDevicesAndSources, refreshPermissions]);
 
+  useEffect(() => {
+    void api.hudSetVisible(cameraBubble.enabled).catch(() => undefined);
+  }, [cameraBubble.enabled]);
 
   const handleOpenPrivacySettings = () => {
     void api.openSystemPrivacySettings("ScreenCapture");
   };
 
   return (
-    <div className="flex flex-col h-screen w-screen overflow-hidden bg-studio-950 text-studio-100 select-none">
+    <div data-ui-root="studio" className="flex flex-col h-screen w-screen overflow-hidden bg-studio-950 text-studio-100 select-none">
       {/* 1. Global Top Bar with Scene Switcher Card */}
       <TopNavBar
         permissions={permissions}
         onOpenSettings={handleOpenPrivacySettings}
+        sessionLocked={recording.sessionOwned}
       />
 
       {/* 2. Main Scene Workspace: Record Scene vs Edit Studio Scene */}
@@ -144,6 +161,7 @@ export const App: React.FC = () => {
             mics={mics}
             permissions={permissions}
             refreshPermissions={refreshPermissions}
+            recording={recording}
           />
         ) : (
           <EditStudioScene />

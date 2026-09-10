@@ -18,7 +18,7 @@
   "app": {
     "windows": [
       {
-        "title": "AeroShoot Studio",
+        "title": "AeroShoot — Untitled",
         "width": 1280,
         "height": 860,
         "minWidth": 960,
@@ -36,7 +36,7 @@
         "decorations": false,
         "transparent": true,
         "visible": false,
-        "resizable": true
+        "resizable": false
       }
     ],
     "security": {

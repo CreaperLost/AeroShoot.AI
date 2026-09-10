@@ -4,6 +4,7 @@
   "description": "Default least-privilege capability for AeroShoot Studio",
   "windows": ["main", "camera_overlay"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:window:allow-set-title"
   ]
 }

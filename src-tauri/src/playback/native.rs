@@ -22,8 +22,22 @@ extern "C" {
         revision: u64,
         generation: u64,
     ) -> c_int;
-    fn aeroshoot_preview_set_clip(handle: *mut c_void, x: f64, y: f64, width: f64, height: f64) -> c_int;
-    fn aeroshoot_preview_present_bgra(handle: *mut c_void, width: i32, height: i32, stride: i32, pixels: *const u8, len: i32, generation: u64) -> c_int;
+    fn aeroshoot_preview_set_clip(
+        handle: *mut c_void,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) -> c_int;
+    fn aeroshoot_preview_present_bgra(
+        handle: *mut c_void,
+        width: i32,
+        height: i32,
+        stride: i32,
+        pixels: *const u8,
+        len: i32,
+        generation: u64,
+    ) -> c_int;
     fn aeroshoot_preview_set_hit_mode(handle: *mut c_void, mode: c_int) -> c_int;
     fn aeroshoot_preview_present_fixed(
         handle: *mut c_void,
@@ -88,7 +102,9 @@ pub fn set_geometry(
             viewport.revision,
             generation,
         ))?;
-        let [x, y, w, h] = viewport.clip.unwrap_or([0.0, 0.0, viewport.width, viewport.height]);
+        let [x, y, w, h] = viewport
+            .clip
+            .unwrap_or([0.0, 0.0, viewport.width, viewport.height]);
         map_status(aeroshoot_preview_set_clip(handle.as_ptr(), x, y, w, h))
     }
     #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
@@ -102,6 +118,9 @@ pub fn set_hit_mode(handle: NonNull<c_void>, mode: PreviewHitMode) -> Result<(),
     let value = match mode {
         PreviewHitMode::Consume => 0,
         PreviewHitMode::Circle => 1,
+        PreviewHitMode::PassThrough => 2,
+        PreviewHitMode::CirclePassThrough => 3,
+        PreviewHitMode::SquirclePassThrough => 4,
     };
     #[cfg(all(target_os = "macos", not(stub_swift_ffi)))]
     unsafe {
@@ -242,9 +261,26 @@ mod stub_preview_ffi {
     }
 }
 
-pub fn present_frame(handle: NonNull<c_void>, frame: &crate::media::VideoFrame, generation: u64) -> Result<(), String> {
+pub fn present_frame(
+    handle: NonNull<c_void>,
+    frame: &crate::media::VideoFrame,
+    generation: u64,
+) -> Result<(), String> {
     #[cfg(all(target_os = "macos", not(stub_swift_ffi)))]
-    unsafe { map_status(aeroshoot_preview_present_bgra(handle.as_ptr(), frame.width as i32, frame.height as i32, frame.stride as i32, frame.data.as_ptr(), frame.data.len() as i32, generation)) }
+    unsafe {
+        map_status(aeroshoot_preview_present_bgra(
+            handle.as_ptr(),
+            frame.width as i32,
+            frame.height as i32,
+            frame.stride as i32,
+            frame.data.as_ptr(),
+            frame.data.len() as i32,
+            generation,
+        ))
+    }
     #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
-    { let _ = (handle, frame, generation); Err("Native frame presentation unsupported".into()) }
+    {
+        let _ = (handle, frame, generation);
+        Err("Native frame presentation unsupported".into())
+    }
 }
