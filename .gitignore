@@ -18,3 +18,7 @@ src-tauri/target/
 *.aero/
 recordings/
 output/
+
+# MiniMax Code runtime data (skills, agents, sessions, logs).
+# Reproduce locally with the commands documented in README.md.
+.minimax/
