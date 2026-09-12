@@ -6,14 +6,14 @@ The companion video editor has been split out and now lives in its own repositor
 
 ## Skills
 
-Agent skills for this project live under `.minimax/skills/` and are **not** committed (the directory is git-ignored). `skills-lock.json` at the repo root is the manifest of what should be installed; it is kept locally and not committed either.
+This project pins its agent skills in [`skills-lock.json`](skills-lock.json) — a manifest that records each skill's source, path, and integrity hash. The lockfile is committed; the actual installed files under `.minimax/skills/` are not (the directory is git-ignored).
 
-To install the project's skills inside the MiniMax Code runtime, from the repo root:
+To install everything the lockfile declares, from the repo root:
 
 ```sh
 npx skills add leonardomso/rust-skills --agent minimax-code --yes
 ```
 
-After installing, restart MiniMax Code (or reload the workspace) so the new skills are picked up. Re-run the command any time `skills-lock.json` changes.
+After installing, restart MiniMax Code (or reload the workspace) so the new skills are picked up. Re-run the install command any time `skills-lock.json` changes.
 
 The Rust skills package is used when writing, reviewing, or refactoring Rust code; invoke it with `/rust-skills` or rely on automatic application in qualifying contexts.
