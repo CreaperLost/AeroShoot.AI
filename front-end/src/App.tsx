@@ -26,7 +26,7 @@ export const App: React.FC = () => {
   useWindowTitle();
   useHudSettings();
   const recording = useRecording();
-  const { reconcileSelections, cameraBubble } = useSettingsStore();
+  const { reconcileSelections } = useSettingsStore();
 
   const [sources, setSources] = useState<CaptureSource[]>([]);
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
@@ -127,8 +127,12 @@ export const App: React.FC = () => {
   }, [loadDevicesAndSources, refreshPermissions]);
 
   useEffect(() => {
-    void api.hudSetVisible(cameraBubble.enabled).catch(() => undefined);
-  }, [cameraBubble.enabled]);
+    // The webcam capture overlay popup was removed. The studio no longer asks
+    // the HUD window to become visible when the camera bubble setting is
+    // toggled — the popup must never appear. Webcam capture into the recording
+    // file is unaffected.
+    void api.hudSetVisible(false).catch(() => undefined);
+  }, []);
 
   const handleOpenPrivacySettings = () => {
     void api.openSystemPrivacySettings("ScreenCapture");

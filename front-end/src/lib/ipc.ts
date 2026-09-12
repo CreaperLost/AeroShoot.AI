@@ -444,6 +444,53 @@ async function emulateCommand<T>(cmd: string, args?: Record<string, unknown>): P
         diagnostics: [],
       } as unknown as T);
 
+    case "studio_preview_attach":
+      if (args?.windowLabel === "camera_overlay") {
+        return Promise.reject(
+          new Error("Studio preview cannot attach to 'camera_overlay'; use the HUD commands instead"),
+        );
+      }
+      return Promise.resolve({
+        attached: true,
+        windowLabel: args?.windowLabel ?? null,
+        generation: 1,
+        layoutRevision: 0,
+        arrangement: "child_overlay",
+        supported: false,
+        presentedKind: "none",
+        copiesPerPresent: 1,
+        copies: 0,
+        presentedBytes: 0,
+        backingScale: 1,
+        physical: null,
+        visible: true,
+        occluded: false,
+        hitMode: args?.hitMode ?? "consume",
+        diagnostics: [],
+      } as unknown as T);
+
+    case "studio_preview_layout":
+    case "studio_preview_status":
+    case "studio_preview_detach":
+      return Promise.resolve({
+        attached: true,
+        windowLabel: "main",
+        generation: 1,
+        layoutRevision: 0,
+        arrangement: "child_overlay",
+        supported: false,
+        presentedKind: "none",
+        copiesPerPresent: 1,
+        copies: 0,
+        presentedBytes: 0,
+        backingScale: 1,
+        physical: null,
+        visible: true,
+        occluded: false,
+        hitMode: "consume",
+        diagnostics: [],
+      } as unknown as T);
+
     case "hud_close":
       return Promise.resolve(
         bumpMockHud({
@@ -568,6 +615,9 @@ export const api = {
     layout?: EditLayout;
     projectName?: string;
     projectDir?: string;
+    /** Microphone gain in decibels applied to the captured mic track.
+     *  Omit / `undefined` when no mic is selected. */
+    micGainDb?: number;
   }) =>
     invokeTauri<{
       sessionId: string;
@@ -602,6 +652,12 @@ export const api = {
   hudPreviewLayout: (viewport: PreviewViewport) =>
     invokeTauri<PreviewStatus>("hud_preview_layout", { viewport }),
   hudPreviewStatus: () => invokeTauri<PreviewStatus>("hud_preview_status"),
+  studioPreviewAttach: (windowLabel: string, hitMode: PreviewHitMode = "consume") =>
+    invokeTauri<PreviewStatus>("studio_preview_attach", { windowLabel, hitMode }),
+  studioPreviewLayout: (viewport: PreviewViewport) =>
+    invokeTauri<PreviewStatus>("studio_preview_layout", { viewport }),
+  studioPreviewStatus: () => invokeTauri<PreviewStatus>("studio_preview_status"),
+  studioPreviewDetach: () => invokeTauri<PreviewStatus>("studio_preview_detach"),
   hudClose: () => invokeTauri<HudSnapshot>("hud_close"),
   hudSetVisible: (visible: boolean) => invokeTauri<HudSnapshot>("hud_set_visible", { visible }),
   getDefaultProjectsDir: () => invokeTauri<string>("get_default_projects_dir"),

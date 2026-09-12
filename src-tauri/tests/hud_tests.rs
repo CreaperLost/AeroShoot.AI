@@ -1,9 +1,10 @@
+use aeroshoot_lib::capture::preview::{LiveFrame, LivePreviewFlags, PREVIEW_BYTES};
 use aeroshoot_lib::commands::*;
 use aeroshoot_lib::hud::{
     resolve_ui_root, window_identity_from_label, HudCameraInfo, HudSettingsPatch, HudShape,
-    HudSize, HudSubscriber, UiRootKind, HUD_WINDOW_LABEL, STUDIO_WINDOW_LABEL,
+    HudSize, HudSubscriber, PreviewHitMode, PreviewViewport, UiRootKind, HUD_WINDOW_LABEL,
+    STUDIO_WINDOW_LABEL,
 };
-use aeroshoot_lib::playback::PreviewHitMode;
 use aeroshoot_lib::session::SessionState;
 use tempfile::tempdir;
 
@@ -18,6 +19,7 @@ fn opts() -> StartRecordingOptions {
         layout: None,
         project_name: None,
         project_dir: None,
+        mic_gain_db: None,
     }
 }
 
@@ -188,5 +190,128 @@ fn hud_preview_rejects_studio_label_and_does_not_use_studio_surface() {
     .contains("camera_overlay"));
     assert!(!hud_snapshot_impl(&state).hud_attached);
     assert!(!hud_preview_status_impl(&state).attached);
-    assert!(!preview_status_impl(&state).attached);
+}
+
+fn studio_viewport(revision: u64) -> PreviewViewport {
+    PreviewViewport {
+        window_label: STUDIO_WINDOW_LABEL.into(),
+        x: 0.0,
+        y: 0.0,
+        width: 320.0,
+        height: 180.0,
+        backing_scale: 1.0,
+        visible: true,
+        occluded: false,
+        revision,
+        generation: 0,
+        clip: None,
+    }
+}
+
+#[test]
+fn studio_preview_accepts_main_and_rejects_hud_label() {
+    let dir = tempdir().unwrap();
+    let state = AppState::new_test(dir.path().to_path_buf());
+    let status = studio_preview_attach_impl(
+        &state,
+        STUDIO_WINDOW_LABEL.into(),
+        PreviewHitMode::Consume,
+        None,
+    )
+    .unwrap();
+    assert!(status.attached);
+    let studio_generation = status.generation;
+    let layout = studio_preview_layout_impl(
+        &state,
+        PreviewViewport {
+            generation: studio_generation,
+            ..studio_viewport(1)
+        },
+    )
+    .unwrap();
+    assert_eq!(layout.layout_revision, 1);
+    assert!(studio_preview_status_impl(&state).attached);
+    assert!(studio_preview_attach_impl(
+        &state,
+        HUD_WINDOW_LABEL.into(),
+        PreviewHitMode::PassThrough,
+        None,
+    )
+    .unwrap_err()
+    .contains("camera_overlay"));
+    assert!(!hud_preview_status_impl(&state).attached);
+    let detached = studio_preview_detach_impl(&state).unwrap();
+    assert!(!detached.attached);
+    assert_ne!(detached.generation, studio_generation);
+}
+
+#[test]
+fn studio_preview_present_frame_updates_kind_and_bytes() {
+    let dir = tempdir().unwrap();
+    let state = AppState::new_test(dir.path().to_path_buf());
+    let status = studio_preview_attach_impl(
+        &state,
+        STUDIO_WINDOW_LABEL.into(),
+        PreviewHitMode::Consume,
+        None,
+    )
+    .unwrap();
+    let generation = status.generation;
+    let frame = LiveFrame::new(LivePreviewFlags::BOTH, vec![0u8; PREVIEW_BYTES]);
+    state
+        .studio_preview
+        .lock()
+        .present_frame(&frame, generation)
+        .unwrap();
+    let after = studio_preview_status_impl(&state);
+    assert_eq!(after.presented_kind, "live");
+    assert_eq!(after.presented_bytes as usize, PREVIEW_BYTES);
+    assert_eq!(after.copies, 1);
+    assert!(state
+        .studio_preview
+        .lock()
+        .present_frame(&frame, generation + 9)
+        .unwrap_err()
+        .contains("Stale"));
+    studio_preview_detach_impl(&state).unwrap();
+    assert_eq!(
+        studio_preview_status_impl(&state).presented_kind,
+        "none"
+    );
+}
+
+#[test]
+fn studio_and_hud_surfaces_have_independent_generations() {
+    let dir = tempdir().unwrap();
+    let state = AppState::new_test(dir.path().to_path_buf());
+    let studio = studio_preview_attach_impl(
+        &state,
+        STUDIO_WINDOW_LABEL.into(),
+        PreviewHitMode::Consume,
+        None,
+    )
+    .unwrap();
+    let _hud = hud_preview_attach_impl(
+        &state,
+        HUD_WINDOW_LABEL.into(),
+        PreviewHitMode::CirclePassThrough,
+        None,
+    )
+    .unwrap();
+    // The two `PreviewOwner` instances are independent. Each `attach` first
+    // calls `detach` (which bumps generation), then bumps again — so a fresh
+    // owner's first attach lands at generation 2. What we actually want to
+    // verify is that detaching one surface does not move the other.
+    let hud_status_before = hud_preview_status_impl(&state);
+    let studio_status_before = studio_preview_status_impl(&state);
+    assert_eq!(studio_status_before.generation, studio.generation);
+    assert_eq!(hud_status_before.generation, 2);
+    hud_close_impl(&state).unwrap();
+    let studio_after = studio_preview_status_impl(&state);
+    assert!(studio_after.attached);
+    assert_eq!(studio_after.generation, studio.generation);
+    // Studio detach bumps its own generation; HUD was already detached.
+    let detached = studio_preview_detach_impl(&state).unwrap();
+    assert!(!detached.attached);
+    assert_ne!(detached.generation, studio.generation);
 }

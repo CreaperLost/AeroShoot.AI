@@ -25,6 +25,7 @@ fn start_opts(camera: bool) -> StartRecordingOptions {
         layout: None,
         project_name: Some("H1 Lifecycle".into()),
         project_dir: None,
+        mic_gain_db: None,
     }
 }
 

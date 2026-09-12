@@ -142,21 +142,11 @@ async fn start_recording(
             let _ = window.set_title(&title);
         }
     }
-    let has_webcam = app
-        .state::<AppState>()
-        .active_session
-        .read()
-        .as_ref()
-        .is_some_and(|session| {
-            session
-                .project_bundle
-                .manifest()
-                .tracks
-                .iter()
-                .any(|track| track.track_type == project::TrackType::Webcam)
-        });
+    // The webcam capture overlay popup was removed. The webcam file is still
+    // written into the recording bundle, but the floating HUD window must never
+    // pop up after Record is pressed. Always force `requested_visible = false`.
     if res.is_ok() {
-        let _ = commands::hud_set_visible_impl(&app.state::<AppState>(), has_webcam);
+        let _ = commands::hud_set_visible_impl(&app.state::<AppState>(), false);
     }
     sync_hud_after_session(&app);
     res
@@ -348,6 +338,43 @@ fn hud_preview_status(state: State<'_, AppState>) -> hud::PreviewStatus {
 
 #[cfg(feature = "tauri-app")]
 #[tauri::command]
+fn studio_preview_attach(
+    app: tauri::AppHandle,
+    window_label: String,
+    hit_mode: hud::PreviewHitMode,
+) -> Result<hud::PreviewStatus, String> {
+    let ns_window = Some(preview_ns_window(&app, &window_label)?);
+    commands::studio_preview_attach_impl(
+        &app.state::<AppState>(),
+        window_label,
+        hit_mode,
+        ns_window,
+    )
+}
+
+#[cfg(feature = "tauri-app")]
+#[tauri::command]
+fn studio_preview_layout(
+    state: State<'_, AppState>,
+    viewport: hud::PreviewViewport,
+) -> Result<hud::PreviewStatus, String> {
+    commands::studio_preview_layout_impl(&state, viewport)
+}
+
+#[cfg(feature = "tauri-app")]
+#[tauri::command]
+fn studio_preview_status(state: State<'_, AppState>) -> hud::PreviewStatus {
+    commands::studio_preview_status_impl(&state)
+}
+
+#[cfg(feature = "tauri-app")]
+#[tauri::command]
+fn studio_preview_detach(state: State<'_, AppState>) -> Result<hud::PreviewStatus, String> {
+    commands::studio_preview_detach_impl(&state)
+}
+
+#[cfg(feature = "tauri-app")]
+#[tauri::command]
 fn hud_close(app: tauri::AppHandle) -> Result<hud::HudSnapshot, String> {
     let snapshot = commands::hud_close_impl(&app.state::<AppState>())?;
     sync_hud_window(&app, &snapshot);
@@ -414,6 +441,13 @@ fn show_in_finder(path: String) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(commands::AppState::default())
+        .setup(|app| {
+            // Bridge the Swift capture mailbox into the studio / HUD preview
+            // surfaces. Runs for the lifetime of the app; gates itself on
+            // `state.live_preview` so it is a no-op outside recording / preview.
+            capture::preview_pump::spawn(app.handle().clone());
+            Ok(())
+        })
         .on_window_event(|window, event| {
             match event {
                 tauri::WindowEvent::CloseRequested { api, .. }
@@ -454,6 +488,10 @@ pub fn run() {
             hud_preview_attach,
             hud_preview_layout,
             hud_preview_status,
+            studio_preview_attach,
+            studio_preview_layout,
+            studio_preview_status,
+            studio_preview_detach,
             hud_close,
             hud_set_visible,
             get_default_projects_dir,

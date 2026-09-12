@@ -25,6 +25,13 @@ export function NativePreviewHost({
   const [status, setStatus] = useState<PreviewStatus | null>(null);
   const [error, setError] = useState<string>();
 
+  // The studio (`main` window) and HUD (`camera_overlay` window) surfaces are
+  // owned by independent `PreviewOwner` instances on the Rust side and exposed
+  // through separate Tauri command sets. Route attach / layout / status /
+  // detach calls accordingly so the host works in both windows without
+  // window-label-rejection errors.
+  const isHud = windowLabel === "camera_overlay";
+
   useEffect(() => {
     let cancelled = false;
     let revision = 0;
@@ -56,17 +63,19 @@ export function NativePreviewHost({
       const key = JSON.stringify(viewport);
       if (key === lastGeometry) return;
       sending = true;
-      const layout = api.hudPreviewLayout;
+      const layout = isHud ? api.hudPreviewLayout : api.studioPreviewLayout;
       void layout({ ...viewport, revision: ++revision })
         .then(next => { if (!cancelled) { lastGeometry = key; setStatus(next); setError(undefined); } })
         .catch(err => { if (!cancelled) setError(String(err)); })
         .finally(() => { sending = false; });
     };
-    const attach = api.hudPreviewAttach(windowLabel, hitMode).then(() => api.hudPreviewStatus());
+    const attach = isHud
+      ? api.hudPreviewAttach(windowLabel, hitMode).then(() => api.hudPreviewStatus())
+      : api.studioPreviewAttach(windowLabel, hitMode).then(() => api.studioPreviewStatus());
     void attach.then(attached => {
       generation = attached.generation;
       if (cancelled) {
-        void api.hudClose().catch(() => undefined);
+        void (isHud ? api.hudClose() : api.studioPreviewDetach()).catch(() => undefined);
         return;
       }
       setStatus(attached); setError(undefined);
@@ -76,10 +85,10 @@ export function NativePreviewHost({
       cancelled = true;
       cancelAnimationFrame(animation);
       if (generation !== undefined) {
-        void api.hudClose().catch(() => undefined);
+        void (isHud ? api.hudClose() : api.studioPreviewDetach()).catch(() => undefined);
       }
     };
-  }, [windowLabel, hitMode, surface]);
+  }, [windowLabel, hitMode, surface, isHud]);
 
   return (
     <div className={`w-full flex flex-col items-center gap-2 ${fitAspectRatio || surface === "hud" ? "h-full min-h-0" : ""}`}>

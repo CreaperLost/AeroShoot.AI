@@ -64,6 +64,10 @@ pub struct AppState {
     pub last_stop_result: RwLock<Option<StopRecordingResult>>,
     pub project_base_dir: PathBuf,
     pub live_preview: std::sync::atomic::AtomicBool,
+    /// Studio (record scene / Edit) preview surface — separate from the HUD
+    /// because the two windows have different hit modes and lifetimes.
+    pub studio_preview: Mutex<PreviewOwner>,
+    /// Camera overlay (`camera_overlay` window) preview surface.
     pub hud_preview: Mutex<PreviewOwner>,
     pub hud: Mutex<HudOwner>,
     pub permission_override: RwLock<Option<PermissionStatus>>,
@@ -83,6 +87,7 @@ impl AppState {
             last_stop_result: RwLock::new(None),
             project_base_dir,
             live_preview: std::sync::atomic::AtomicBool::new(false),
+            studio_preview: Mutex::new(PreviewOwner::new()),
             hud_preview: Mutex::new(PreviewOwner::new()),
             hud: Mutex::new(HudOwner::new()),
             permission_override: RwLock::new(None),
@@ -99,6 +104,7 @@ impl AppState {
             last_stop_result: RwLock::new(None),
             project_base_dir,
             live_preview: std::sync::atomic::AtomicBool::new(false),
+            studio_preview: Mutex::new(PreviewOwner::new()),
             hud_preview: Mutex::new(PreviewOwner::new()),
             hud: Mutex::new(HudOwner::new()),
             permission_override: RwLock::new(Some(PermissionStatus {
@@ -195,6 +201,12 @@ pub struct StartRecordingOptions {
     pub project_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_dir: Option<String>,
+    /// Microphone gain in decibels applied to the mic track before it is
+    /// written to the WAV segment. `None` and `0.0` both mean unity gain
+    /// (no change). Range is clamped on the native side to a sane window
+    /// (typically ±24 dB) to avoid runaway amplification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mic_gain_db: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -680,6 +692,7 @@ pub fn start_recording_impl(
                     preserves_aspect_ratio: geometry.preserves_aspect_ratio,
                     project_path: bundle.root_path(),
                     session_offset_us: epoch.current_elapsed_us(),
+                    mic_gain_db: options.mic_gain_db,
                 },
             ) {
                 Ok(session) => native_session = Some(session),
@@ -1491,6 +1504,51 @@ pub fn hud_close_impl(state: &AppState) -> Result<HudSnapshot, String> {
     Ok(state.hud.lock().close(recording, capture_alive))
 }
 
+// --- Studio preview surface -------------------------------------------------
+//
+// The studio (`main` window) hosts the record scene preview and has its own
+// lifetime independent of the HUD camera overlay. It must therefore own a
+// separate `PreviewOwner`. These impls reject the HUD window label so the
+// two surfaces never share state.
+
+pub fn studio_preview_attach_impl(
+    state: &AppState,
+    window_label: String,
+    hit_mode: PreviewHitMode,
+    native_window: Option<*mut std::ffi::c_void>,
+) -> Result<PreviewStatus, String> {
+    if window_label == HUD_WINDOW_LABEL {
+        return Err(format!(
+            "Studio preview cannot attach to '{HUD_WINDOW_LABEL}'; use the HUD commands instead"
+        ));
+    }
+    state
+        .studio_preview
+        .lock()
+        .attach(window_label, hit_mode, native_window)
+}
+
+pub fn studio_preview_layout_impl(
+    state: &AppState,
+    viewport: PreviewViewport,
+) -> Result<PreviewStatus, String> {
+    if viewport.window_label == HUD_WINDOW_LABEL {
+        return Err(format!(
+            "Studio preview layout rejected for '{HUD_WINDOW_LABEL}'"
+        ));
+    }
+    state.studio_preview.lock().layout(viewport)
+}
+
+pub fn studio_preview_status_impl(state: &AppState) -> PreviewStatus {
+    state.studio_preview.lock().status()
+}
+
+pub fn studio_preview_detach_impl(state: &AppState) -> Result<PreviewStatus, String> {
+    state.studio_preview.lock().detach();
+    Ok(state.studio_preview.lock().status())
+}
+
 pub fn hud_set_visible_impl(state: &AppState, visible: bool) -> Result<HudSnapshot, String> {
     let (recording, capture_alive) = hud_session_flags(state);
     state
@@ -1538,11 +1596,20 @@ mod tests {
             layout: None,
             project_name: None,
             project_dir: None,
+            mic_gain_db: Some(-6.0),
         };
 
         let json = serde_json::to_string(&opt).unwrap();
         assert!(json.contains("\"sourceId\":\"src-1\""));
         assert!(json.contains("\"captureSystemAudio\":true"));
+        assert!(json.contains("\"micGainDb\":-6.0"));
+        // Skipped when None (frontend contract — `undefined` is the same).
+        let opt_no_gain = StartRecordingOptions {
+            mic_gain_db: None,
+            ..opt.clone()
+        };
+        let json_no_gain = serde_json::to_string(&opt_no_gain).unwrap();
+        assert!(!json_no_gain.contains("micGainDb"));
 
         let res = StopRecordingResult {
             project_path: "/tmp/example.aero".into(),
@@ -1573,6 +1640,7 @@ mod tests {
             layout: Some(portrait_layout),
             project_name: None,
             project_dir: None,
+            mic_gain_db: None,
         };
 
         // First recording
@@ -1695,6 +1763,7 @@ mod tests {
                 layout: None,
                 project_name: Some(" Launch Demo ".into()),
                 project_dir: Some(nested.to_string_lossy().into_owned()),
+                mic_gain_db: None,
             },
         )
         .unwrap();
@@ -1720,6 +1789,7 @@ mod tests {
                 layout: None,
                 project_name: Some("Launch Demo".into()),
                 project_dir: Some(nested.to_string_lossy().into_owned()),
+                mic_gain_db: None,
             },
         );
         assert!(collision.unwrap_err().contains("already exists"));
@@ -1736,6 +1806,7 @@ mod tests {
                 layout: None,
                 project_name: None,
                 project_dir: Some(nested.to_string_lossy().into_owned()),
+                mic_gain_db: None,
             },
         )
         .unwrap();
@@ -1756,6 +1827,7 @@ mod tests {
                 layout: None,
                 project_name: None,
                 project_dir: Some(nested.to_string_lossy().into_owned()),
+                mic_gain_db: None,
             },
         )
         .unwrap();
@@ -1774,6 +1846,7 @@ mod tests {
                 layout: None,
                 project_name: Some("Nope".into()),
                 project_dir: Some("relative/path".into()),
+                mic_gain_db: None,
             },
         );
         assert!(relative.unwrap_err().contains("absolute"));

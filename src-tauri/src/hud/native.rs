@@ -38,6 +38,15 @@ extern "C" {
         b: f32,
         generation: u64,
     ) -> c_int;
+    fn aeroshoot_preview_present_bgra(
+        handle: *mut c_void,
+        width: i32,
+        height: i32,
+        stride: i32,
+        pixels: *const u8,
+        len: i32,
+        generation: u64,
+    ) -> c_int;
     fn aeroshoot_preview_decode_present(
         handle: *mut c_void,
         path: *const c_char,
@@ -149,6 +158,36 @@ pub fn present_fixed(
     }
 }
 
+/// Push a BGRA8 frame into the preview NSView. The pixel buffer must remain
+/// valid for the duration of the call (Swift copies the bytes synchronously
+/// inside `previewPresentBgra`).
+pub fn present_frame(
+    handle: NonNull<c_void>,
+    width: u32,
+    height: u32,
+    stride: u32,
+    pixels: &[u8],
+    generation: u64,
+) -> Result<(), String> {
+    #[cfg(all(target_os = "macos", not(stub_swift_ffi)))]
+    unsafe {
+        map_status(aeroshoot_preview_present_bgra(
+            handle.as_ptr(),
+            width as i32,
+            height as i32,
+            stride as i32,
+            pixels.as_ptr(),
+            pixels.len() as i32,
+            generation,
+        ))
+    }
+    #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
+    {
+        let _ = (handle, width, height, stride, pixels, generation);
+        Ok(())
+    }
+}
+
 pub fn decode_present(handle: NonNull<c_void>, path: &str, generation: u64) -> Result<(), String> {
     #[cfg(all(target_os = "macos", not(stub_swift_ffi)))]
     unsafe {
@@ -192,6 +231,7 @@ fn map_status(code: c_int) -> Result<(), String> {
         2 => Err("Stale preview generation".into()),
         3 => Err("Stale preview layout revision".into()),
         4 => Err("Invalid preview viewport".into()),
+        5 => Err("Invalid preview BGRA buffer".into()),
         6 => Err("Failed to decode preview fixture".into()),
         _ => Err("Native preview adapter failed".into()),
     }
@@ -235,6 +275,18 @@ mod stub_preview_ffi {
         _r: f32,
         _g: f32,
         _b: f32,
+        _generation: u64,
+    ) -> c_int {
+        0
+    }
+    #[no_mangle]
+    pub extern "C" fn aeroshoot_preview_present_bgra(
+        _handle: *mut c_void,
+        _width: i32,
+        _height: i32,
+        _stride: i32,
+        _pixels: *const u8,
+        _len: i32,
         _generation: u64,
     ) -> c_int {
         0

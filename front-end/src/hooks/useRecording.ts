@@ -110,6 +110,7 @@ export function useRecording() {
         layout: layoutFromSettings(settings.canvas, settings.cameraBubble),
         projectName: projectName || undefined,
         projectDir: settings.projectDir || undefined,
+        micGainDb: settings.selectedMicId ? settings.micGainDb : undefined,
       });
       setSessionState(res.state);
       setSessionOwned(true);

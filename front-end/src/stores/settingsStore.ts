@@ -62,6 +62,9 @@ interface SettingsStore {
   hudDiagnostics: string[];
   knownCameras: HudCameraInfo[];
   layoutOwnedByProject: boolean;
+  /// Microphone gain in decibels applied to the mic track on the native
+  /// side AND shown live on the HUD waveform. Clamped to ±24 dB; 0 = unity.
+  micGainDb: number;
 
   setProjectName: (name: string) => void;
   setProjectDir: (dir: string | null) => void;
@@ -72,6 +75,7 @@ interface SettingsStore {
   setCaptureSystemAudio: (enabled: boolean) => void;
   setFps: (fps: number) => void;
   setResolution: (res: "1080p" | "4K") => void;
+  setMicGainDb: (gainDb: number) => void;
   updateCameraBubble: (settings: Partial<CameraBubbleSettings>) => void;
   updateCanvas: (settings: Partial<CanvasSettings>) => void;
   hydrateLayout: (layout: EditLayout) => void;
@@ -99,6 +103,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   hudDiagnostics: [],
   knownCameras: [],
   layoutOwnedByProject: false,
+  micGainDb: 0,
 
   setProjectName: (projectName) => set({ projectName }),
   setProjectDir: (projectDir) => set({ projectDir }),
@@ -141,6 +146,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setCaptureSystemAudio: (enabled) => set({ captureSystemAudio: enabled }),
   setFps: (fps) => set({ fps }),
   setResolution: (resolution) => set({ resolution }),
+  setMicGainDb: (micGainDb) => {
+    const clamped = Math.max(-24, Math.min(24, micGainDb));
+    set({ micGainDb: clamped });
+  },
   updateCameraBubble: (settings) => {
     set((state) => ({ cameraBubble: { ...state.cameraBubble, ...settings } }));
     queueHudPatch(settings);

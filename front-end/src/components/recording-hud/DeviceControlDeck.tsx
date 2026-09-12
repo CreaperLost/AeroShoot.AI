@@ -11,6 +11,8 @@ import {
 } from "lucide-react";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { CaptureSource, CameraDevice, AudioDevice } from "../../lib/types";
+import { MicPreview } from "./MicPreview";
+import { MicGainSlider } from "./MicGainSlider";
 
 interface DeviceControlDeckProps {
   sources: CaptureSource[];
@@ -28,6 +30,7 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
   const settings = useSettingsStore();
 
   const [openDropdown, setOpenDropdown] = useState<"source" | "mic" | "camera" | null>(null);
+  const [micPeakDb, setMicPeakDb] = useState<number | null>(null);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
 
@@ -148,8 +151,8 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
           >
             <div className="p-1 rounded-lg bg-amber-500/15 text-amber-400 relative">
               <Mic className="w-4 h-4" />
-              {/* Animated VU Meter Dot */}
-              {selectedMic && (
+              {/* Live activity dot, derived from MicPreview's peak */}
+              {selectedMic && micPeakDb !== null && Number.isFinite(micPeakDb) && micPeakDb > -50 && (
                 <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
               )}
             </div>
@@ -161,13 +164,29 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
                 {selectedMic ? selectedMic.name : "No Microphone"}
               </span>
             </div>
-            {/* Live audio level visualizer bar */}
+            {/* Live waveform + gain readout */}
             {selectedMic && (
-              <div className="device-control-detail flex items-end space-x-0.5 h-3.5 px-1 py-0.5 bg-studio-800/80 rounded border border-studio-700/60">
-                <div className="w-0.5 h-1.5 bg-emerald-400 rounded-full animate-bounce" style={{ animationDuration: "600ms" }} />
-                <div className="w-0.5 h-3 bg-emerald-400 rounded-full animate-bounce" style={{ animationDuration: "450ms" }} />
-                <div className="w-0.5 h-2 bg-emerald-400 rounded-full animate-bounce" style={{ animationDuration: "750ms" }} />
-                <div className="w-0.5 h-2.5 bg-amber-400 rounded-full animate-bounce" style={{ animationDuration: "550ms" }} />
+              <div className="device-control-detail flex items-center space-x-1.5">
+                <MicPreview
+                  deviceId={selectedMic.id}
+                  gainDb={settings.micGainDb}
+                  width={42}
+                  height={14}
+                  onPeakDbChange={setMicPeakDb}
+                />
+                <span
+                  className={`text-[10px] font-mono ${
+                    settings.micGainDb === 0
+                      ? "text-studio-400"
+                      : settings.micGainDb > 0
+                        ? "text-amber-300"
+                        : "text-sky-300"
+                  }`}
+                  title="Applied mic gain"
+                >
+                  {settings.micGainDb > 0 ? "+" : ""}
+                  {settings.micGainDb} dB
+                </span>
               </div>
             )}
             <ChevronDown
@@ -178,12 +197,12 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
           </button>
 
           {openDropdown === "mic" && (
-            <div className="absolute top-full mt-2 left-0 w-72 bg-studio-900 border border-studio-700/80 rounded-2xl shadow-2xl p-2 z-50 animate-in fade-in zoom-in-95 backdrop-blur-xl">
+            <div className="absolute top-full mt-2 left-0 w-80 bg-studio-900 border border-studio-700/80 rounded-2xl shadow-2xl p-2 z-50 animate-in fade-in zoom-in-95 backdrop-blur-xl">
               <div className="text-[11px] font-semibold text-studio-400 uppercase px-3 py-1.5 border-b border-studio-800 flex justify-between">
                 <span>Audio Inputs</span>
                 <span className="text-[10px] text-studio-500 font-mono">{mics.length} detected</span>
               </div>
-              <div className="py-1 space-y-0.5 max-h-56 overflow-y-auto">
+              <div className="py-1 space-y-0.5 max-h-48 overflow-y-auto">
                 {mics.length === 0 ? (
                   <div className="px-3 py-3 text-studio-400 text-center">No microphones detected</div>
                 ) : (
@@ -193,7 +212,6 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
                       type="button"
                       onClick={() => {
                         settings.setSelectedMicId(mic.id);
-                        setOpenDropdown(null);
                       }}
                       className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left transition-colors ${
                         settings.selectedMicId === mic.id
@@ -212,6 +230,48 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
                   ))
                 )}
               </div>
+              {selectedMic && (
+                <div className="border-t border-studio-800 mt-1 pt-3 px-3 pb-2 space-y-3">
+                  {/* Wider preview that lives only inside the dropdown */}
+                  <div className="flex items-center space-x-3">
+                    <MicPreview
+                      deviceId={selectedMic.id}
+                      gainDb={settings.micGainDb}
+                      width={140}
+                      height={32}
+                      onPeakDbChange={setMicPeakDb}
+                    />
+                    <div className="flex flex-col text-[10px] font-mono leading-tight">
+                      <span className="text-studio-400 uppercase">Peak</span>
+                      <span
+                        className={`text-base font-semibold ${
+                          micPeakDb !== null && Number.isFinite(micPeakDb)
+                            ? micPeakDb > -3
+                              ? "text-rose-400"
+                              : micPeakDb > -12
+                                ? "text-amber-300"
+                                : "text-emerald-300"
+                            : "text-studio-500"
+                        }`}
+                      >
+                        {micPeakDb !== null && Number.isFinite(micPeakDb)
+                          ? `${micPeakDb.toFixed(1)}`
+                          : "—"}
+                      </span>
+                      <span className="text-studio-500">dBFS</span>
+                    </div>
+                  </div>
+                  <MicGainSlider
+                    value={settings.micGainDb}
+                    onChange={settings.setMicGainDb}
+                    peakDb={micPeakDb}
+                    disabled={disabled}
+                  />
+                  <p className="text-[10px] text-studio-500 leading-snug">
+                    Gain is applied to the captured mic track. Values above 0 dB can clip loud inputs.
+                  </p>
+                </div>
+              )}
             </div>
           )}
         </div>

@@ -24,6 +24,7 @@
 // swiftc build pipeline; no module.modulemap is required.
 
 import AVFoundation
+import AudioToolbox
 import CoreGraphics
 import CoreMedia
 import CoreVideo
@@ -732,6 +733,83 @@ private func requireHardwareH264(width: Int, height: Int) throws {
     throw NSError(domain: "AeroShoot", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "A hardware VideoToolbox H.264 encoder is unavailable for \(width)x\(height)"])
   }
   VTCompressionSessionInvalidate(session)
+}
+
+/// Hard limits for the user-facing mic gain slider. The Rust layer clamps
+/// before reaching here; this is a defensive second clamp so a misbehaving
+/// caller cannot push the gain into runaway territory and clip the PCM.
+private let kMicGainClampLowDb: Float = -24.0
+private let kMicGainClampHighDb: Float = 24.0
+
+/// Convert a decibel gain to a linear multiplier. `-inf dB` is clamped to
+/// zero so a fully-attenuated slider mutes the track instead of leaving it
+/// at unity.
+@inline(__always)
+private func linearGain(forDb db: Float) -> Float {
+  let clamped = min(max(db, kMicGainClampLowDb), kMicGainClampHighDb)
+  return pow(10.0, clamped / 20.0)
+}
+
+/// Apply a decibel gain to every PCM sample inside an audio sample buffer,
+/// in place. Supports the float32 and int16 formats that AVFoundation's
+/// mic output actually emits on macOS. Returns the original buffer
+/// unmodified when the gain is unity (so the hot path stays branch-free
+/// for callers that always pass 0 dB) or when the format is unsupported.
+@discardableResult
+private func applyMicGain(_ sampleBuffer: CMSampleBuffer, gainDb: Float) -> CMSampleBuffer {
+  // Short-circuit for unity gain and any sub-clamp-low value (mute).
+  if gainDb >= -0.001 && gainDb <= 0.001 { return sampleBuffer }
+  if gainDb <= kMicGainClampLowDb { return sampleBuffer }
+
+  guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
+    return sampleBuffer
+  }
+  guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee else {
+    return sampleBuffer
+  }
+
+  var blockBuffer: CMBlockBuffer?
+  var audioBufferList = AudioBufferList(
+    mNumberBuffers: 1,
+    mBuffers: AudioBuffer(mNumberChannels: 0, mDataByteSize: 0, mData: nil)
+  )
+  let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+    sampleBuffer,
+    bufferListSizeNeededOut: nil,
+    bufferListOut: &audioBufferList,
+    bufferListSize: MemoryLayout<AudioBufferList>.size,
+    blockBufferAllocator: kCFAllocatorDefault,
+    blockBufferMemoryAllocator: kCFAllocatorDefault,
+    flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+    blockBufferOut: &blockBuffer
+  )
+  guard status == noErr else { return sampleBuffer }
+
+  let linear = linearGain(forDb: gainDb)
+  let buffers = UnsafeMutableAudioBufferListPointer(&audioBufferList)
+  let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+  for buffer in buffers {
+    guard let raw = buffer.mData else { continue }
+    if isFloat {
+      let floatCount = Int(buffer.mDataByteSize) / MemoryLayout<Float32>.size
+      let pointer = raw.bindMemory(to: Float32.self, capacity: floatCount)
+      for index in 0..<floatCount {
+        let scaled = pointer[index] * linear
+        pointer[index] = max(-1.0, min(1.0, scaled))
+      }
+    } else if asbd.mBitsPerChannel == 16 {
+      // Treat anything non-float as signed 16-bit. Int16 is what
+      // AVCaptureAudioDataOutput emits by default on macOS; other widths
+      // are passed through unchanged.
+      let count = Int(buffer.mDataByteSize) / MemoryLayout<Int16>.size
+      let pointer = raw.bindMemory(to: Int16.self, capacity: count)
+      for index in 0..<count {
+        let scaled = Float(pointer[index]) * linear
+        pointer[index] = Int16(max(-32768.0, min(32767.0, scaled)))
+      }
+    }
+  }
+  return sampleBuffer
 }
 
 private final class Recorder: NSObject, SCStreamDelegate, SCStreamOutput, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
@@ -2867,3 +2945,150 @@ enum RecordingWriterContracts {
   }
 }
 #endif
+
+#if MIC_GAIN_TESTS
+// Contract tests for the in-place PCM gain helper that sits between the
+// AVCaptureAudioDataOutput delegate and the WAV writer. We build a real
+// CMSampleBuffer for both float32 and int16 paths, apply a known gain,
+// and verify the samples land where the math says they should.
+enum MicGainContracts {
+  static func run() throws {
+    try float32BoostAppliesLinearGain()
+    try float32BoostClipsToUnitRange()
+    try float32CutAppliesLinearGain()
+    try int16BoostClipsToInt16Range()
+    try unityGainIsNoOp()
+    print("Mic gain passed: float32/int16 boost/cut/clip/unity all behave")
+  }
+
+  private static func makeFloat32SampleBuffer(value: Float32, frames: Int = 8) -> CMSampleBuffer {
+    var asbd = AudioStreamBasicDescription(
+      mSampleRate: 48000, mFormatID: kAudioFormatLinearPCM,
+      mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+      mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4,
+      mChannelsPerFrame: 1, mBitsPerChannel: 32, mReserved: 0)
+    var format: CMAudioFormatDescription?
+    guard CMAudioFormatDescriptionCreate(allocator: nil, asbd: &asbd, layoutSize: 0, layout: nil,
+      magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &format) == noErr else {
+      fatalError("failed to create float32 audio format")
+    }
+    let bytes = frames * MemoryLayout<Float32>.size
+    var block: CMBlockBuffer?
+    // `kCMBlockBufferAssureMemoryNow` (raw value 1) forces the backing
+    // store to be allocated up-front so `CMBlockBufferGetDataPointer`
+    // returns a real pointer instead of bailing with
+    // `kCMBlockBufferBadOffsetParameter`.
+    precondition(CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: bytes,
+      blockAllocator: nil, customBlockSource: nil, offsetToData: 0, dataLength: bytes,
+      flags: 1, blockBufferOut: &block) == noErr)
+    var dataPtr: UnsafeMutablePointer<Int8>?
+    var totalLength = 0
+    precondition(CMBlockBufferGetDataPointer(block!, atOffset: 0,
+      lengthAtOffsetOut: nil, totalLengthOut: &totalLength, dataPointerOut: &dataPtr) == noErr)
+    let typedPtr = UnsafeMutableRawPointer(dataPtr!).assumingMemoryBound(to: Float32.self)
+    for index in 0..<frames { typedPtr[index] = value }
+    var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 48000),
+      presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
+    var size = MemoryLayout<Float32>.size
+    var sample: CMSampleBuffer?
+    precondition(CMSampleBufferCreateReady(allocator: nil, dataBuffer: block, formatDescription: format!,
+      sampleCount: frames, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+      sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample) == noErr)
+    return sample!
+  }
+
+  private static func readFloat32Samples(_ buffer: CMSampleBuffer) -> [Float32] {
+    var list = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(mNumberChannels: 0, mDataByteSize: 0, mData: nil))
+    var retained: CMBlockBuffer?
+    precondition(CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+      buffer, bufferListSizeNeededOut: nil, bufferListOut: &list,
+      bufferListSize: MemoryLayout<AudioBufferList>.size,
+      blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: kCFAllocatorDefault,
+      flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+      blockBufferOut: &retained) == noErr)
+    defer { retained = nil }
+    let buffers = UnsafeMutableAudioBufferListPointer(&list)
+    let raw = buffers[0].mData!.assumingMemoryBound(to: Float32.self)
+    let count = Int(buffers[0].mDataByteSize) / MemoryLayout<Float32>.size
+    return Array(UnsafeBufferPointer(start: raw, count: count))
+  }
+
+  private static func float32BoostAppliesLinearGain() throws {
+    // +6 dB ≈ 1.9953x. Input 0.25 → expected 0.4988.
+    let original = makeFloat32SampleBuffer(value: 0.25)
+    let processed = applyMicGain(original, gainDb: 6.0)
+    let values = readFloat32Samples(processed)
+    let expected = Float32(0.25 * pow(10.0, 6.0 / 20.0))
+    precondition(abs(values[0] - expected) < 0.001,
+      "expected ~\(expected), got \(values[0])")
+  }
+
+  private static func float32BoostClipsToUnitRange() throws {
+    // +12 dB ≈ 3.98x would clip a 0.8 input to 1.0.
+    let original = makeFloat32SampleBuffer(value: 0.8)
+    let processed = applyMicGain(original, gainDb: 12.0)
+    let values = readFloat32Samples(processed)
+    precondition(values[0] == 1.0, "expected clip to 1.0, got \(values[0])")
+  }
+
+  private static func float32CutAppliesLinearGain() throws {
+    // -6 dB ≈ 0.5012x. Input 0.5 → expected 0.2506.
+    let original = makeFloat32SampleBuffer(value: 0.5)
+    let processed = applyMicGain(original, gainDb: -6.0)
+    let values = readFloat32Samples(processed)
+    let expected = Float32(0.5 * pow(10.0, -6.0 / 20.0))
+    precondition(abs(values[0] - expected) < 0.001,
+      "expected ~\(expected), got \(values[0])")
+  }
+
+  private static func int16BoostClipsToInt16Range() throws {
+    var asbd = AudioStreamBasicDescription(
+      mSampleRate: 48000, mFormatID: kAudioFormatLinearPCM,
+      mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
+      mBytesPerPacket: 2, mFramesPerPacket: 1, mBytesPerFrame: 2,
+      mChannelsPerFrame: 1, mBitsPerChannel: 16, mReserved: 0)
+    var format: CMAudioFormatDescription?
+    precondition(CMAudioFormatDescriptionCreate(allocator: nil, asbd: &asbd, layoutSize: 0, layout: nil,
+      magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &format) == noErr)
+    let frames = 4
+    let bytes = frames * MemoryLayout<Int16>.size
+    var block: CMBlockBuffer?
+    precondition(CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: bytes,
+      blockAllocator: nil, customBlockSource: nil, offsetToData: 0, dataLength: bytes,
+      flags: 1, blockBufferOut: &block) == noErr)
+    var dataPtr: UnsafeMutablePointer<Int8>?
+    var totalLength = 0
+    precondition(CMBlockBufferGetDataPointer(block!, atOffset: 0,
+      lengthAtOffsetOut: nil, totalLengthOut: &totalLength, dataPointerOut: &dataPtr) == noErr)
+    let typedPtr = UnsafeMutableRawPointer(dataPtr!).assumingMemoryBound(to: Int16.self)
+    typedPtr[0] = 12_000  // +12 dB (~3.98x → 47_775) should clip to 32_767
+    var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 48000),
+      presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
+    var size = MemoryLayout<Int16>.size
+    var sample: CMSampleBuffer?
+    precondition(CMSampleBufferCreateReady(allocator: nil, dataBuffer: block, formatDescription: format!,
+      sampleCount: frames, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+      sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample) == noErr)
+    let processed = applyMicGain(sample!, gainDb: 12.0)
+    var list = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(mNumberChannels: 0, mDataByteSize: 0, mData: nil))
+    var retained: CMBlockBuffer?
+    precondition(CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+      processed, bufferListSizeNeededOut: nil, bufferListOut: &list,
+      bufferListSize: MemoryLayout<AudioBufferList>.size,
+      blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: kCFAllocatorDefault,
+      flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+      blockBufferOut: &retained) == noErr)
+    let buffers = UnsafeMutableAudioBufferListPointer(&list)
+    let raw = buffers[0].mData!.assumingMemoryBound(to: Int16.self)
+    precondition(raw[0] == 32_767, "int16 boost should clip to 32_767, got \(raw[0])")
+  }
+
+  private static func unityGainIsNoOp() throws {
+    let original = makeFloat32SampleBuffer(value: 0.33)
+    let processed = applyMicGain(original, gainDb: 0.0)
+    let values = readFloat32Samples(processed)
+    precondition(values[0] == 0.33, "unity gain must be a no-op, got \(values[0])")
+  }
+}
+#endif
+

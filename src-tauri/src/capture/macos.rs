@@ -688,6 +688,11 @@ pub struct NativeRecordingConfig<'a> {
     pub preserves_aspect_ratio: bool,
     pub project_path: &'a Path,
     pub session_offset_us: u64,
+    /// Microphone gain in decibels applied to the captured mic samples
+    /// before they are written to the WAV segment. `0.0` means unity.
+    /// Clamped on the Swift side to a sane window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mic_gain_db: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -908,6 +913,38 @@ mod tests {
         let err = decode_encoder_result(failed).expect_err("failed status must error");
         assert_eq!(err.0, 42);
         assert!(err.1.contains("writer failed"));
+    }
+
+    #[test]
+    fn native_config_serializes_mic_gain_in_camel_case() {
+        let rect = SourceRect::from_dimensions(1920, 1080);
+        let project_path = Path::new("/tmp/example.aero");
+        let cfg = NativeRecordingConfig {
+            source_id: "src-1",
+            camera_id: Some("cam-1"),
+            mic_id: Some("mic-1"),
+            capture_system_audio: true,
+            fps: 30,
+            width: 1920,
+            height: 1080,
+            source_rect: rect,
+            destination_rect: rect,
+            preserves_aspect_ratio: true,
+            project_path,
+            session_offset_us: 1_234,
+            mic_gain_db: Some(6.0),
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize config");
+        // camelCase field that the Swift side decodes.
+        assert!(json.contains("\"micGainDb\":6.0"), "json was: {json}");
+        // The Swift decoder treats `None` as "field omitted", so when the
+        // Rust caller doesn't pass a gain we should omit it entirely.
+        let cfg_none = NativeRecordingConfig {
+            mic_gain_db: None,
+            ..cfg
+        };
+        let json_none = serde_json::to_string(&cfg_none).expect("serialize config");
+        assert!(!json_none.contains("micGainDb"), "json was: {json_none}");
     }
 
     #[test]

@@ -250,6 +250,37 @@ impl PreviewOwner {
         Ok(self.status())
     }
 
+    /// Push a BGRA8 frame into the preview NSView. Used by the live preview
+    /// pump to forward mailbox frames captured from SCStream / AVCaptureSession
+    /// into either the studio or the HUD overlay surface.
+    ///
+    /// `frame` is a borrowed slice; the caller must keep it alive until this
+    /// call returns. Returns `Ok(())` even when no native handle is attached
+    /// (the studio window during unmount, for instance) — the bookkeeping
+    /// still advances so a future attach picks up correct `presented_kind`.
+    pub fn present_frame(
+        &mut self,
+        frame: &crate::capture::preview::LiveFrame,
+        generation: u64,
+    ) -> Result<(), String> {
+        self.ensure_open()?;
+        self.ensure_generation(generation)?;
+        if let Some(handle) = self.native {
+            super::native::present_frame(
+                handle,
+                frame.width as u32,
+                frame.height as u32,
+                frame.stride as u32,
+                &frame.data,
+                self.generation,
+            )?;
+        }
+        self.presented_kind = "live".into();
+        self.copies = self.copies.saturating_add(1);
+        self.presented_bytes = frame.data.len() as u64;
+        Ok(())
+    }
+
     pub fn hit_test(&self, x: f64, y: f64) -> bool {
         let Some(viewport) = &self.viewport else {
             return false;
@@ -377,6 +408,29 @@ mod tests {
         assert_ne!(owner.status().generation, generation);
         owner.detach();
         assert!(!owner.status().attached);
+    }
+
+    #[test]
+    fn present_frame_records_kind_and_bytes_without_native_handle() {
+        let mut owner = PreviewOwner::new();
+        owner
+            .attach("studio".into(), PreviewHitMode::Consume, None)
+            .unwrap();
+        let generation = owner.status().generation;
+        let frame = crate::capture::preview::LiveFrame::new(
+            crate::capture::preview::LivePreviewFlags::BOTH,
+            vec![0u8; crate::capture::preview::PREVIEW_BYTES],
+        );
+        owner.present_frame(&frame, generation).unwrap();
+        let status = owner.status();
+        assert_eq!(status.presented_kind, "live");
+        assert_eq!(status.presented_bytes as usize, crate::capture::preview::PREVIEW_BYTES);
+        assert_eq!(status.copies, 1);
+        // Stale generation is rejected.
+        assert!(owner
+            .present_frame(&frame, generation + 9)
+            .unwrap_err()
+            .contains("Stale"));
     }
 
     #[test]
