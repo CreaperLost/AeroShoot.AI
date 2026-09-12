@@ -1,17 +1,14 @@
-import React, { useEffect, useRef, useState } from "react";
+import React from "react";
 import {
   Palette,
   Sliders,
   Camera,
 } from "lucide-react";
 import { useSettingsStore } from "../../stores/settingsStore";
-import { useProjectStore } from "../../stores/projectStore";
-import { api } from "../../lib/ipc";
 import {
   CameraBubblePosition,
   CameraBubbleSize,
   LAYOUT_UNSUPPORTED,
-  layoutFromSettings,
 } from "../../lib/types";
 
 export const InspectorPanel: React.FC = () => {
@@ -20,46 +17,14 @@ export const InspectorPanel: React.FC = () => {
     cameraBubble,
     updateCanvas,
     updateCameraBubble,
-    activeScene,
   } = useSettingsStore();
-  const openedProject = useProjectStore((s) => s.openedProject);
-  const applyOpenedProject = useProjectStore((s) => s.applyOpenedProject);
-  const persistTimer = useRef<number>();
-  const openedRef = useRef(openedProject);
-  openedRef.current = openedProject;
-  const [persistError, setPersistError] = useState<string>();
-
-  const persistLayout = (nextCanvas = canvas, nextCamera = cameraBubble) => {
-    if (activeScene !== "edit") return;
-    window.clearTimeout(persistTimer.current);
-    persistTimer.current = window.setTimeout(() => {
-      const opened = openedRef.current;
-      if (!opened) return;
-      const layout = layoutFromSettings(
-        nextCanvas,
-        nextCamera,
-        opened.layout?.wallpaperAsset,
-      );
-      void api
-        .projectLayoutUpdate(opened.projectHandle, opened.revision, layout)
-        .then((updated) => {
-          applyOpenedProject(updated);
-          setPersistError(undefined);
-        })
-        .catch((err) => setPersistError(String(err)));
-    }, 180);
-  };
-
-  useEffect(() => () => window.clearTimeout(persistTimer.current), []);
 
   const setCanvas = (patch: Parameters<typeof updateCanvas>[0]) => {
     updateCanvas(patch);
-    persistLayout({ ...canvas, ...patch }, cameraBubble);
   };
 
   const setCamera = (patch: Parameters<typeof updateCameraBubble>[0]) => {
     updateCameraBubble(patch);
-    persistLayout(canvas, { ...cameraBubble, ...patch });
   };
 
   const gradientPresets = [
@@ -76,18 +41,12 @@ export const InspectorPanel: React.FC = () => {
       <div className="flex items-center justify-between pb-3 border-b border-studio-800">
         <div className="flex items-center space-x-2 text-white font-semibold text-sm">
           <Sliders className="w-4 h-4 text-indigo-400" />
-          <span>Studio Inspector</span>
+          <span>Studio Customizer</span>
         </div>
         <span className="text-[11px] px-2 py-0.5 rounded bg-studio-800 text-studio-400 font-mono">
-          {activeScene === "edit" && openedProject ? "Revisioned" : "Customizer"}
+          Settings
         </span>
       </div>
-
-      {persistError && (
-        <p role="alert" className="text-[11px] text-rose-300 bg-rose-950/40 border border-rose-900/40 rounded p-2">
-          {persistError}
-        </p>
-      )}
 
       <div className="space-y-4">
         <div className="flex items-center space-x-2 text-xs font-semibold uppercase tracking-wider text-studio-400">
@@ -103,40 +62,7 @@ export const InspectorPanel: React.FC = () => {
                 key={kind}
                 type="button"
                 onClick={() => {
-                  if (kind !== "wallpaper") {
-                    setCanvas({ backgroundType: kind });
-                    return;
-                  }
-                  const existing = openedProject?.layout?.wallpaperAsset;
-                  if (existing && canvas.backgroundType !== "wallpaper") {
-                    setCanvas({ backgroundType: "wallpaper" });
-                    return;
-                  }
-                  const opened = openedRef.current;
-                  if (!opened) {
-                    setPersistError("Open a project to ingest wallpaper into assets/");
-                    return;
-                  }
-                  void api
-                    .pickWallpaperSource()
-                    .then((source) => {
-                      if (!source) return;
-                      const layout = layoutFromSettings(canvas, cameraBubble, opened.layout?.wallpaperAsset);
-                      layout.backgroundType = "wallpaper";
-                      return api
-                        .projectLayoutUpdate(
-                          opened.projectHandle,
-                          opened.revision,
-                          layout,
-                          source,
-                        )
-                        .then((updated) => {
-                          applyOpenedProject(updated);
-                          updateCanvas({ backgroundType: "wallpaper" });
-                          setPersistError(undefined);
-                        });
-                    })
-                    .catch((err) => setPersistError(String(err)));
+                  setCanvas({ backgroundType: kind });
                 }}
                 className={`py-1 text-xs capitalize rounded transition-colors ${
                   canvas.backgroundType === kind

@@ -1,30 +1,15 @@
 import {
-  OpenedProject,
-  SegmentPage,
   StopRecordingResult,
-  WaveformPage,
-  PlaybackStatus,
-  EditCut,
   PreviewStatus,
   PreviewViewport,
   PreviewHitMode,
-  MediaInteropStatus,
-  MediaParityReport,
-  ExportSettings,
-  ExportStatus,
   CaptureSource,
   CameraDevice,
   AudioDevice,
   SessionState,
-  SilenceConfig,
-  SilenceDetectionResult,
   PermissionBundle,
   PermissionState,
   MouseTelemetryPermission,
-  ZoomGeneration,
-  ZoomConfig,
-  ProjectZoom,
-  ManualZoomInput,
   EditLayout,
   WindowIdentity,
   HudSnapshot,
@@ -592,109 +577,20 @@ export const api = {
     }>("start_recording", { options }),
   pauseRecording: () => invokeTauri<{ state: SessionState }>("pause_recording"),
   resumeRecording: () => invokeTauri<{ state: SessionState }>("resume_recording"),
-  openProject: (path: string) => invokeTauri<OpenedProject>("open_project", { path }),
-  closeProject: (projectHandle: string) => invokeTauri<void>("close_project", { projectHandle }),
-  projectSegments: (projectHandle: string, trackId: string, offset = 0, limit = 100) =>
-    invokeTauri<SegmentPage>("project_segments", { projectHandle, trackId, offset, limit }),
-  projectWaveform: (
-    projectHandle: string,
-    trackId: string,
-    startUs: number,
-    endUs: number,
-    bucketCount = 256,
-  ) =>
-    invokeTauri<WaveformPage>("project_waveform", {
-      projectHandle,
-      trackId,
-      startUs,
-      endUs,
-      bucketCount,
-    }),
-  projectZoomSuggestions: (projectHandle: string, config?: ZoomConfig) =>
-    invokeTauri<ZoomGeneration>(
-      "project_zoom_suggestions",
-      config ? { projectHandle, config } : { projectHandle },
-    ),
-  projectZoomAccept: (projectHandle: string, expectedRevision: number, ids: string[]) =>
-    invokeTauri<OpenedProject>("project_zoom_accept", {
-      projectHandle,
-      expectedRevision,
-      ids,
-    }),
-  projectZoomDismiss: (projectHandle: string, expectedRevision: number, ids: string[]) =>
-    invokeTauri<OpenedProject>("project_zoom_dismiss", {
-      projectHandle,
-      expectedRevision,
-      ids,
-    }),
-  projectZoomUpdate: (projectHandle: string, expectedRevision: number, zoom: ProjectZoom) =>
-    invokeTauri<OpenedProject>("project_zoom_update", {
-      projectHandle,
-      expectedRevision,
-      zoom,
-    }),
-  projectZoomAdd: (projectHandle: string, expectedRevision: number, input: ManualZoomInput) =>
-    invokeTauri<OpenedProject>("project_zoom_add", {
-      projectHandle,
-      expectedRevision,
-      input,
-    }),
-  projectZoomDelete: (projectHandle: string, expectedRevision: number, id: string) =>
-    invokeTauri<OpenedProject>("project_zoom_delete", {
-      projectHandle,
-      expectedRevision,
-      id,
-    }),
-  projectLayoutUpdate: (
-    projectHandle: string,
-    expectedRevision: number,
-    layout: EditLayout,
-    wallpaperSource?: string,
-  ) =>
-    invokeTauri<OpenedProject>(
-      "project_layout_update",
-      wallpaperSource
-        ? { projectHandle, expectedRevision, layout, wallpaperSource }
-        : { projectHandle, expectedRevision, layout },
-    ),
-  projectRippleCuts: (
-    projectHandle: string,
-    expectedRevision: number,
-    cuts: EditCut[],
-  ) =>
-    invokeTauri<OpenedProject>("project_ripple_cuts", {
-      projectHandle,
-      expectedRevision,
-      cuts,
-    }),
-  projectUndo: (projectHandle: string, expectedRevision: number) =>
-    invokeTauri<OpenedProject>("project_undo", { projectHandle, expectedRevision }),
-  projectRedo: (projectHandle: string, expectedRevision: number) =>
-    invokeTauri<OpenedProject>("project_redo", { projectHandle, expectedRevision }),
-  projectRename: (projectHandle: string, newName: string) =>
-    invokeTauri<OpenedProject>("project_rename", { projectHandle, newName }),
-  playbackStatus: (projectHandle: string) =>
-    invokeTauri<PlaybackStatus>("playback_status", { projectHandle }),
-  playbackPlay: (projectHandle: string) =>
-    invokeTauri<PlaybackStatus>("playback_play", { projectHandle }),
-  playbackPause: (projectHandle: string) =>
-    invokeTauri<PlaybackStatus>("playback_pause", { projectHandle }),
-  playbackSeek: (projectHandle: string, editedUs: number) =>
-    invokeTauri<PlaybackStatus>("playback_seek", { projectHandle, editedUs: Math.max(0, Math.round(editedUs)) }),
-  previewAttach: (windowLabel: string, hitMode: PreviewHitMode = "consume") =>
-    invokeTauri<PreviewStatus>("preview_attach", { windowLabel, hitMode }),
-  previewLayout: (viewport: PreviewViewport) =>
-    invokeTauri<PreviewStatus>("preview_layout", { viewport }),
-  previewPresentFixed: (r: number, g: number, b: number, generation = 0) =>
-    invokeTauri<PreviewStatus>("preview_present_fixed", { r, g, b, generation }),
-  previewPresentFixture: (path: string, generation = 0) =>
-    invokeTauri<PreviewStatus>("preview_present_fixture", { path, generation }),
+  stopRecording: () => invokeTauri<StopRecordingResult>("stop_recording"),
+  getSessionStatus: () =>
+    invokeTauri<{
+      state: SessionState;
+      elapsedUs: number;
+      droppedFrames: number;
+      audioBufferUnderflows: number;
+      gapsTotal: number;
+      timestampRecordsDropped: number;
+      lastRuntimeError?: { message: string };
+      projectPath?: string;
+    }>("get_session_status"),
   capturePreviewConfigure: (enabled: boolean, sourceId?: string, cameraId?: string) =>
     invokeTauri<void>("capture_preview_configure", { enabled, sourceId: sourceId ?? null, cameraId: cameraId ?? null }),
-  previewStatus: () => invokeTauri<PreviewStatus>("preview_status"),
-  previewHitTest: (x: number, y: number) => invokeTauri<boolean>("preview_hit_test", { x, y }),
-  previewDetach: (windowLabel: string, generation?: number) =>
-    invokeTauri<PreviewStatus>("preview_detach", { windowLabel, generation }),
   windowIdentity: () => invokeTauri<WindowIdentity>("window_identity"),
   hudSnapshot: () => invokeTauri<HudSnapshot>("hud_snapshot"),
   hudUpdate: (expectedRevision: number, patch: HudSettingsPatch) =>
@@ -708,36 +604,8 @@ export const api = {
   hudPreviewStatus: () => invokeTauri<PreviewStatus>("hud_preview_status"),
   hudClose: () => invokeTauri<HudSnapshot>("hud_close"),
   hudSetVisible: (visible: boolean) => invokeTauri<HudSnapshot>("hud_set_visible", { visible }),
-  mediaInteropStatus: () => invokeTauri<MediaInteropStatus>("media_interop_status"),
-  mediaRunParity: () => invokeTauri<MediaParityReport>("media_run_parity"),
-  exportStart: (projectHandle: string, settings: ExportSettings) =>
-    invokeTauri<ExportStatus>("export_start", { projectHandle, settings }),
-  exportStatus: (jobId?: string) =>
-    invokeTauri<ExportStatus>("export_status", { jobId: jobId ?? null }),
-  exportCancel: (jobId: string) => invokeTauri<ExportStatus>("export_cancel", { jobId }),
-  stopRecording: () => invokeTauri<StopRecordingResult>("stop_recording"),
-  getSessionStatus: () =>
-    invokeTauri<{
-      state: SessionState;
-      elapsedUs: number;
-      droppedFrames: number;
-      audioBufferUnderflows: number;
-      gapsTotal: number;
-      timestampRecordsDropped: number;
-      lastRuntimeError?: { message: string };
-      projectPath?: string;
-    }>("get_session_status"),
-  detectSilence: (projectHandle: string, trackId: string, config: SilenceConfig) =>
-    invokeTauri<SilenceDetectionResult>("detect_silence", { projectHandle, trackId, config }),
-  applyJumpCuts: (silenceBlockIds: string[]) =>
-    invokeTauri<{ affectedIntervalsCount: number }>("apply_jump_cuts", { silenceBlockIds }),
-  saveProject: (projectData: unknown) => invokeTauri<{ success: boolean }>("save_project", { projectData }),
   getDefaultProjectsDir: () => invokeTauri<string>("get_default_projects_dir"),
-  pickProjectFolder: () => invokeTauri<string | null>("pick_project_folder"),
   pickSaveDirectory: () => invokeTauri<string | null>("pick_save_directory"),
-  pickExportDestination: (projectHandle?: string) =>
-    invokeTauri<string | null>("pick_export_destination", { projectHandle: projectHandle ?? null }),
-  pickWallpaperSource: () => invokeTauri<string | null>("pick_wallpaper_source"),
   showInFinder: (path: string): Promise<void> =>
     invokeTauri<void>("show_in_finder", { path }),
   setWindowTitle: async (title: string): Promise<void> => {

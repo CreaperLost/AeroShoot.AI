@@ -81,11 +81,8 @@ export const RecordScene: React.FC<RecordSceneProps> = ({
     return undefined;
   })();
 
-  const handleStopAndEdit = async () => {
-    const success = await stopRecording();
-    if (success) {
-      settings.setActiveScene("edit");
-    }
+  const handleStop = async () => {
+    await stopRecording();
   };
 
   const handleStart = async () => {
@@ -186,7 +183,7 @@ export const RecordScene: React.FC<RecordSceneProps> = ({
               onStart={handleStart}
               onPause={pauseRecording}
               onResume={resumeRecording}
-              onStop={handleStopAndEdit}
+              onStop={handleStop}
             />
           </div>
         </div>

@@ -3,7 +3,9 @@
 //! The studio (`main`) and overlay (`camera_overlay`) share one revisioned
 //! snapshot. Zustand is a view. Closing the HUD must not stop recording or
 //! start an independent capture session.
-use crate::playback::PreviewHitMode;
+pub mod native;
+pub mod preview;
+pub use preview::{PreviewHitMode, PreviewOwner, PreviewStatus, PreviewViewport};
 use serde::{Deserialize, Serialize};
 
 pub const STUDIO_WINDOW_LABEL: &str = "main";

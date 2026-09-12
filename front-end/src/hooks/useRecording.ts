@@ -1,8 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
-import { layoutFromSettings, SessionState } from "../lib/types";
+import { layoutFromSettings, SessionState, StopRecordingResult } from "../lib/types";
 import { api } from "../lib/ipc";
 import { useSettingsStore } from "../stores/settingsStore";
-import { useProjectStore } from "../stores/projectStore";
 
 export type RecordingController = ReturnType<typeof useRecording>;
 
@@ -19,9 +18,9 @@ export function useRecording() {
   const [elapsedMs, setElapsedMs] = useState(0);
   const [droppedFrames] = useState(0);
   const [sessionOwned, setSessionOwned] = useState(false);
+  const [lastRecordingResult, setLastRecordingResult] = useState<StopRecordingResult | null>(null);
 
   const settings = useSettingsStore();
-  const project = useProjectStore();
 
   const applyStatus = useCallback(
     (status: {
@@ -98,6 +97,7 @@ export function useRecording() {
 
     try {
       setError(undefined);
+      setLastRecordingResult(null);
       setSessionState("preparing");
       const projectName = settings.projectName.trim();
       const res = await api.startRecording({
@@ -164,16 +164,10 @@ export function useRecording() {
       if (res.projectPath) {
         settings.setCreatedProjectPath(res.projectPath);
       }
-      if (!res.projectPath) {
-        throw new Error("Stop did not return a project path. Open the recording in the desktop app.");
-      }
-      // Backend open stages the replacement. Closing the previous handle first
-      // would drop a still-usable project if the new open fails.
-      const opened = await api.openProject(res.projectPath);
-      project.loadOpenedProject(opened, res.projectPath);
+      setLastRecordingResult(res);
       return true;
     } catch (err) {
-      console.error("Failed to stop recording or open its project:", err);
+      console.error("Failed to stop recording:", err);
       setError(String(err));
       try {
         const status = await api.getSessionStatus();
@@ -186,7 +180,11 @@ export function useRecording() {
       }
       return false;
     }
-  }, [project, settings, applyStatus]);
+  }, [settings, applyStatus]);
+
+  const dismissCompletedModal = useCallback(() => {
+    setLastRecordingResult(null);
+  }, []);
 
   return {
     error,
@@ -194,6 +192,8 @@ export function useRecording() {
     elapsedMs,
     droppedFrames,
     sessionOwned,
+    lastRecordingResult,
+    dismissCompletedModal,
     startRecording,
     pauseRecording,
     resumeRecording,

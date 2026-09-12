@@ -250,21 +250,6 @@ impl PreviewOwner {
         Ok(self.status())
     }
 
-    pub fn present_frame(
-        &mut self,
-        frame: &crate::media::VideoFrame,
-        generation: u64,
-    ) -> Result<(), String> {
-        self.ensure_open()?;
-        self.ensure_generation(generation)?;
-        let native = self.native.ok_or("No native surface")?;
-        super::native::present_frame(native, frame, generation)?;
-        self.presented_kind = "project".into();
-        self.copies += 1;
-        self.presented_bytes = frame.data.len() as u64;
-        Ok(())
-    }
-
     pub fn hit_test(&self, x: f64, y: f64) -> bool {
         let Some(viewport) = &self.viewport else {
             return false;

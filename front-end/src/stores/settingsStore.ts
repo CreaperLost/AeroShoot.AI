@@ -13,9 +13,7 @@ import {
 } from "../lib/types";
 import { api } from "../lib/ipc";
 
-// The studio and camera HUD share a revisioned native settings owner. Inspector
-// controls can emit many changes in a single frame (notably range inputs), so
-// serialize writes instead of racing every patch with the same revision.
+// The studio and camera HUD share a revisioned native settings owner.
 let hudUpdateQueue: Promise<void> = Promise.resolve();
 let pendingHudPatches: Partial<CameraBubbleSettings>[] = [];
 
@@ -30,8 +28,6 @@ function queueHudPatch(patch: Partial<CameraBubbleSettings>) {
     try {
       snapshot = await api.hudUpdate(useSettingsStore.getState().hudRevision, patch);
     } catch {
-      // A change from the other window may legitimately advance the owner.
-      // Reconcile once and retry this patch against the current revision.
       const current = await api.hudSnapshot();
       useSettingsStore.getState().applyHudSnapshot(current);
       snapshot = await api.hudUpdate(current.revision, patch);
@@ -40,12 +36,10 @@ function queueHudPatch(patch: Partial<CameraBubbleSettings>) {
     useSettingsStore.getState().applyHudSnapshot(snapshot);
   }).catch(async () => {
     removePending();
-    // Do not leave a permanently optimistic patch behind if the native owner
-    // is unavailable; restore the last authoritative snapshot when possible.
     try {
       useSettingsStore.getState().applyHudSnapshot(await api.hudSnapshot());
     } catch {
-      // The local setting remains usable when running outside the desktop app.
+      // Ignored outside desktop app
     }
   });
 }
@@ -59,7 +53,6 @@ interface SettingsStore {
   resolution: "1080p" | "4K";
   cameraBubble: CameraBubbleSettings;
   canvas: CanvasSettings;
-  activeScene: "record" | "edit";
   selectionsReady: boolean;
   projectName: string;
   projectDir: string | null;
@@ -70,7 +63,6 @@ interface SettingsStore {
   knownCameras: HudCameraInfo[];
   layoutOwnedByProject: boolean;
 
-  setActiveScene: (scene: "record" | "edit") => void;
   setProjectName: (name: string) => void;
   setProjectDir: (dir: string | null) => void;
   setCreatedProjectPath: (path: string | null) => void;
@@ -98,7 +90,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   captureSystemAudio: true,
   fps: 30,
   resolution: "1080p",
-  activeScene: "record",
   selectionsReady: false,
   projectName: "",
   projectDir: null,
@@ -109,7 +100,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   knownCameras: [],
   layoutOwnedByProject: false,
 
-  setActiveScene: (scene) => set({ activeScene: scene }),
   setProjectName: (projectName) => set({ projectName }),
   setProjectDir: (projectDir) => set({ projectDir }),
   setCreatedProjectPath: (createdProjectPath) => set({ createdProjectPath }),
@@ -184,9 +174,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           borderWidth: snapshot.settings.borderWidth,
           shadow: snapshot.settings.shadow,
         };
-        // Native events and command responses can arrive before later queued
-        // writes. Keep the optimistic UI (and recording options) at the newest
-        // requested values until those writes have committed.
         for (const patch of pendingHudPatches) {
           cameraBubble = { ...cameraBubble, ...patch };
         }
@@ -195,20 +182,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       return next;
     }),
 
-  /**
-   * Reconcile persistent selection IDs against the freshly enumerated native
-   * source/device lists. Preserves an ID only if it still exists; otherwise
-   * falls back to the first available display / a device marked `isDefault`,
-   * or `null` for optional devices (mic) when nothing matches.
-   *
-   * Once this runs successfully the store becomes `selectionsReady`, which
-   * gates the record button in the HUD.
-   */
   reconcileSelections: (sources, cameras, mics) => {
     const state = get();
-    // Native enumeration is the source of truth for IDs. Keep malformed
-    // entries out of the selection sets so a stale/partial bridge response
-    // can never make an arbitrary persisted ID look valid.
     const safeSources = Array.isArray(sources)
       ? sources.filter((source) => typeof source?.id === "string" && source.id.length > 0)
       : [];
@@ -247,9 +222,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         ...state.cameraBubble,
         enabled: safeCameras.length === 0 ? false : state.cameraBubble.enabled,
       },
-      // Reconciliation is complete only after all three native enumeration
-      // responses have settled. An empty but valid response is still ready;
-      // recording remains disabled because there is no source to select.
       selectionsReady:
         Array.isArray(sources) && Array.isArray(cameras) && Array.isArray(mics),
     });

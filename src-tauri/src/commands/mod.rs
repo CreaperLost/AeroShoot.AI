@@ -2,21 +2,15 @@ use crate::capture::{
     AudioDevice, CameraDevice, CaptureSource, CaptureSourceType, FitMode, PermissionState,
     PermissionStatus, SourceGeometry,
 };
-use crate::dsp::{SilenceConfig, SilenceDetectionResult};
 use crate::fixtures::{generate_valid_fmp4_segment, generate_valid_wav_segment};
 use crate::hud::{
-    HudCameraInfo, HudOwner, HudSettingsPatch, HudSnapshot, HUD_WINDOW_LABEL,
-};
-use crate::media::{EncoderGate, MediaInteropStatus, MediaParityReport};
-use crate::playback::{
-    self, PlaybackOwner, PlaybackStatus, PreviewHitMode, PreviewOwner, PreviewStatus,
-    PreviewViewport,
+    HudCameraInfo, HudOwner, HudSettingsPatch, HudSnapshot, PreviewHitMode, PreviewOwner,
+    PreviewStatus, PreviewViewport, HUD_WINDOW_LABEL,
 };
 use crate::project::manifest::{PauseInterval, TrackDescriptor, TrackType};
 use crate::project::{
-    display_name_from_input, EditDocument, EditLayout, JournalRecord, OpenedProject,
-    ProjectBundle, ProjectReader, ProjectRecoveryReport, RecoveryEngine, RetainedInterval,
-    SegmentPage, TrackSegmentWriter, WaveformPage, WaveformTrackContext,
+    display_name_from_input, EditDocument, EditLayout, JournalRecord, ProjectBundle,
+    ProjectRecoveryReport, RecoveryEngine, RetainedInterval, TrackSegmentWriter,
 };
 use crate::session::{
     RuntimeErrorRecord, SessionDiagnostics, SessionEpoch, SessionEvent, SessionState,
@@ -24,10 +18,9 @@ use crate::session::{
 };
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 pub struct ActiveSession {
@@ -70,17 +63,9 @@ pub struct AppState {
     pub active_session: RwLock<Option<ActiveSession>>,
     pub last_stop_result: RwLock<Option<StopRecordingResult>>,
     pub project_base_dir: PathBuf,
-    pub opened_project: Mutex<Option<crate::project::ProjectReader>>,
-    pub playback: Mutex<PlaybackOwner>,
-    pub playback_shutdown: std::sync::atomic::AtomicBool,
     pub live_preview: std::sync::atomic::AtomicBool,
-    pub preview: Mutex<PreviewOwner>,
     pub hud_preview: Mutex<PreviewOwner>,
     pub hud: Mutex<HudOwner>,
-    pub encoder_gate: Arc<EncoderGate>,
-    pub export: Mutex<crate::export::ExportOwner>,
-    pub waveform_epoch: AtomicU64,
-    pub waveform_generations: Mutex<HashMap<String, u64>>,
     pub permission_override: RwLock<Option<PermissionStatus>>,
     pub native_capture_enabled: bool,
     /// Diagnostics bag for the active session: most-recent runtime error
@@ -97,17 +82,9 @@ impl AppState {
             active_session: RwLock::new(None),
             last_stop_result: RwLock::new(None),
             project_base_dir,
-            opened_project: Mutex::new(None),
-            playback: Mutex::new(PlaybackOwner::closed()),
-            playback_shutdown: std::sync::atomic::AtomicBool::new(false),
             live_preview: std::sync::atomic::AtomicBool::new(false),
-            preview: Mutex::new(PreviewOwner::new()),
             hud_preview: Mutex::new(PreviewOwner::new()),
             hud: Mutex::new(HudOwner::new()),
-            encoder_gate: Arc::new(EncoderGate::new()),
-            export: Mutex::new(crate::export::ExportOwner::new()),
-            waveform_epoch: AtomicU64::new(0),
-            waveform_generations: Mutex::new(HashMap::new()),
             permission_override: RwLock::new(None),
             native_capture_enabled: cfg!(target_os = "macos"),
             diagnostics: Arc::new(SessionDiagnostics::new()),
@@ -121,17 +98,9 @@ impl AppState {
             active_session: RwLock::new(None),
             last_stop_result: RwLock::new(None),
             project_base_dir,
-            opened_project: Mutex::new(None),
-            playback: Mutex::new(PlaybackOwner::closed()),
-            playback_shutdown: std::sync::atomic::AtomicBool::new(false),
             live_preview: std::sync::atomic::AtomicBool::new(false),
-            preview: Mutex::new(PreviewOwner::new()),
             hud_preview: Mutex::new(PreviewOwner::new()),
             hud: Mutex::new(HudOwner::new()),
-            encoder_gate: Arc::new(EncoderGate::new()),
-            export: Mutex::new(crate::export::ExportOwner::new()),
-            waveform_epoch: AtomicU64::new(0),
-            waveform_generations: Mutex::new(HashMap::new()),
             permission_override: RwLock::new(Some(PermissionStatus {
                 screen_recording: PermissionState::Authorized,
                 camera: PermissionState::Authorized,
@@ -484,10 +453,6 @@ pub fn start_recording_impl(
 ) -> Result<StartRecordingResult, String> {
     // 1. Serialize all lifecycle commands
     let _cmd_guard = state.command_lock.lock();
-
-    if state.export.lock().busy() {
-        return Err("Wait for the current export to finish or cancel it before recording".into());
-    }
 
     if state.native_capture_enabled {
         crate::capture::preview::stop();
@@ -1396,39 +1361,6 @@ pub fn get_session_status_impl(state: &AppState) -> SessionStatusResult {
     }
 }
 
-pub fn detect_silence_impl(
-    state: &AppState,
-    project_handle: String,
-    track_id: String,
-    config: SilenceConfig,
-) -> Result<SilenceDetectionResult, String> {
-    config.validate()?;
-    let ctx = {
-        let opened = state.opened_project.lock();
-        let reader = opened.as_ref().ok_or("No opened project")?;
-        if reader.summary.project_handle != project_handle {
-            return Err("Stale project handle".into());
-        }
-        let track = reader
-            .summary
-            .tracks
-            .iter()
-            .find(|track| track.descriptor.id == track_id)
-            .ok_or("Unknown track")?;
-        WaveformTrackContext {
-            root: reader.root().to_path_buf(),
-            track_id: track_id.clone(),
-            track_type: track.descriptor.track_type,
-            segments: reader
-                .segments_for(&track_id)
-                .ok_or("Unknown track")?
-                .to_vec(),
-            retained: reader.summary.retained_intervals.clone(),
-            edited_duration_us: reader.summary.edited_duration_us,
-        }
-    };
-    crate::project::silence::detect_track_silence(&ctx, &config)
-}
 
 /// Computes the active source / destination geometry for the given
 /// `source_id`. The Frontend calls this to preview the active rect before
@@ -1468,6 +1400,125 @@ pub fn compute_source_geometry_impl(
 
 pub fn recover_project_impl(project_dir: PathBuf) -> Result<ProjectRecoveryReport, String> {
     RecoveryEngine::scan_and_recover(project_dir).map_err(|e| e.to_string())
+}
+
+fn hud_session_flags(state: &AppState) -> (bool, bool) {
+    let capture_alive = state.active_session.read().is_some();
+    let recording = matches!(
+        state.state_machine.current(),
+        SessionState::Preparing
+            | SessionState::Recording
+            | SessionState::Paused
+            | SessionState::Stopping
+    ) || capture_alive;
+    (recording, capture_alive)
+}
+
+pub fn hud_snapshot_impl(state: &AppState) -> HudSnapshot {
+    let (recording, capture_alive) = hud_session_flags(state);
+    state.hud.lock().snapshot(recording, capture_alive)
+}
+
+pub fn hud_update_impl(
+    state: &AppState,
+    expected_revision: u64,
+    patch: HudSettingsPatch,
+) -> Result<HudSnapshot, String> {
+    let (recording, capture_alive) = hud_session_flags(state);
+    state
+        .hud
+        .lock()
+        .update(expected_revision, patch, recording, capture_alive)
+}
+
+pub fn hud_reconcile_cameras_impl(
+    state: &AppState,
+    cameras: Vec<HudCameraInfo>,
+    selected_camera_id: Option<String>,
+) -> Result<HudSnapshot, String> {
+    let (recording, capture_alive) = hud_session_flags(state);
+    state
+        .hud
+        .lock()
+        .reconcile_cameras(cameras, selected_camera_id, recording, capture_alive)
+}
+
+pub fn hud_preview_attach_impl(
+    state: &AppState,
+    window_label: String,
+    hit_mode: PreviewHitMode,
+    native_window: Option<*mut std::ffi::c_void>,
+) -> Result<HudSnapshot, String> {
+    if window_label != HUD_WINDOW_LABEL {
+        return Err(format!(
+            "HUD preview can only attach to '{HUD_WINDOW_LABEL}'"
+        ));
+    }
+    {
+        let mut preview = state.hud_preview.lock();
+        preview.attach(window_label.clone(), hit_mode, native_window)?;
+    }
+    let (recording, capture_alive) = hud_session_flags(state);
+    state
+        .hud
+        .lock()
+        .attach_preview(&window_label, recording, capture_alive)
+}
+
+pub fn hud_preview_layout_impl(
+    state: &AppState,
+    viewport: PreviewViewport,
+) -> Result<PreviewStatus, String> {
+    if viewport.window_label != HUD_WINDOW_LABEL {
+        return Err(format!(
+            "HUD preview layout requires window '{HUD_WINDOW_LABEL}'"
+        ));
+    }
+    if viewport.generation == 0 {
+        return Err("Preview generation is required".into());
+    }
+    state.hud_preview.lock().layout(viewport)
+}
+
+pub fn hud_preview_status_impl(state: &AppState) -> PreviewStatus {
+    state.hud_preview.lock().status()
+}
+
+/// Detach the HUD overlay. Must not call stop_recording or drop the capture session.
+pub fn hud_close_impl(state: &AppState) -> Result<HudSnapshot, String> {
+    state.hud_preview.lock().detach();
+    let (recording, capture_alive) = hud_session_flags(state);
+    Ok(state.hud.lock().close(recording, capture_alive))
+}
+
+pub fn hud_set_visible_impl(state: &AppState, visible: bool) -> Result<HudSnapshot, String> {
+    let (recording, capture_alive) = hud_session_flags(state);
+    state
+        .hud
+        .lock()
+        .set_requested_visible(visible, recording, capture_alive)
+}
+
+/// Formats the window title for recording scenes or active sessions.
+/// Defaults to a dated Untitled name (e.g. "Untitled 9 Sep 2026") when `project_name` is empty or omitted,
+/// producing "AeroShoot — <Project Name>" (e.g. "AeroShoot — Untitled 9 Sep 2026").
+pub fn window_title_for_recording(project_name: Option<&str>) -> String {
+    let name = project_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(crate::project::default_project_name);
+    format!("AeroShoot \u{2014} {}", name)
+}
+
+/// Formats the window title for project editing.
+/// When a project is open, produces "AeroShoot — <Project Name>" (e.g. "AeroShoot — Launch Demo").
+/// When no project is open (None or empty), produces "AeroShoot".
+pub fn window_title_for_project(project_name: Option<&str>) -> String {
+    match project_name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => format!("AeroShoot \u{2014} {}", name),
+        None => "AeroShoot".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1774,651 +1825,5 @@ mod tests {
         let dir = tempdir().unwrap();
         let result = show_in_finder_impl(dir.path().to_string_lossy().into_owned());
         assert!(result.is_ok());
-    }
-}
-
-pub fn open_project_impl(state: &AppState, path: String) -> Result<OpenedProject, String> {
-    let _guard = state.command_lock.lock();
-    state.live_preview.store(false, Ordering::Release);
-    let reader = ProjectReader::open(std::path::Path::new(&path))?;
-    let summary = reader.summary.clone();
-    let tracks = playback::tracks_from_reader(&reader);
-    let document = reader.history().current.clone();
-    let mut owner = PlaybackOwner::open(
-        summary.project_handle.clone(),
-        reader.root().to_path_buf(),
-        &document,
-        tracks,
-    )?;
-    *state.opened_project.lock() = Some(reader);
-    owner.native_enabled = state.native_capture_enabled;
-    *state.playback.lock() = owner;
-    state.waveform_epoch.fetch_add(1, Ordering::SeqCst);
-    state.waveform_generations.lock().clear();
-    Ok(summary)
-}
-
-pub fn close_project_impl(state: &AppState, project_handle: String) -> Result<(), String> {
-    let _guard = state.command_lock.lock();
-    let mut opened = state.opened_project.lock();
-    if let Some(reader) = opened.as_ref() {
-        if reader.summary.project_handle != project_handle {
-            return Err("Stale project handle".into());
-        }
-    }
-    *opened = None;
-    state.playback.lock().close();
-    state.waveform_epoch.fetch_add(1, Ordering::SeqCst);
-    state.waveform_generations.lock().clear();
-    Ok(())
-}
-
-pub fn project_segments_impl(
-    state: &AppState,
-    project_handle: String,
-    track_id: String,
-    offset: usize,
-    limit: usize,
-) -> Result<SegmentPage, String> {
-    let opened = state.opened_project.lock();
-    let reader = opened.as_ref().ok_or("No opened project")?;
-    if reader.summary.project_handle != project_handle {
-        return Err("Stale project handle".into());
-    }
-    reader.page(&track_id, offset, limit)
-}
-
-pub fn project_waveform_impl(
-    state: &AppState,
-    project_handle: String,
-    track_id: String,
-    start_us: u64,
-    end_us: u64,
-    bucket_count: usize,
-) -> Result<WaveformPage, String> {
-    let epoch = state.waveform_epoch.load(Ordering::SeqCst);
-    let generation = {
-        let mut generations = state.waveform_generations.lock();
-        let slot = generations.entry(track_id.clone()).or_insert(0);
-        *slot += 1;
-        *slot
-    };
-    let ctx = {
-        let opened = state.opened_project.lock();
-        let reader = opened.as_ref().ok_or("No opened project")?;
-        if reader.summary.project_handle != project_handle {
-            return Err("Stale project handle".into());
-        }
-        let track = reader
-            .summary
-            .tracks
-            .iter()
-            .find(|track| track.descriptor.id == track_id)
-            .ok_or("Unknown track")?;
-        WaveformTrackContext {
-            root: reader.root().to_path_buf(),
-            track_id: track_id.clone(),
-            track_type: track.descriptor.track_type,
-            segments: reader
-                .segments_for(&track_id)
-                .ok_or("Unknown track")?
-                .to_vec(),
-            retained: reader.summary.retained_intervals.clone(),
-            edited_duration_us: reader.summary.edited_duration_us,
-        }
-    };
-    crate::project::waveform::query_waveform(&ctx, start_us, end_us, bucket_count, &|| {
-        if state.waveform_epoch.load(Ordering::SeqCst) != epoch {
-            return true;
-        }
-        state
-            .waveform_generations
-            .lock()
-            .get(&track_id)
-            .copied()
-            .unwrap_or(0)
-            != generation
-    })
-}
-
-pub fn project_zoom_suggestions_impl(
-    state: &AppState,
-    project_handle: String,
-    config: Option<crate::zoom::ZoomConfig>,
-) -> Result<crate::zoom::ZoomGeneration, String> {
-    let config = config.unwrap_or_default();
-    config.validate()?;
-    let opened = state.opened_project.lock();
-    let reader = opened.as_ref().ok_or("No opened project")?;
-    if reader.summary.project_handle != project_handle {
-        return Err("Stale project handle".into());
-    }
-    let stream = crate::telemetry::reader::read_telemetry(reader.root())?;
-    let mut generation = crate::zoom::generate_zoom_suggestions(&stream, &config)?;
-    let mapper = reader.history().current.mapper()?;
-    crate::zoom::attach_edited_ranges(&mut generation, &mapper);
-    let taken: std::collections::BTreeSet<_> = reader
-        .summary
-        .zooms
-        .iter()
-        .map(|z| z.id.clone())
-        .chain(reader.summary.dismissed_zoom_ids.iter().cloned())
-        .collect();
-    generation
-        .suggestions
-        .retain(|suggestion| !taken.contains(&suggestion.id));
-    Ok(generation)
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ManualZoomInput {
-    pub edited_start_us: u64,
-    pub edited_end_us: u64,
-    pub center_x: f64,
-    pub center_y: f64,
-    pub scale: f64,
-}
-
-fn mutate_opened(
-    state: &AppState,
-    project_handle: String,
-    mutate: impl FnOnce(&mut crate::project::ProjectReader) -> Result<OpenedProject, String>,
-) -> Result<OpenedProject, String> {
-    let _guard = state.command_lock.lock();
-    let mut opened = state.opened_project.lock();
-    let reader = opened.as_mut().ok_or("No opened project")?;
-    require_handle(reader, &project_handle)?;
-    let summary = mutate(reader)?;
-    state
-        .playback
-        .lock()
-        .apply_document(&reader.history().current)?;
-    Ok(summary)
-}
-
-pub fn project_zoom_accept_impl(
-    state: &AppState,
-    project_handle: String,
-    expected_revision: u64,
-    ids: Vec<String>,
-) -> Result<OpenedProject, String> {
-    let config = crate::zoom::ZoomConfig::default();
-    mutate_opened(state, project_handle, |reader| {
-        let stream = crate::telemetry::reader::read_telemetry(reader.root())?;
-        let generation = crate::zoom::generate_zoom_suggestions(&stream, &config)?;
-        let selected: Vec<_> = if ids.is_empty() {
-            generation.suggestions
-        } else {
-            generation
-                .suggestions
-                .into_iter()
-                .filter(|s| ids.iter().any(|id| id == &s.id))
-                .collect()
-        };
-        reader.accept_zooms(expected_revision, &selected)
-    })
-}
-
-pub fn project_zoom_dismiss_impl(
-    state: &AppState,
-    project_handle: String,
-    expected_revision: u64,
-    ids: Vec<String>,
-) -> Result<OpenedProject, String> {
-    mutate_opened(state, project_handle, |reader| {
-        reader.dismiss_zooms(expected_revision, &ids)
-    })
-}
-
-pub fn project_zoom_update_impl(
-    state: &AppState,
-    project_handle: String,
-    expected_revision: u64,
-    zoom: crate::zoom::ZoomKeyframe,
-) -> Result<OpenedProject, String> {
-    mutate_opened(state, project_handle, |reader| {
-        reader.update_zoom(expected_revision, zoom)
-    })
-}
-
-pub fn project_zoom_add_impl(
-    state: &AppState,
-    project_handle: String,
-    expected_revision: u64,
-    input: ManualZoomInput,
-) -> Result<OpenedProject, String> {
-    mutate_opened(state, project_handle, |reader| {
-        reader.add_manual_zoom(
-            expected_revision,
-            input.edited_start_us,
-            input.edited_end_us,
-            input.center_x,
-            input.center_y,
-            input.scale,
-        )
-    })
-}
-
-pub fn project_zoom_delete_impl(
-    state: &AppState,
-    project_handle: String,
-    expected_revision: u64,
-    id: String,
-) -> Result<OpenedProject, String> {
-    mutate_opened(state, project_handle, |reader| {
-        reader.delete_zoom(expected_revision, &id)
-    })
-}
-
-pub fn project_layout_update_impl(
-    state: &AppState,
-    project_handle: String,
-    expected_revision: u64,
-    mut layout: crate::project::EditLayout,
-    wallpaper_source: Option<String>,
-) -> Result<OpenedProject, String> {
-    mutate_opened(state, project_handle, |reader| {
-        if let Some(source) = wallpaper_source {
-            let relative = crate::project::layout::ingest_wallpaper(
-                reader.root(),
-                std::path::Path::new(&source),
-            )?;
-            layout.wallpaper_asset = Some(relative);
-            layout.background_type = "wallpaper".into();
-        }
-        reader.update_layout(expected_revision, layout)
-    })
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct EditCut {
-    pub start_us: u64,
-    pub end_us: u64,
-}
-
-fn require_handle(reader: &ProjectReader, project_handle: &str) -> Result<(), String> {
-    if reader.summary.project_handle != project_handle {
-        return Err("Stale project handle".into());
-    }
-    Ok(())
-}
-
-pub fn project_ripple_cuts_impl(
-    state: &AppState,
-    project_handle: String,
-    expected_revision: u64,
-    cuts: Vec<EditCut>,
-) -> Result<OpenedProject, String> {
-    let _guard = state.command_lock.lock();
-    let mut opened = state.opened_project.lock();
-    let reader = opened.as_mut().ok_or("No opened project")?;
-    require_handle(reader, &project_handle)?;
-    let ranges: Vec<(u64, u64)> = cuts
-        .into_iter()
-        .map(|cut| (cut.start_us, cut.end_us))
-        .collect();
-    let summary = reader.ripple_cuts(expected_revision, &ranges)?;
-    state
-        .playback
-        .lock()
-        .apply_document(&reader.history().current)?;
-    state.waveform_epoch.fetch_add(1, Ordering::SeqCst);
-    Ok(summary)
-}
-
-pub fn project_undo_impl(
-    state: &AppState,
-    project_handle: String,
-    expected_revision: u64,
-) -> Result<OpenedProject, String> {
-    let _guard = state.command_lock.lock();
-    let mut opened = state.opened_project.lock();
-    let reader = opened.as_mut().ok_or("No opened project")?;
-    require_handle(reader, &project_handle)?;
-    let summary = reader.undo(expected_revision)?;
-    state
-        .playback
-        .lock()
-        .apply_document(&reader.history().current)?;
-    state.waveform_epoch.fetch_add(1, Ordering::SeqCst);
-    Ok(summary)
-}
-
-pub fn project_redo_impl(
-    state: &AppState,
-    project_handle: String,
-    expected_revision: u64,
-) -> Result<OpenedProject, String> {
-    let _guard = state.command_lock.lock();
-    let mut opened = state.opened_project.lock();
-    let reader = opened.as_mut().ok_or("No opened project")?;
-    require_handle(reader, &project_handle)?;
-    let summary = reader.redo(expected_revision)?;
-    state
-        .playback
-        .lock()
-        .apply_document(&reader.history().current)?;
-    state.waveform_epoch.fetch_add(1, Ordering::SeqCst);
-    Ok(summary)
-}
-
-pub fn project_rename_impl(
-    state: &AppState,
-    project_handle: String,
-    new_name: String,
-) -> Result<OpenedProject, String> {
-    let _guard = state.command_lock.lock();
-    let mut opened = state.opened_project.lock();
-    let reader = opened.as_mut().ok_or("No opened project")?;
-    require_handle(reader, &project_handle)?;
-    reader.rename_project(&new_name)
-}
-
-pub fn playback_status_impl(
-    state: &AppState,
-    project_handle: String,
-) -> Result<PlaybackStatus, String> {
-    let mut playback = state.playback.lock();
-    let status = playback.status()?;
-    if status.state == crate::playback::PlaybackState::Closed {
-        return Err("Playback is closed".into());
-    }
-    if status.project_handle != project_handle {
-        return Err("Stale project handle".into());
-    }
-    Ok(status)
-}
-
-pub fn playback_play_impl(
-    state: &AppState,
-    project_handle: String,
-) -> Result<PlaybackStatus, String> {
-    let mut playback = state.playback.lock();
-    if playback.status()?.project_handle != project_handle {
-        return Err("Stale project handle".into());
-    }
-    playback.play()
-}
-
-pub fn playback_pause_impl(
-    state: &AppState,
-    project_handle: String,
-) -> Result<PlaybackStatus, String> {
-    let mut playback = state.playback.lock();
-    if playback.status()?.project_handle != project_handle {
-        return Err("Stale project handle".into());
-    }
-    playback.pause()
-}
-
-pub fn playback_seek_impl(
-    state: &AppState,
-    project_handle: String,
-    edited_us: u64,
-) -> Result<PlaybackStatus, String> {
-    let mut playback = state.playback.lock();
-    if playback.status()?.project_handle != project_handle {
-        return Err("Stale project handle".into());
-    }
-    playback.seek(edited_us)
-}
-
-pub fn preview_attach_impl(
-    state: &AppState,
-    window_label: String,
-    hit_mode: PreviewHitMode,
-    native_window: Option<*mut std::ffi::c_void>,
-) -> Result<PreviewStatus, String> {
-    if native_window.is_none() {
-        return Err("Native preview requires a desktop window".into());
-    }
-    state
-        .preview
-        .lock()
-        .attach(window_label, hit_mode, native_window)
-}
-
-pub fn preview_layout_impl(
-    state: &AppState,
-    viewport: PreviewViewport,
-) -> Result<PreviewStatus, String> {
-    if viewport.generation == 0 {
-        return Err("Preview generation is required".into());
-    }
-    state.preview.lock().layout(viewport)
-}
-
-pub fn preview_present_fixed_impl(
-    state: &AppState,
-    r: f32,
-    g: f32,
-    b: f32,
-    generation: u64,
-) -> Result<PreviewStatus, String> {
-    state.preview.lock().present_fixed(r, g, b, generation)
-}
-
-pub fn preview_present_fixture_impl(
-    state: &AppState,
-    path: String,
-    generation: u64,
-) -> Result<PreviewStatus, String> {
-    state.preview.lock().present_fixture(&path, generation)
-}
-
-pub fn preview_status_impl(state: &AppState) -> PreviewStatus {
-    state.preview.lock().status()
-}
-
-pub fn preview_hit_test_impl(state: &AppState, x: f64, y: f64) -> bool {
-    state.preview.lock().hit_test(x, y)
-}
-
-pub fn preview_detach_impl(
-    state: &AppState,
-    window_label: String,
-) -> Result<PreviewStatus, String> {
-    let mut preview = state.preview.lock();
-    if preview.status().attached
-        && preview.status().window_label.as_deref() != Some(window_label.as_str())
-    {
-        return Err("Stale preview window label".into());
-    }
-    preview.detach();
-    Ok(preview.status())
-}
-
-fn hud_session_flags(state: &AppState) -> (bool, bool) {
-    let capture_alive = state.active_session.read().is_some();
-    let recording = matches!(
-        state.state_machine.current(),
-        SessionState::Preparing
-            | SessionState::Recording
-            | SessionState::Paused
-            | SessionState::Stopping
-    ) || capture_alive;
-    (recording, capture_alive)
-}
-
-pub fn hud_snapshot_impl(state: &AppState) -> HudSnapshot {
-    let (recording, capture_alive) = hud_session_flags(state);
-    state.hud.lock().snapshot(recording, capture_alive)
-}
-
-pub fn hud_update_impl(
-    state: &AppState,
-    expected_revision: u64,
-    patch: HudSettingsPatch,
-) -> Result<HudSnapshot, String> {
-    let (recording, capture_alive) = hud_session_flags(state);
-    state
-        .hud
-        .lock()
-        .update(expected_revision, patch, recording, capture_alive)
-}
-
-pub fn hud_reconcile_cameras_impl(
-    state: &AppState,
-    cameras: Vec<HudCameraInfo>,
-    selected_camera_id: Option<String>,
-) -> Result<HudSnapshot, String> {
-    let (recording, capture_alive) = hud_session_flags(state);
-    state
-        .hud
-        .lock()
-        .reconcile_cameras(cameras, selected_camera_id, recording, capture_alive)
-}
-
-pub fn hud_preview_attach_impl(
-    state: &AppState,
-    window_label: String,
-    hit_mode: PreviewHitMode,
-    native_window: Option<*mut std::ffi::c_void>,
-) -> Result<HudSnapshot, String> {
-    if window_label != HUD_WINDOW_LABEL {
-        return Err(format!(
-            "HUD preview can only attach to '{HUD_WINDOW_LABEL}'"
-        ));
-    }
-    {
-        let mut preview = state.hud_preview.lock();
-        preview.attach(window_label.clone(), hit_mode, native_window)?;
-    }
-    let (recording, capture_alive) = hud_session_flags(state);
-    state
-        .hud
-        .lock()
-        .attach_preview(&window_label, recording, capture_alive)
-}
-
-pub fn hud_preview_layout_impl(
-    state: &AppState,
-    viewport: PreviewViewport,
-) -> Result<PreviewStatus, String> {
-    if viewport.window_label != HUD_WINDOW_LABEL {
-        return Err(format!(
-            "HUD preview layout requires window '{HUD_WINDOW_LABEL}'"
-        ));
-    }
-    if viewport.generation == 0 {
-        return Err("Preview generation is required".into());
-    }
-    state.hud_preview.lock().layout(viewport)
-}
-
-pub fn hud_preview_status_impl(state: &AppState) -> PreviewStatus {
-    state.hud_preview.lock().status()
-}
-
-/// Detach the HUD overlay. Must not call stop_recording or drop the capture session.
-pub fn hud_close_impl(state: &AppState) -> Result<HudSnapshot, String> {
-    state.hud_preview.lock().detach();
-    let (recording, capture_alive) = hud_session_flags(state);
-    Ok(state.hud.lock().close(recording, capture_alive))
-}
-
-pub fn hud_set_visible_impl(state: &AppState, visible: bool) -> Result<HudSnapshot, String> {
-    let (recording, capture_alive) = hud_session_flags(state);
-    state
-        .hud
-        .lock()
-        .set_requested_visible(visible, recording, capture_alive)
-}
-
-pub fn media_interop_status_impl(state: &AppState) -> MediaInteropStatus {
-    let _ = state;
-    crate::media::interop_status(
-        None,
-        vec![
-            "FFmpeg is not pinned; VideoToolbox implements the decoder/encoder contract".into(),
-            "WGPU uses a CPU upload/readback fallback; Metal texture interop is untested".into(),
-        ],
-    )
-}
-
-pub fn media_run_parity_impl(state: &AppState) -> Result<MediaParityReport, String> {
-    let dir = std::env::temp_dir().join(format!("aeroshoot-f2-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let report = crate::render::run_parity(&dir, &state.encoder_gate);
-    let _ = std::fs::remove_dir_all(&dir);
-    report
-}
-
-pub fn export_start_impl(
-    state: &AppState,
-    project_handle: String,
-    settings: crate::export::ExportSettings,
-) -> Result<crate::export::ExportStatus, String> {
-    let _guard = state.command_lock.lock();
-    let session_state = state.state_machine.current();
-    let opened = state.opened_project.lock();
-    let reader = opened.as_ref().ok_or("No opened project")?;
-    require_handle(reader, &project_handle)?;
-    let document = reader.history().current.clone();
-    let tracks = playback::tracks_from_reader(reader);
-    let root = reader.root().to_path_buf();
-    let name = reader.summary.manifest.project_name.clone();
-    drop(opened);
-    let gate = Arc::clone(&state.encoder_gate);
-    let mut owner = state.export.lock();
-    match crate::export::prepare_job(
-        session_state,
-        &root,
-        &name,
-        document,
-        tracks,
-        settings,
-        &mut owner,
-    ) {
-        Ok(captured) => Ok(crate::export::spawn_job(captured, &mut owner, gate)),
-        Err(status) => {
-            owner.install_failed(status.clone());
-            Ok(status)
-        }
-    }
-}
-
-pub fn export_status_impl(
-    state: &AppState,
-    job_id: Option<String>,
-) -> Result<crate::export::ExportStatus, String> {
-    let mut owner = state.export.lock();
-    let status = owner.status();
-    if let Some(id) = job_id {
-        if !status.job_id.is_empty() && status.job_id != id {
-            return Err("Stale export job id".into());
-        }
-    }
-    Ok(status)
-}
-
-pub fn export_cancel_impl(
-    state: &AppState,
-    job_id: String,
-) -> Result<crate::export::ExportStatus, String> {
-    state.export.lock().cancel(&job_id)
-}
-
-/// Formats the window title for recording scenes or active sessions.
-/// Defaults to a dated Untitled name (e.g. "Untitled 9 Sep 2026") when `project_name` is empty or omitted,
-/// producing "AeroShoot — <Project Name>" (e.g. "AeroShoot — Untitled 9 Sep 2026").
-pub fn window_title_for_recording(project_name: Option<&str>) -> String {
-    let name = project_name
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or_else(crate::project::default_project_name);
-    format!("AeroShoot \u{2014} {}", name)
-}
-
-/// Formats the window title for project editing.
-/// When a project is open, produces "AeroShoot — <Project Name>" (e.g. "AeroShoot — Launch Demo").
-/// When no project is open (None or empty), produces "AeroShoot".
-pub fn window_title_for_project(project_name: Option<&str>) -> String {
-    match project_name.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(name) => format!("AeroShoot \u{2014} {}", name),
-        None => "AeroShoot".to_string(),
     }
 }

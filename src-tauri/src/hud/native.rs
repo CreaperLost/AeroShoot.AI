@@ -1,5 +1,6 @@
-//! Platform adapter for the F1 preview overlay. Pixels stay in-process.
+//! Platform adapter for recorder HUD preview overlay.
 use super::preview::{PreviewHitMode, PreviewViewport};
+#[allow(unused_imports)]
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr::NonNull;
 
@@ -28,15 +29,6 @@ extern "C" {
         y: f64,
         width: f64,
         height: f64,
-    ) -> c_int;
-    fn aeroshoot_preview_present_bgra(
-        handle: *mut c_void,
-        width: i32,
-        height: i32,
-        stride: i32,
-        pixels: *const u8,
-        len: i32,
-        generation: u64,
     ) -> c_int;
     fn aeroshoot_preview_set_hit_mode(handle: *mut c_void, mode: c_int) -> c_int;
     fn aeroshoot_preview_present_fixed(
@@ -258,29 +250,5 @@ mod stub_preview_ffi {
     #[no_mangle]
     pub extern "C" fn aeroshoot_preview_copy_stats_json(_handle: *mut c_void) -> *mut c_char {
         unsafe { libc::strdup(b"{\"attached\":true}\0".as_ptr() as *const i8) }
-    }
-}
-
-pub fn present_frame(
-    handle: NonNull<c_void>,
-    frame: &crate::media::VideoFrame,
-    generation: u64,
-) -> Result<(), String> {
-    #[cfg(all(target_os = "macos", not(stub_swift_ffi)))]
-    unsafe {
-        map_status(aeroshoot_preview_present_bgra(
-            handle.as_ptr(),
-            frame.width as i32,
-            frame.height as i32,
-            frame.stride as i32,
-            frame.data.as_ptr(),
-            frame.data.len() as i32,
-            generation,
-        ))
-    }
-    #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
-    {
-        let _ = (handle, frame, generation);
-        Err("Native frame presentation unsupported".into())
     }
 }

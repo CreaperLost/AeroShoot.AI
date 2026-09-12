@@ -1,10 +1,6 @@
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
-    // Allow the build to skip the Swift bridge when developing the
-    // pure-Rust side. Set `AEROSHOOT_SKIP_SWIFT=1` to skip the Swift
-    // compile step (used by parallel agents verifying their own
-    // changes without waiting for the Swift agent).
     let skip_swift = env::var("AEROSHOOT_SKIP_SWIFT").is_ok();
     println!("cargo:rerun-if-env-changed=AEROSHOOT_SKIP_SWIFT");
     println!("cargo:rustc-check-cfg=cfg(stub_swift_ffi)");
@@ -22,17 +18,14 @@ fn main() {
 fn build_macos_capture_bridge() {
     let source = PathBuf::from("native/macos/AeroShootCapture.swift");
     let live_source = PathBuf::from("native/macos/AeroShootLivePreview.swift");
-    println!("cargo:rerun-if-changed={}", live_source.display());
     let mouse_source = PathBuf::from("native/macos/MouseHookMac.swift");
     let preview_source = PathBuf::from("native/macos/AeroShootPreview.swift");
-    let media_source = PathBuf::from("native/macos/AeroShootMedia.swift");
-    let playback_source = PathBuf::from("native/macos/AeroShootPlayback.swift");
-    println!("cargo:rerun-if-changed={}", playback_source.display());
-    let export_source = PathBuf::from("native/macos/AeroShootExport.swift");
+
+    println!("cargo:rerun-if-changed={}", source.display());
+    println!("cargo:rerun-if-changed={}", live_source.display());
     println!("cargo:rerun-if-changed={}", mouse_source.display());
     println!("cargo:rerun-if-changed={}", preview_source.display());
-    println!("cargo:rerun-if-changed={}", media_source.display());
-    println!("cargo:rerun-if-changed={}", export_source.display());
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     let library = out_dir.join("libaeroshoot_macos_capture.a");
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo target architecture");
@@ -40,7 +33,6 @@ fn build_macos_capture_bridge() {
     let module_cache = out_dir.join("swift-module-cache");
     std::fs::create_dir_all(&module_cache).expect("create Swift module cache");
 
-    println!("cargo:rerun-if-changed={}", source.display());
     let status = Command::new("xcrun")
         .env("CLANG_MODULE_CACHE_PATH", &module_cache)
         .args([
@@ -60,9 +52,6 @@ fn build_macos_capture_bridge() {
         .arg(&live_source)
         .arg(&mouse_source)
         .arg(&preview_source)
-        .arg(&media_source)
-        .arg(&export_source)
-        .arg(&playback_source)
         .arg("-o")
         .arg(&library)
         .status()

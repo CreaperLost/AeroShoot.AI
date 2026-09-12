@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { useProjectStore } from "../../stores/projectStore";
 import { api } from "../../lib/ipc";
 import { PreviewHitMode, PreviewStatus } from "../../lib/types";
 
@@ -14,7 +13,7 @@ interface NativePreviewHostProps {
 }
 
 export function NativePreviewHost({
-  live = false,
+  live = true,
   windowLabel = "main",
   hitMode = "consume",
   className = "w-full max-w-4xl aspect-video",
@@ -22,8 +21,6 @@ export function NativePreviewHost({
   fitAspectRatio,
   showStatus = true,
 }: NativePreviewHostProps) {
-  const previewAvailable = useProjectStore(s => s.previewAvailable);
-  const playbackError = useProjectStore(s => s.playbackError);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [status, setStatus] = useState<PreviewStatus | null>(null);
   const [error, setError] = useState<string>();
@@ -59,20 +56,17 @@ export function NativePreviewHost({
       const key = JSON.stringify(viewport);
       if (key === lastGeometry) return;
       sending = true;
-      const layout = surface === "hud" ? api.hudPreviewLayout : api.previewLayout;
+      const layout = api.hudPreviewLayout;
       void layout({ ...viewport, revision: ++revision })
         .then(next => { if (!cancelled) { lastGeometry = key; setStatus(next); setError(undefined); } })
         .catch(err => { if (!cancelled) setError(String(err)); })
         .finally(() => { sending = false; });
     };
-    const attach = surface === "hud"
-      ? api.hudPreviewAttach(windowLabel, hitMode).then(() => api.hudPreviewStatus())
-      : api.previewAttach(windowLabel, hitMode);
+    const attach = api.hudPreviewAttach(windowLabel, hitMode).then(() => api.hudPreviewStatus());
     void attach.then(attached => {
       generation = attached.generation;
       if (cancelled) {
-        if (surface === "hud") void api.hudClose().catch(() => undefined);
-        else void api.previewDetach(windowLabel, generation).catch(() => undefined);
+        void api.hudClose().catch(() => undefined);
         return;
       }
       setStatus(attached); setError(undefined);
@@ -82,8 +76,7 @@ export function NativePreviewHost({
       cancelled = true;
       cancelAnimationFrame(animation);
       if (generation !== undefined) {
-        if (surface === "hud") void api.hudClose().catch(() => undefined);
-        else void api.previewDetach(windowLabel, generation).catch(() => undefined);
+        void api.hudClose().catch(() => undefined);
       }
     };
   }, [windowLabel, hitMode, surface]);
@@ -109,16 +102,14 @@ export function NativePreviewHost({
         />
       </div>
       {showStatus && <p className="text-xs text-studio-400 max-w-md text-center shrink-0">
-        {error || (!live && playbackError)
-          ? error || playbackError
+        {error
+          ? error
           : status?.attached
             ? live
               ? surface === "hud"
                 ? "Live camera from the capture session"
                 : "Live screen and selected webcam"
-              : previewAvailable
-                ? ""
-                : "Loading project preview…"
+              : ""
             : "Native preview surface is not attached."}
       </p>}
     </div>

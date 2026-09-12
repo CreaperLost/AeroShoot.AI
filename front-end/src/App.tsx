@@ -1,8 +1,7 @@
 import React, { useEffect, useState, useCallback } from "react";
 import { TopNavBar } from "./components/navigation/TopNavBar";
 import { RecordScene } from "./components/scenes/RecordScene";
-import { EditStudioScene } from "./components/scenes/EditStudioScene";
-import { SilenceModal } from "./components/silence-modal/SilenceModal";
+import { RecordingCompletedModal } from "./components/recording-hud/RecordingCompletedModal";
 import { useSettingsStore } from "./stores/settingsStore";
 import { useWindowTitle } from "./hooks/useWindowTitle";
 import { useHudSettings } from "./hooks/useHudSettings";
@@ -21,15 +20,13 @@ const ZERO_PERMISSIONS: PermissionBundle = {
   microphone: "unknown",
 };
 
-// React StrictMode mounts twice in development. A process-level guard keeps the
-// one-shot Screen Recording prompt from firing twice in a packaged build too.
 let didAutoRequestScreen = false;
 
 export const App: React.FC = () => {
   useWindowTitle();
   useHudSettings();
   const recording = useRecording();
-  const { activeScene, reconcileSelections, cameraBubble } = useSettingsStore();
+  const { reconcileSelections, cameraBubble } = useSettingsStore();
 
   const [sources, setSources] = useState<CaptureSource[]>([]);
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
@@ -98,9 +95,6 @@ export const App: React.FC = () => {
     void (async () => {
       const current = await refreshPermissions(false);
       if (cancelled) return;
-      // Prompt at most once per launch, and only for Screen Recording. Camera
-      // and microphone dialogs must not fire on startup — that is what made
-      // the packaged app unusable after the user had already granted access.
       if (current.screenRecording === "notDetermined" && !didAutoRequestScreen) {
         didAutoRequestScreen = true;
         await refreshPermissions(true, { screen: true, camera: false, microphone: false });
@@ -113,11 +107,8 @@ export const App: React.FC = () => {
     };
   }, [loadDevicesAndSources, refreshPermissions]);
 
-  // Refresh devices and permissions when window regains focus or hardware changes
   useEffect(() => {
     const onDeviceOrFocusChange = () => {
-      // Read-only. Requesting here re-opens the macOS permission dialog every
-      // time the window refocuses after the user grants access in Settings.
       void refreshPermissions(false);
       void loadDevicesAndSources();
     };
@@ -145,31 +136,32 @@ export const App: React.FC = () => {
 
   return (
     <div data-ui-root="studio" className="flex flex-col h-screen w-screen overflow-hidden bg-studio-950 text-studio-100 select-none">
-      {/* 1. Global Top Bar with Scene Switcher Card */}
+      {/* 1. Recorder Top Bar */}
       <TopNavBar
         permissions={permissions}
         onOpenSettings={handleOpenPrivacySettings}
-        sessionLocked={recording.sessionOwned}
+        sessionState={recording.sessionState}
       />
 
-      {/* 2. Main Scene Workspace: Record Scene vs Edit Studio Scene */}
+      {/* 2. Main Recording Scene Workspace */}
       <main className="flex-1 flex overflow-hidden relative">
-        {activeScene === "record" ? (
-          <RecordScene
-            sources={sources}
-            cameras={cameras}
-            mics={mics}
-            permissions={permissions}
-            refreshPermissions={refreshPermissions}
-            recording={recording}
-          />
-        ) : (
-          <EditStudioScene />
-        )}
+        <RecordScene
+          sources={sources}
+          cameras={cameras}
+          mics={mics}
+          permissions={permissions}
+          refreshPermissions={refreshPermissions}
+          recording={recording}
+        />
       </main>
 
-      {/* 3. Global Silence Detection Modal */}
-      <SilenceModal />
+      {/* 3. Recording Complete Modal */}
+      {recording.lastRecordingResult && (
+        <RecordingCompletedModal
+          result={recording.lastRecordingResult}
+          onDismiss={recording.dismissCompletedModal}
+        />
+      )}
     </div>
   );
 };
