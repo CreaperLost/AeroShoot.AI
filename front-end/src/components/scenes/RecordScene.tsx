@@ -4,7 +4,6 @@ import { DeviceControlDeck } from "../recording-hud/DeviceControlDeck";
 import { ProjectDestinationBar } from "../recording-hud/ProjectDestinationBar";
 import { CapturePreview } from "../canvas/CapturePreview";
 import { RecordingFloatingDock } from "../recording-hud/RecordingFloatingDock";
-import { InspectorPanel } from "../inspector/InspectorPanel";
 import { RecordingController } from "../../hooks/useRecording";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { CaptureSource, CameraDevice, AudioDevice, PermissionBundle } from "../../lib/types";
@@ -164,32 +163,26 @@ export const RecordScene: React.FC<RecordSceneProps> = ({
         </div>
       )}
 
-      {/* 2. Workspace: Canvas Preview + Customizer Panel */}
-      <div className="record-workspace-grid min-h-0 overflow-hidden relative">
-        {/* Center Canvas Stage with cleanly spaced Recording Dock */}
-        <div className="flex-1 flex flex-col items-center justify-between relative overflow-hidden bg-studio-950 p-4">
-          <div className="flex-1 w-full min-w-0 flex items-center justify-center min-h-0 overflow-hidden">
-            <CapturePreview sourceId={selectedSource?.id} cameraId={settings.cameraBubble.enabled && permissions.camera === "authorized" ? selectedCamera?.id : undefined} enabled={screenReady && sessionState !== "stopping"} aspectRatio={previewAspectRatio} />
-          </div>
-
-          {/* Cleanly docked Recording Action Bar below the canvas */}
-          <div className="pt-2 shrink-0 z-30">
-            <RecordingFloatingDock
-              sessionState={sessionState}
-              elapsedMs={elapsedMs}
-              canStart={canStart}
-              sessionOwned={sessionOwned}
-              disabledReason={disabledReason}
-              onStart={handleStart}
-              onPause={pauseRecording}
-              onResume={resumeRecording}
-              onStop={handleStop}
-            />
-          </div>
+      {/* 2. Workspace: Canvas Preview */}
+      <div className="flex-1 min-h-0 overflow-hidden relative bg-studio-950 p-4 flex flex-col items-center justify-between">
+        <div className="flex-1 w-full min-w-0 flex items-center justify-center min-h-0 overflow-hidden">
+          <CapturePreview sourceId={selectedSource?.id} cameraId={settings.cameraBubble.enabled && permissions.camera === "authorized" ? selectedCamera?.id : undefined} enabled={screenReady && sessionState !== "stopping"} aspectRatio={previewAspectRatio} />
         </div>
 
-        {/* Right Studio Customizer / Inspector */}
-        <InspectorPanel />
+        {/* Cleanly docked Recording Action Bar below the canvas */}
+        <div className="pt-2 shrink-0 z-30">
+          <RecordingFloatingDock
+            sessionState={sessionState}
+            elapsedMs={elapsedMs}
+            canStart={canStart}
+            sessionOwned={sessionOwned}
+            disabledReason={disabledReason}
+            onStart={handleStart}
+            onPause={pauseRecording}
+            onResume={resumeRecording}
+            onStop={handleStop}
+          />
+        </div>
       </div>
     </div>
   );
