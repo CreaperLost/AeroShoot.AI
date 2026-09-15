@@ -4,6 +4,7 @@ import { MouseTelemetryControl } from "../recording-hud/MouseTelemetryControl";
 import { DeviceControlDeck } from "../recording-hud/DeviceControlDeck";
 import { ProjectDestinationBar } from "../recording-hud/ProjectDestinationBar";
 import { RecordingQualityControl } from "../recording-hud/RecordingQualityControl";
+import { CountdownControl } from "../recording-hud/CountdownControl";
 import { CapturePreview } from "../canvas/CapturePreview";
 import { RecordingFloatingDock } from "../recording-hud/RecordingFloatingDock";
 import { CaptureHealthBar } from "../recording-hud/CaptureHealthBar";
@@ -57,6 +58,7 @@ export const RecordScene: React.FC<RecordSceneProps> = ({
     resumeRecording,
     stopRecording,
     captureHealth,
+    countdownEndsAt,
   } = recording;
 
   const selectedSource = sources.find((s) => s.id === settings.selectedSourceId);
@@ -187,6 +189,10 @@ export const RecordScene: React.FC<RecordSceneProps> = ({
             <ProjectDestinationBar disabled={isRecording || isPaused || isTransitioning} />
           </SidebarSection>
 
+          <SidebarSection title="Countdown">
+            <CountdownControl disabled={isRecording || isPaused || isTransitioning} />
+          </SidebarSection>
+
           <SidebarSection title="Mouse tracking">
             <MouseTelemetryControl disabled={isRecording || isPaused || isTransitioning} />
           </SidebarSection>
@@ -207,6 +213,7 @@ export const RecordScene: React.FC<RecordSceneProps> = ({
           <RecordingFloatingDock
             sessionState={sessionState}
             elapsedMs={elapsedMs}
+            countdownEndsAt={countdownEndsAt}
             canStart={canStart}
             sessionOwned={sessionOwned}
             disabledReason={disabledReason}

@@ -1,10 +1,14 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RecordingFloatingDock } from "./RecordingFloatingDock";
 
 const handlers = () => ({ onStart: vi.fn(), onPause: vi.fn(), onResume: vi.fn(), onStop: vi.fn() });
 
 describe("RecordingFloatingDock", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("disables Record and explains why when recording cannot start", () => {
     render(
       <RecordingFloatingDock
@@ -42,5 +46,29 @@ describe("RecordingFloatingDock", () => {
     render(<RecordingFloatingDock sessionState="error" elapsedMs={0} canStart={false} sessionOwned {...actions} />);
     fireEvent.click(screen.getByRole("button", { name: /retry stop/i }));
     expect(actions.onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts down on the Record button, then waits for capture to start", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    render(
+      <RecordingFloatingDock sessionState="preparing" elapsedMs={0} countdownEndsAt={12_500} canStart={false} {...handlers()} />,
+    );
+    expect(screen.getByRole("button", { name: /recording in 3/i })).toBeTruthy();
+    act(() => {
+      vi.advanceTimersByTime(1_600);
+    });
+    expect(screen.getByRole("button", { name: /recording in 1/i })).toBeTruthy();
+    act(() => {
+      vi.advanceTimersByTime(1_000);
+    });
+    expect(screen.getByRole("button", { name: /starting/i })).toBeTruthy();
+  });
+
+  it("shows that the recording is being saved after Stop", () => {
+    render(<RecordingFloatingDock sessionState="stopping" elapsedMs={5_000} canStart={false} sessionOwned {...handlers()} />);
+    const saving = screen.getByRole("button", { name: /saving recording/i }) as HTMLButtonElement;
+    expect(saving.disabled).toBe(true);
+    expect(screen.queryByRole("button", { name: /retry stop/i })).toBeNull();
   });
 });

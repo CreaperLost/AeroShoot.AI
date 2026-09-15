@@ -43,6 +43,8 @@ export function useRecording() {
   });
   const [sessionOwned, setSessionOwned] = useState(false);
   const [lastRecordingResult, setLastRecordingResult] = useState<StopRecordingResult | null>(null);
+  /** When the start countdown reaches zero (ms since epoch), while starting. */
+  const [countdownEndsAt, setCountdownEndsAt] = useState<number | null>(null);
 
   const settings = useSettingsStore();
 
@@ -168,6 +170,8 @@ export function useRecording() {
       setCaptureHealth((health) => ({ ...health, firstTerminalError: undefined }));
       setLastRecordingResult(null);
       setSessionState("preparing");
+      const startDelayMs = settings.countdownSeconds * 1000;
+      setCountdownEndsAt(startDelayMs > 0 ? Date.now() + startDelayMs : null);
       const projectName = settings.projectName.trim();
       const res = await api.startRecording({
         sourceId,
@@ -183,7 +187,9 @@ export function useRecording() {
         micGainDb: settings.selectedMicId ? settings.micGainDb : undefined,
         videoBitrateBps: settings.videoBitrateMbps * 1_000_000,
         captureMouse: settings.captureMouse,
+        startDelayMs,
       });
+      setCountdownEndsAt(null);
       setSessionState(res.state);
       setSessionOwned(true);
       setElapsedMs(0);
@@ -192,6 +198,7 @@ export function useRecording() {
       }
     } catch (err) {
       console.error("Failed to start recording:", err);
+      setCountdownEndsAt(null);
       setError(String(err));
       try {
         const status = await api.getSessionStatus();
@@ -267,6 +274,7 @@ export function useRecording() {
     captureHealth,
     sessionOwned,
     lastRecordingResult,
+    countdownEndsAt,
     dismissCompletedModal,
     startRecording,
     pauseRecording,

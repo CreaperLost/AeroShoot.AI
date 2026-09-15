@@ -330,6 +330,16 @@ pub fn run() {
                     let app = window.app_handle().clone();
                     std::thread::spawn(move || {
                         let state = app.state::<AppState>();
+                        // A start still in its countdown creates the session
+                        // when it ends; wait for it so that recording is
+                        // stopped and saved instead of left half-created.
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(20);
+                        while state.state_machine.current() == session::SessionState::Preparing
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
                         if state.active_session.read().is_some() {
                             if let Err(error) = commands::stop_recording_impl(&state) {
                                 eprintln!(

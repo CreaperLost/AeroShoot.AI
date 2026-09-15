@@ -522,6 +522,24 @@ pub(crate) fn install_callback_targets(
     });
 }
 
+/// Move the session clock used by native callbacks once recording has begun.
+pub(crate) fn set_callback_epoch(epoch: crate::session::SessionEpoch) {
+    if let Some(target) = RUNTIME_ERROR_TARGET
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_mut()
+    {
+        target.epoch = epoch.clone();
+    }
+    if let Some(target) = SEGMENT_TARGET
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_mut()
+    {
+        target.epoch = epoch;
+    }
+}
+
 /// Drain native publication writers before clearing callback targets.
 /// Sets `closed` first so a racing callback cannot recreate a throwaway writer.
 pub(crate) fn take_native_segment_writers() -> Vec<TrackSegmentWriter> {
@@ -726,11 +744,15 @@ pub struct NativeRecordingConfig<'a> {
     pub capture_mouse: bool,
     /// Hide the OS cursor from screen capture; the editor redraws it from telemetry.
     pub hide_cursor: bool,
+    /// Countdown before recording begins; every source warms up during it.
+    pub start_delay_ms: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct NativeCaptureStats {
+    /// Microseconds since native recording began; `None` during the countdown.
+    pub recording_started_ago_us: Option<u64>,
     pub dropped_frames: u64,
     pub audio_buffer_underflows: u64,
     pub timestamp_records_dropped: u64,
@@ -1039,10 +1061,12 @@ mod tests {
             video_bitrate_bps: None,
             capture_mouse: true,
             hide_cursor: false,
+            start_delay_ms: 3_000,
         };
         let json = serde_json::to_string(&cfg).expect("serialize config");
         // camelCase field that the Swift side decodes.
         assert!(json.contains("\"micGainDb\":6.0"), "json was: {json}");
+        assert!(json.contains("\"startDelayMs\":3000"), "json was: {json}");
         // The Swift decoder treats `None` as "field omitted", so when the
         // Rust caller doesn't pass a gain we should omit it entirely.
         let cfg_none = NativeRecordingConfig {

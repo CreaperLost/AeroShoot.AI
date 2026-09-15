@@ -460,6 +460,9 @@ private struct NativeConfig: Decodable {
   let videoBitrateBps: Int?
   let captureMouse: Bool?
   let hideCursor: Bool?
+  /// Countdown before the recording begins. Sources start immediately and
+  /// warm up while it runs; nothing captured before it ends is recorded.
+  let startDelayMs: Int?
 }
 
 private struct NativeRect: Decodable {
@@ -503,6 +506,8 @@ private struct StatsDTO: Encodable {
   let cameraLastSampleAgeMs: UInt64?
   let systemAudioLastSampleAgeMs: UInt64?
   let micLastSampleAgeMs: UInt64?
+  /// Microseconds since the recording began; omitted during the countdown.
+  var recordingStartedAgoUs: UInt64? = nil
 }
 
 // MARK: - Legacy C exports (preserved verbatim for back-compat with src-tauri/src/capture/macos.rs)
@@ -2138,6 +2143,88 @@ private final class PerTrackRecorder {
   func discardInFlight() { writer.discardCurrent() }
 }
 
+// MARK: - RecordingWindow
+//
+// Decides, on the host clock, which captured samples belong to the recording.
+// Sources start during the countdown and keep running through pauses; only
+// samples captured in [openedAt, closedAt) are written. Every track therefore
+// starts at the same instant and ends at the Pause or Stop click, however long
+// each device took to start or stop.
+
+private final class RecordingWindow {
+  private let lock = NSLock()
+  private var openedAt: CMTime?
+  private var closedAt: CMTime?
+  private var lastSampleTime: [String: CMTime] = [:]
+  private var lastArrival: [String: CFTimeInterval] = [:]
+
+  /// Notes that `source` delivered a sample captured at `hostTime`, and
+  /// returns whether that sample belongs to the recording.
+  func admit(_ source: String, hostTime: CMTime, arrivedAt: CFTimeInterval = CACurrentMediaTime()) -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    lastArrival[source] = arrivedAt
+    guard hostTime.isNumeric else { return false }
+    if lastSampleTime[source].map({ CMTimeCompare($0, hostTime) < 0 }) ?? true {
+      lastSampleTime[source] = hostTime
+    }
+    guard let openedAt, CMTimeCompare(hostTime, openedAt) >= 0 else { return false }
+    if let closedAt, CMTimeCompare(hostTime, closedAt) >= 0 { return false }
+    return true
+  }
+
+  var isOpen: Bool { lock.lock(); defer { lock.unlock() }; return openedAt != nil }
+
+  func hasDelivered(_ source: String) -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    return lastArrival[source] != nil
+  }
+
+  /// Admits samples captured at or after `time`.
+  func open(at time: CMTime) {
+    lock.lock(); defer { lock.unlock() }
+    openedAt = time
+    closedAt = nil
+  }
+
+  /// Stops admitting samples captured at or after `time` and returns the cut.
+  /// An earlier cut is kept; nil when the window is not open.
+  @discardableResult
+  func close(at time: CMTime) -> CMTime? {
+    lock.lock(); defer { lock.unlock() }
+    guard openedAt != nil else { return nil }
+    if let closedAt, CMTimeCompare(closedAt, time) <= 0 { return closedAt }
+    closedAt = time
+    return time
+  }
+
+  /// Admits nothing until the next `open`.
+  func seal() {
+    lock.lock(); defer { lock.unlock() }
+    openedAt = nil
+    closedAt = nil
+  }
+
+  /// Sources still delivering (a sample arrived within `activeWithin` seconds)
+  /// whose latest sample was captured before `cut`.
+  func sourcesBehind(_ cut: CMTime, now: CFTimeInterval = CACurrentMediaTime(), activeWithin: CFTimeInterval = 0.5) -> [String] {
+    lock.lock(); defer { lock.unlock() }
+    return lastSampleTime.compactMap { source, time -> String? in
+      guard let arrival = lastArrival[source], now - arrival <= activeWithin,
+        CMTimeCompare(time, cut) < 0 else { return nil }
+      return source
+    }.sorted()
+  }
+
+  /// Waits until each still-delivering source has handed over a sample
+  /// captured at or after `cut`, so media captured just before it is kept.
+  func waitForSources(reaching cut: CMTime, timeout: TimeInterval) {
+    let deadline = CACurrentMediaTime() + timeout
+    while !sourcesBehind(cut).isEmpty && CACurrentMediaTime() < deadline {
+      Thread.sleep(forTimeInterval: 0.005)
+    }
+  }
+}
+
 // MARK: - ActiveRecorder (Task 2/3/4/6)
 //
 // The new session-level recorder. Owns the SCStream / AVCaptureSession, fans
@@ -2166,8 +2253,14 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   private let stateLock = NSLock()
   private var stream: SCStream?
   private var cameraSession: AVCaptureSession?
-  private var paused = false
-  private let sessionHostEpoch: CMTime
+  /// Which captured samples are recorded (countdown, pauses, stop).
+  private let window = RecordingWindow()
+  /// Host time at which the recording began; set when the countdown ends.
+  private var sessionHostEpoch: CMTime
+  private var recordingStarted = false
+  /// Clocks stamping each source's samples, to place them on the host clock.
+  private var screenClock: CMClock?
+  private var captureClock: CMClock?
   private var screenTracker: PerTrackRecorder?
   private var systemTracker: PerTrackRecorder?
   private var cameraTracker: PerTrackRecorder?
@@ -2252,21 +2345,42 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
 
     installRuntimeObservers()
 
+    // Every source starts now and warms up during the countdown. The camera
+    // takes about 1.3 s to deliver its first frame; starting it alongside the
+    // screen stream hides that inside the countdown instead of cutting it from
+    // the start of the webcam and mic tracks.
+    let countdownEnds = CACurrentMediaTime() + Double(max(config.startDelayMs ?? 0, 0)) / 1000
+    let avCaptureStarted = DispatchGroup()
+    if config.cameraId != nil || config.micId != nil {
+      avCaptureStarted.enter()
+      DispatchQueue.global(qos: .userInitiated).async { [self] in
+        startActiveAVCapture()
+        avCaptureStarted.leave()
+      }
+    }
     if config.captureScreen || config.captureSystemAudio {
       do {
         try startScreen()
       } catch {
+        avCaptureStarted.wait()
+        cameraSession?.stopRunning()
         return encoderResultFailed(code: Int32((error as NSError).code), message: "screen/audio start failed: \(error.localizedDescription)")
       }
     }
-    if config.cameraId != nil || config.micId != nil {
-      startActiveAVCapture()
-    }
+    avCaptureStarted.wait()
+    waitForSourcesToStart(countdownEnds: countdownEnds)
+
+    // The recording begins now. Every track and the pointer log share this
+    // zero, and nothing captured before it is written.
+    let recordingStart = CMClockGetTime(CMClockGetHostTimeClock())
+    stateLock.lock(); sessionHostEpoch = recordingStart; recordingStarted = true; stateLock.unlock()
+    installClockCorrelations(epoch: recordingStart)
+    window.open(at: recordingStart)
 
     if config.captureScreen && (config.captureMouse ?? true) {
       stateLock.lock(); let hidden = cursorHidden; stateLock.unlock()
       let mouse = MouseHookMac(sourceID: config.sourceId, width: config.width, height: config.height,
-        epoch: sessionHostEpoch, offsetUs: config.sessionOffsetUs, cursorMode: hidden ? "replace" : "baked")
+        epoch: recordingStart, offsetUs: config.sessionOffsetUs, cursorMode: hidden ? "replace" : "baked")
       mouse.onTrackingLost = { [weak self] _ in self?.showCursorInVideo() }
       mouseHook = mouse
       mouse.start()
@@ -2274,6 +2388,46 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     startRotationTimer()
     LivePreviewRenderer.shared.setRecording(true)
     return encoderResultOK()
+  }
+
+  /// Waits for the countdown to end and for the screen, camera and mic to
+  /// deliver a first sample, so all of them are running when recording begins.
+  /// System audio is not awaited: ScreenCaptureKit sends no audio while the
+  /// system is silent. A source that never delivers holds the start back at
+  /// most 5 s past the countdown; Rust then reports it.
+  private func waitForSourcesToStart(countdownEnds: CFTimeInterval) {
+    let giveUp = countdownEnds + 5
+    while true {
+      let now = CACurrentMediaTime()
+      stateLock.lock(); let failed = appendFailure != nil; stateLock.unlock()
+      let ready = (screenTracker == nil || window.hasDelivered("screen"))
+        && (cameraTracker == nil || window.hasDelivered("webcam"))
+        && (micTracker == nil || window.hasDelivered("mic"))
+      if failed || now >= giveUp || (ready && now >= countdownEnds) { return }
+      Thread.sleep(forTimeInterval: 0.005)
+    }
+  }
+
+  /// Maps each source clock onto the session clock, whose zero is `epoch`.
+  private func installClockCorrelations(epoch: CMTime) {
+    guard let timestampLog else { return }
+    stateLock.lock(); let streamClock = screenClock; let avClock = captureClock; stateLock.unlock()
+    if let streamClock {
+      screenTracker?.setCorrelation(NativeClockCorrelation(sourceId: "screen", sourceClock: streamClock, sessionOffsetUs: config.sessionOffsetUs, sessionHostEpoch: epoch), journal: timestampLog)
+      systemTracker?.setCorrelation(NativeClockCorrelation(sourceId: "system", sourceClock: streamClock, sessionOffsetUs: config.sessionOffsetUs, sessionHostEpoch: epoch), journal: timestampLog)
+    }
+    if let avClock {
+      cameraTracker?.setCorrelation(NativeClockCorrelation(sourceId: "webcam", sourceClock: avClock, sessionOffsetUs: config.sessionOffsetUs, sessionHostEpoch: epoch), journal: timestampLog)
+      micTracker?.setCorrelation(NativeClockCorrelation(sourceId: "mic", sourceClock: avClock, sessionOffsetUs: config.sessionOffsetUs, sessionHostEpoch: epoch), journal: timestampLog)
+    }
+  }
+
+  /// The host-clock time at which `sample` was captured.
+  private static func hostTime(of sample: CMSampleBuffer, clock: CMClock?) -> CMTime {
+    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+    guard let clock, pts.isNumeric else { return pts }
+    let host = CMSyncConvertTime(pts, from: clock, to: CMClockGetHostTimeClock())
+    return host.isNumeric ? host : pts
   }
 
   // MARK: Runtime observers (Task 6)
@@ -2420,11 +2574,10 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     }
     if config.captureSystemAudio { try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: systemAudioQueue) }
 
-    guard let streamClock = stream.synchronizationClock, let timestampLog else {
+    guard let streamClock = stream.synchronizationClock, timestampLog != nil else {
       throw NSError(domain: "AeroShoot", code: 299, userInfo: [NSLocalizedDescriptionKey: "SCStream synchronization clock unavailable"])
     }
-    screenTracker?.setCorrelation(NativeClockCorrelation(sourceId: "screen", sourceClock: streamClock, sessionOffsetUs: config.sessionOffsetUs, sessionHostEpoch: sessionHostEpoch), journal: timestampLog)
-    systemTracker?.setCorrelation(NativeClockCorrelation(sourceId: "system", sourceClock: streamClock, sessionOffsetUs: config.sessionOffsetUs, sessionHostEpoch: sessionHostEpoch), journal: timestampLog)
+    stateLock.lock(); screenClock = streamClock; stateLock.unlock()
 
     // Task 6: treat the startCapture completion as required, with a 5s timeout
     // to surface hangs.
@@ -2524,19 +2677,15 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
       micTracker = nil
       return
     }
-    guard let captureClock = session.synchronizationClock, let timestampLog else {
+    guard let captureClock = session.synchronizationClock, timestampLog != nil else {
       invokeRuntimeErrorCallback(trackId: cameraReady ? "webcam" : "mic", code: 16, message: "AVCaptureSession synchronization clock unavailable; continuing without camera/mic")
       session.stopRunning()
       cameraTracker = nil
       micTracker = nil
       return
     }
-    if cameraReady {
-      cameraTracker?.setCorrelation(NativeClockCorrelation(sourceId: "webcam", sourceClock: captureClock, sessionOffsetUs: config.sessionOffsetUs, sessionHostEpoch: sessionHostEpoch), journal: timestampLog)
-    }
-    if micReady {
-      micTracker?.setCorrelation(NativeClockCorrelation(sourceId: "mic", sourceClock: captureClock, sessionOffsetUs: config.sessionOffsetUs, sessionHostEpoch: sessionHostEpoch), journal: timestampLog)
-    }
+    // Correlations are installed when the countdown ends and recording begins.
+    stateLock.lock(); self.captureClock = captureClock; stateLock.unlock()
     cameraSession = session
   }
 
@@ -2578,8 +2727,8 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   // MARK: SCStream delegate / output
 
   func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
-    stateLock.lock(); let shouldAppend = !paused; stateLock.unlock()
-    guard shouldAppend, sampleBuffer.isValid else { return }
+    guard sampleBuffer.isValid else { return }
+    stateLock.lock(); let clock = screenClock; stateLock.unlock()
     if outputType == .screen {
       let arrived = CACurrentMediaTime()
       let previous = lastScreenCallbackAt
@@ -2607,11 +2756,15 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
         return
       }
       guard let toAppend else { return }
-      stateLock.lock(); screenSamples &+= 1; screenLastSampleAt = CACurrentMediaTime(); stateLock.unlock()
+      // The preview stays live through the countdown and pauses; only samples
+      // inside the recording window are written.
       LivePreviewFrames.offer(toAppend, camera: false)
+      guard window.admit("screen", hostTime: Self.hostTime(of: toAppend, clock: clock)) else { return }
+      stateLock.lock(); screenSamples &+= 1; screenLastSampleAt = CACurrentMediaTime(); stateLock.unlock()
       let outcome = screenTracker?.append(toAppend, journal: timestampLog!) ?? .backpressured
       handleAppendOutcome(outcome, tracker: screenTracker, isAudio: false)
     } else if outputType == .audio {
+      guard window.admit("system", hostTime: Self.hostTime(of: sampleBuffer, clock: clock)) else { return }
       let peak = audioPeakDb(sampleBuffer)
       stateLock.lock(); systemAudioSamples &+= 1; systemAudioPeakDb = peak; systemAudioLastSampleAt = CACurrentMediaTime(); stateLock.unlock()
       let outcome = systemTracker?.append(sampleBuffer, journal: timestampLog!) ?? .backpressured
@@ -2628,8 +2781,8 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   // MARK: AVCapture output
 
   func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-    stateLock.lock(); let shouldAppend = !paused; stateLock.unlock()
-    guard shouldAppend, sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
+    guard sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
+    stateLock.lock(); let clock = captureClock; stateLock.unlock()
     if output is AVCaptureVideoDataOutput {
       let arrived = CACurrentMediaTime()
       let previous = lastCameraCallbackAt
@@ -2637,11 +2790,13 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
       defer { noteCaptureTiming(track: "webcam", arrivedAt: arrived, previous: previous) }
       guard CMSampleBufferGetImageBuffer(sampleBuffer) != nil else { return }
       let timed = copySampleWithDuration(sampleBuffer, duration: videoFrameDuration(fps: config.fps))
-      stateLock.lock(); cameraSamples &+= 1; cameraLastSampleAt = CACurrentMediaTime(); stateLock.unlock()
       LivePreviewFrames.offer(timed, camera: true)
+      guard window.admit("webcam", hostTime: Self.hostTime(of: timed, clock: clock)) else { return }
+      stateLock.lock(); cameraSamples &+= 1; cameraLastSampleAt = CACurrentMediaTime(); stateLock.unlock()
       let outcome = cameraTracker?.append(timed, journal: timestampLog!) ?? .backpressured
       handleAppendOutcome(outcome, tracker: cameraTracker, isAudio: false)
     } else {
+      guard window.admit("mic", hostTime: Self.hostTime(of: sampleBuffer, clock: clock)) else { return }
       let processed = applyMicGain(sampleBuffer, gainDb: config.micGainDb ?? 0)
       let peak = audioPeakDb(processed)
       stateLock.lock(); micSamples &+= 1; micPeakDb = peak; micLastSampleAt = CACurrentMediaTime(); stateLock.unlock()
@@ -2654,8 +2809,11 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   /// `delivery_gap`: the source delivered nothing for over 100 ms (upstream).
   /// `slow_callback`: this callback held its capture queue for over 50 ms.
   private func noteCaptureTiming(track: String, arrivedAt arrived: CFTimeInterval, previous: CFTimeInterval) {
+    // The countdown and pauses are not recorded, so their timing is not either.
+    guard window.isOpen else { return }
     let finished = CACurrentMediaTime()
-    let epochSeconds = CMTimeGetSeconds(sessionHostEpoch)
+    stateLock.lock(); let epoch = sessionHostEpoch; stateLock.unlock()
+    let epochSeconds = CMTimeGetSeconds(epoch)
     func sessionUs(_ hostSeconds: CFTimeInterval) -> Int64 {
       Int64(clamping: config.sessionOffsetUs) + Int64((hostSeconds - epochSeconds) * 1_000_000)
     }
@@ -2695,15 +2853,39 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   // clears the flag; the next sample opens a fresh writer.
 
   func setPaused(_ value: Bool) {
-    stateLock.lock(); paused = value; stateLock.unlock()
+    // Pause and resume cut at the click on the host clock, like Stop.
+    let now = CMClockGetTime(CMClockGetHostTimeClock())
+    if value { window.close(at: now) } else { window.open(at: now) }
     // A pause is not a delivery gap; restart arrival tracking on resume.
     lastScreenCallbackAt = 0
     lastCameraCallbackAt = 0
     mouseHook?.setPaused(value)
   }
 
+  /// Ends the recording window at `cut`. Sources hand over media a little after
+  /// capturing it, so first wait (briefly) for what they captured before the
+  /// cut, then admit nothing more until the next resume.
+  private func closeWindow(at cut: CMTime) {
+    if let cut = window.close(at: cut) {
+      window.waitForSources(reaching: cut, timeout: 0.5)
+    }
+    window.seal()
+  }
+
+  /// Microseconds since the recording began, or nil during the countdown.
+  private func recordingStartedAgoUs() -> UInt64? {
+    stateLock.lock(); let started = recordingStarted; let epoch = sessionHostEpoch; stateLock.unlock()
+    guard started else { return nil }
+    let seconds = CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), epoch))
+    return UInt64(max(0, seconds) * 1_000_000)
+  }
+
   func pauseAndFinalize() -> AeroShootEncoderResult {
-    setPaused(true)
+    let cut = CMClockGetTime(CMClockGetHostTimeClock())
+    mouseHook?.setPaused(true)
+    closeWindow(at: cut)
+    lastScreenCallbackAt = 0
+    lastCameraCallbackAt = 0
     screenQueue.sync {}
     systemAudioQueue.sync {}
     cameraQueue.sync {}
@@ -2729,24 +2911,45 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   // MARK: Stop (Task 3 typed outcomes)
 
   func stop() -> AeroShootEncoderResult {
-    LivePreviewRenderer.shared.setRecording(false)
-    // 1. Stop the SCStream (with a 10s timeout) and AVCaptureSession.
-    rotationTimer?.cancel(); rotationTimer = nil
-    rotationQueue.sync {}
-    NotificationCenter.default.removeObserver(self)
-    cameraSession?.stopRunning()
+    // The recording ends at the Stop click: pointer telemetry stops there, and
+    // media sources run just long enough to hand over what they captured
+    // before it (see closeWindow).
+    let cut = CMClockGetTime(CMClockGetHostTimeClock())
     var firstFailure: AeroShootEncoderResult?
     if let error = mouseHook?.stop() {
       firstFailure = encoderResultFailed(code: -700, message: error)
     }
     mouseHook = nil
+    closeWindow(at: cut)
+    LivePreviewRenderer.shared.setRecording(false)
+    // 1. Stop the SCStream and AVCaptureSession together (10 s timeout).
+    // Stopping the camera alone takes about 1.3 s; nothing is recorded after
+    // the cut, so stopping in parallel only shortens the wait.
+    rotationTimer?.cancel(); rotationTimer = nil
+    rotationQueue.sync {}
+    NotificationCenter.default.removeObserver(self)
+    let sourcesStopped = DispatchGroup()
+    let stopErrorLock = NSLock()
+    var streamStopError: Error?
+    if let session = cameraSession {
+      sourcesStopped.enter()
+      DispatchQueue.global(qos: .userInitiated).async {
+        session.stopRunning()
+        sourcesStopped.leave()
+      }
+    }
     if let stream = stream {
-      let semaphore = DispatchSemaphore(value: 0)
-      var stopError: Error?
-      stream.stopCapture { error in stopError = error; semaphore.signal() }
-      if semaphore.wait(timeout: .now() + 10) == .timedOut {
-        firstFailure = encoderResultTimeout(trackId: "screen")
-      } else if let stopError {
+      sourcesStopped.enter()
+      stream.stopCapture { error in
+        stopErrorLock.lock(); streamStopError = error; stopErrorLock.unlock()
+        sourcesStopped.leave()
+      }
+    }
+    if sourcesStopped.wait(timeout: .now() + 10) == .timedOut {
+      firstFailure = encoderResultTimeout(trackId: stream == nil ? "session" : "screen")
+    } else {
+      stopErrorLock.lock(); let stopError = streamStopError; stopErrorLock.unlock()
+      if let stopError {
         firstFailure = encoderResultFailed(code: Int32((stopError as NSError).code), message: "SCStream stop failed: \(stopError.localizedDescription)")
       }
     }
@@ -2807,7 +3010,8 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
       systemAudioSamples: sampleState.2, micSamples: sampleState.3,
       systemAudioPeakDb: sampleState.4, micPeakDb: sampleState.5,
       screenLastSampleAgeMs: sampleState.6, cameraLastSampleAgeMs: sampleState.7,
-      systemAudioLastSampleAgeMs: sampleState.8, micLastSampleAgeMs: sampleState.9)
+      systemAudioLastSampleAgeMs: sampleState.8, micLastSampleAgeMs: sampleState.9,
+      recordingStartedAgoUs: recordingStartedAgoUs())
   }
 }
 
@@ -3298,6 +3502,30 @@ enum RecordingWriterContracts {
     precondition(correlation.map(.positiveInfinity) == nil)
     precondition(correlation.map(boot) == nil, "backward device timestamps must not reach the writer")
     print("Clock mapping passed: startup zero rejected; synchronized PTS stays session-relative")
+
+    // The recording window: countdown samples are dropped, every source starts
+    // at the same instant, and a cut waits for media captured before it.
+    let window = RecordingWindow()
+    let at = { (ms: Int64) in CMTime(value: 10_000 + ms, timescale: 1_000) }
+    precondition(!window.admit("screen", hostTime: at(0), arrivedAt: 1.0), "countdown samples must not be recorded")
+    precondition(window.hasDelivered("screen") && !window.hasDelivered("webcam"), "readiness follows first delivery")
+    window.open(at: at(100))
+    precondition(!window.admit("webcam", hostTime: at(90), arrivedAt: 1.1), "frames captured before the start must not be recorded")
+    precondition(window.admit("webcam", hostTime: at(100), arrivedAt: 1.1), "the first frame at the start is recorded")
+    precondition(window.admit("mic", hostTime: at(120), arrivedAt: 1.12))
+    precondition(window.close(at: at(500)) == at(500))
+    precondition(window.close(at: at(900)) == at(500), "a later click must not extend an earlier cut")
+    precondition(window.admit("mic", hostTime: at(480), arrivedAt: 1.5), "media captured before Stop but delivered after it is kept")
+    precondition(!window.admit("screen", hostTime: at(500), arrivedAt: 1.5), "media captured at or after Stop is not recorded")
+    precondition(window.sourcesBehind(at(500), now: 1.55) == ["mic", "webcam"], "Stop waits for sources that have not reached the cut")
+    precondition(window.sourcesBehind(at(500), now: 1.7) == ["mic"], "a source that stopped delivering does not hold Stop back")
+    precondition(!window.admit("mic", hostTime: at(520), arrivedAt: 1.65))
+    precondition(window.sourcesBehind(at(500), now: 1.7).isEmpty, "every source reached the cut")
+    window.seal()
+    precondition(!window.isOpen && !window.admit("mic", hostTime: at(490), arrivedAt: 1.7), "a sealed window records nothing")
+    window.open(at: at(2_000))
+    precondition(window.admit("screen", hostTime: at(2_000), arrivedAt: 3.0), "resume records again from its click")
+    print("Recording window passed: tracks share the start, the cut keeps in-flight media and nothing after it")
   }
 }
 #endif

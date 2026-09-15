@@ -19,6 +19,19 @@ impl SessionEpoch {
         }
     }
 
+    /// An epoch that began `age` ago, such as a native recording that started
+    /// once its countdown ended.
+    pub fn started_ago(age: std::time::Duration) -> Self {
+        let now = Instant::now();
+        let start_instant = now.checked_sub(age).unwrap_or(now);
+        let age_us =
+            i64::try_from(now.duration_since(start_instant).as_micros()).unwrap_or(i64::MAX);
+        Self {
+            start_instant,
+            start_wall_time_us: chrono::Utc::now().timestamp_micros().saturating_sub(age_us),
+        }
+    }
+
     /// Calculates session-relative integer microseconds from an `Instant`.
     pub fn elapsed_us_at(&self, instant: Instant) -> u64 {
         if instant < self.start_instant {
@@ -211,6 +224,13 @@ mod tests {
     use super::*;
     use std::thread::sleep;
     use std::time::Duration;
+
+    #[test]
+    fn started_ago_counts_from_the_earlier_start() {
+        let epoch = SessionEpoch::started_ago(std::time::Duration::from_millis(250));
+        assert!(epoch.current_elapsed_us() >= 250_000);
+        assert!(epoch.start_wall_time_us() <= chrono::Utc::now().timestamp_micros() - 250_000);
+    }
 
     #[test]
     fn test_session_epoch_monotonicity() {

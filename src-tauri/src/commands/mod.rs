@@ -201,6 +201,10 @@ pub struct StartRecordingOptions {
     /// Log pointer motion and clicks beside the screen track. On by default.
     #[serde(default = "default_true")]
     pub capture_mouse: bool,
+    /// Countdown in milliseconds before recording begins (at most 10 s).
+    /// Every source starts at once and warms up during it.
+    #[serde(default)]
+    pub start_delay_ms: u32,
 }
 
 fn default_true() -> bool {
@@ -585,8 +589,13 @@ pub fn start_recording_impl(
     state.diagnostics.reset();
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let epoch = SessionEpoch::now();
-    let started_at_us = epoch.start_wall_time_us();
+    // The countdown includes the time spent preparing the project below.
+    const MAX_START_DELAY_MS: u32 = 10_000;
+    let recording_due = std::time::Instant::now()
+        + std::time::Duration::from_millis(options.start_delay_ms.min(MAX_START_DELAY_MS).into());
+    // Moved to the moment native capture begins recording, after the countdown.
+    let mut epoch = SessionEpoch::now();
+    let mut started_at_us = epoch.start_wall_time_us();
 
     let explicit_name = options
         .project_name
@@ -764,11 +773,18 @@ pub fn start_recording_impl(
                     destination_rect: geometry.dest_rect,
                     preserves_aspect_ratio: geometry.preserves_aspect_ratio,
                     project_path: bundle.root_path(),
-                    session_offset_us: epoch.current_elapsed_us(),
+                    // Native session time zero is when recording begins.
+                    session_offset_us: 0,
                     mic_gain_db: options.mic_gain_db,
                     video_bitrate_bps,
                     capture_mouse: options.capture_mouse,
                     hide_cursor,
+                    start_delay_ms: u32::try_from(
+                        recording_due
+                            .saturating_duration_since(std::time::Instant::now())
+                            .as_millis(),
+                    )
+                    .unwrap_or(u32::MAX),
                 },
             ) {
                 Ok(session) => {
@@ -805,6 +821,13 @@ pub fn start_recording_impl(
                             LIFECYCLE_PREPARE,
                             format!("Native capture did not become ready: {error}"),
                         ));
+                    }
+                    // Session time zero is when native capture began
+                    // recording, after the countdown: move the session clock there.
+                    if let Some(ago_us) = session.stats().recording_started_ago_us {
+                        epoch = SessionEpoch::started_ago(std::time::Duration::from_micros(ago_us));
+                        started_at_us = epoch.start_wall_time_us();
+                        crate::capture::macos::set_callback_epoch(epoch.clone());
                     }
                     native_session = Some(session);
                 }
@@ -1770,6 +1793,7 @@ mod tests {
             mic_gain_db: Some(-6.0),
             video_bitrate_bps: None,
             capture_mouse: true,
+            start_delay_ms: 0,
         };
 
         let json = serde_json::to_string(&opt).unwrap();
@@ -1781,6 +1805,7 @@ mod tests {
             mic_gain_db: None,
             video_bitrate_bps: None,
             capture_mouse: true,
+            start_delay_ms: 0,
             ..opt.clone()
         };
         let json_no_gain = serde_json::to_string(&opt_no_gain).unwrap();
@@ -1819,6 +1844,7 @@ mod tests {
             mic_gain_db: None,
             video_bitrate_bps: None,
             capture_mouse: true,
+            start_delay_ms: 0,
         };
 
         // First recording
@@ -1945,6 +1971,7 @@ mod tests {
                 mic_gain_db: None,
                 video_bitrate_bps: None,
                 capture_mouse: true,
+                start_delay_ms: 0,
             },
         )
         .unwrap();
@@ -1974,6 +2001,7 @@ mod tests {
                 mic_gain_db: None,
                 video_bitrate_bps: None,
                 capture_mouse: true,
+                start_delay_ms: 0,
             },
         );
         assert!(collision.unwrap_err().contains("already exists"));
@@ -1994,6 +2022,7 @@ mod tests {
                 mic_gain_db: None,
                 video_bitrate_bps: None,
                 capture_mouse: true,
+                start_delay_ms: 0,
             },
         )
         .unwrap();
@@ -2018,6 +2047,7 @@ mod tests {
                 mic_gain_db: None,
                 video_bitrate_bps: None,
                 capture_mouse: true,
+                start_delay_ms: 0,
             },
         )
         .unwrap();
@@ -2040,6 +2070,7 @@ mod tests {
                 mic_gain_db: None,
                 video_bitrate_bps: None,
                 capture_mouse: true,
+                start_delay_ms: 0,
             },
         );
         assert!(relative.unwrap_err().contains("absolute"));
@@ -2076,6 +2107,7 @@ mod tests {
                 mic_gain_db: Some(3.0),
                 video_bitrate_bps: None,
                 capture_mouse: true,
+                start_delay_ms: 0,
             },
         )
         .unwrap();
@@ -2127,6 +2159,7 @@ mod tests {
                 mic_gain_db: None,
                 video_bitrate_bps: None,
                 capture_mouse: true,
+                start_delay_ms: 0,
             },
         );
         assert!(result.unwrap_err().contains("at least one media source"));

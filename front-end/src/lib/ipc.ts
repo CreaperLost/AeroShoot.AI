@@ -483,6 +483,8 @@ export const api = {
     videoBitrateBps?: number;
     /** Log pointer motion and clicks; the backend defaults to true. */
     captureMouse?: boolean;
+    /** Countdown before recording begins; every source warms up during it. */
+    startDelayMs?: number;
   }) =>
     invokeTauri<{
       sessionId: string;

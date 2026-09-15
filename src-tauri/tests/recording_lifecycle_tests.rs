@@ -29,6 +29,7 @@ fn start_opts(camera: bool) -> StartRecordingOptions {
         mic_gain_db: None,
         video_bitrate_bps: None,
         capture_mouse: true,
+        start_delay_ms: 0,
     }
 }
 

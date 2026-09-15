@@ -7,7 +7,7 @@ import {
   resolutionSize,
 } from "../../lib/recordingQuality";
 
-function Segmented<T>({
+export function Segmented<T>({
   label,
   unit,
   options,

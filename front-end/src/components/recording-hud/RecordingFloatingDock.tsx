@@ -1,10 +1,12 @@
-import React from "react";
-import { Circle, Square, Pause, Play, AlertTriangle } from "lucide-react";
+import React, { useEffect, useState } from "react";
+import { Circle, Square, Pause, Play, AlertTriangle, Loader2 } from "lucide-react";
 import { SessionState } from "../../lib/types";
 
 interface RecordingFloatingDockProps {
   sessionState: SessionState;
   elapsedMs: number;
+  /** When the start countdown reaches zero (ms since epoch); null without one. */
+  countdownEndsAt?: number | null;
   canStart: boolean;
   sessionOwned?: boolean;
   disabledReason?: string;
@@ -14,9 +16,22 @@ interface RecordingFloatingDockProps {
   onStop: () => void;
 }
 
+/** Whole seconds left until `endsAt`, refreshed while a countdown runs. */
+function useSecondsUntil(endsAt: number | null): number | null {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (endsAt === null) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 100);
+    return () => window.clearInterval(timer);
+  }, [endsAt]);
+  return endsAt === null ? null : Math.max(0, Math.ceil((endsAt - now) / 1000));
+}
+
 export const RecordingFloatingDock: React.FC<RecordingFloatingDockProps> = ({
   sessionState,
   elapsedMs,
+  countdownEndsAt = null,
   canStart,
   sessionOwned = false,
   disabledReason,
@@ -27,9 +42,12 @@ export const RecordingFloatingDock: React.FC<RecordingFloatingDockProps> = ({
 }) => {
   const isRecording = sessionState === "recording";
   const isPaused = sessionState === "paused";
-  const isTransitioning = sessionState === "preparing" || sessionState === "stopping";
-  const showRecoveryStop =
-    sessionOwned && (sessionState === "error" || sessionState === "stopping");
+  const isStarting = sessionState === "preparing";
+  const isStopping = sessionState === "stopping";
+  const isTransitioning = isStarting || isStopping;
+  const showRecoveryStop = sessionOwned && sessionState === "error";
+  const countdown = useSecondsUntil(isStarting ? countdownEndsAt : null);
+  const counting = countdown !== null && countdown > 0;
 
   const formatElapsed = (ms: number) => {
     const totalSecs = Math.floor(ms / 1000);
@@ -67,27 +85,41 @@ export const RecordingFloatingDock: React.FC<RecordingFloatingDockProps> = ({
         </div>
 
         {/* Main Trigger Button */}
-        {showRecoveryStop ? (
+        {isStopping ? (
+          <button
+            type="button"
+            disabled
+            className="flex flex-1 items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-studio-800 border border-studio-700 text-studio-200 text-sm font-semibold"
+            title="Finishing the recording files"
+          >
+            <Loader2 className="w-4 h-4 animate-spin" />
+            <span>Saving recording…</span>
+          </button>
+        ) : showRecoveryStop ? (
           <button
             type="button"
             onClick={onStop}
-            disabled={sessionState === "stopping"}
-            className="flex flex-1 items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-rose-700/80 to-rose-600 hover:from-rose-600 hover:to-rose-500 disabled:opacity-50 border border-rose-500/50 text-white text-sm font-semibold transition-colors shadow-lg shadow-rose-950/50"
+            className="flex flex-1 items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-rose-700/80 to-rose-600 hover:from-rose-600 hover:to-rose-500 border border-rose-500/50 text-white text-sm font-semibold transition-colors shadow-lg shadow-rose-950/50"
             title="Retry stop and keep the recoverable project"
           >
             <Square className="w-3.5 h-3.5 fill-white" />
-            <span>{sessionState === "stopping" ? "Stopping..." : "Retry Stop"}</span>
+            <span>Retry Stop</span>
           </button>
         ) : !isRecording && !isPaused ? (
           <button
             type="button"
             onClick={onStart}
             disabled={!canStart || isTransitioning}
-            title={disabledReason || "Start Recording Session"}
+            title={isStarting ? "Starting capture" : disabledReason || "Start Recording Session"}
+            aria-live={isStarting ? "polite" : undefined}
             className="flex flex-1 items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-rose-600 to-rose-500 hover:from-rose-500 hover:to-rose-400 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-semibold shadow-xl shadow-rose-900/40 transition-colors active:scale-[0.98]"
           >
-            <Circle className="w-4 h-4 fill-white" />
-            <span>{isTransitioning ? "Preparing..." : "Record"}</span>
+            {isStarting && !counting ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Circle className="w-4 h-4 fill-white" />
+            )}
+            <span>{isStarting ? (counting ? `Recording in ${countdown}…` : "Starting…") : "Record"}</span>
           </button>
         ) : (
           <>
@@ -128,7 +160,7 @@ export const RecordingFloatingDock: React.FC<RecordingFloatingDockProps> = ({
         )}
       </div>
 
-      {!showRecoveryStop && !isRecording && !isPaused && !canStart && disabledReason && (
+      {!showRecoveryStop && !isRecording && !isPaused && !isTransitioning && !canStart && disabledReason && (
         <div
           className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-amber-950/40 border border-amber-800/40 text-[11px] text-amber-300"
           title={disabledReason}

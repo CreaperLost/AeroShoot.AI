@@ -33,6 +33,8 @@ interface SettingsStore {
   micGainDb: number;
   /** Log pointer motion and clicks during screen recordings. On by default. */
   captureMouse: boolean;
+  /** Seconds of countdown before recording begins: 0 (off), 3 or 5. */
+  countdownSeconds: number;
 
   setProjectName: (name: string) => void;
   setProjectDir: (dir: string | null) => void;
@@ -46,6 +48,7 @@ interface SettingsStore {
   setVideoBitrateMbps: (mbps: number) => void;
   setMicGainDb: (gainDb: number) => void;
   setCaptureMouse: (enabled: boolean) => void;
+  setCountdownSeconds: (seconds: number) => void;
   updateCameraBubble: (settings: Partial<CameraBubbleSettings>) => void;
   updateCanvas: (settings: Partial<CanvasSettings>) => void;
   hydrateLayout: (layout: EditLayout) => void;
@@ -76,6 +79,28 @@ function saveCaptureMouse(enabled: boolean) {
   }
 }
 
+export const COUNTDOWN_SECONDS = [0, 3, 5] as const;
+const COUNTDOWN_KEY = "aeroshoot.countdownSeconds";
+const DEFAULT_COUNTDOWN_SECONDS = 3;
+
+export function loadCountdownSeconds(): number {
+  try {
+    const stored = localStorage.getItem(COUNTDOWN_KEY);
+    const seconds = stored === null ? Number.NaN : Number(stored);
+    return (COUNTDOWN_SECONDS as readonly number[]).includes(seconds) ? seconds : DEFAULT_COUNTDOWN_SECONDS;
+  } catch {
+    return DEFAULT_COUNTDOWN_SECONDS;
+  }
+}
+
+function saveCountdownSeconds(seconds: number) {
+  try {
+    localStorage.setItem(COUNTDOWN_KEY, String(seconds));
+  } catch {
+    // Storage can be unavailable; the choice still applies for this session.
+  }
+}
+
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
   selectedSourceId: null,
   availableSourceFallbackId: null,
@@ -92,6 +117,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   layoutOwnedByProject: false,
   micGainDb: 0,
   captureMouse: loadCaptureMouse(),
+  countdownSeconds: loadCountdownSeconds(),
 
   setProjectName: (projectName) => set({ projectName }),
   setProjectDir: (projectDir) => set({ projectDir }),
@@ -144,6 +170,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setCaptureMouse: (captureMouse) => {
     set({ captureMouse });
     saveCaptureMouse(captureMouse);
+  },
+  setCountdownSeconds: (countdownSeconds) => {
+    set({ countdownSeconds });
+    saveCountdownSeconds(countdownSeconds);
   },
   updateCameraBubble: (settings) =>
     set((state) => ({ cameraBubble: { ...state.cameraBubble, ...settings } })),
