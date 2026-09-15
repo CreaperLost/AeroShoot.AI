@@ -5,6 +5,26 @@ import { useSettingsStore } from "../stores/settingsStore";
 
 export type RecordingController = ReturnType<typeof useRecording>;
 
+export interface CaptureHealth {
+  screenSamples: number;
+  cameraSamples: number;
+  systemAudioSamples: number;
+  micSamples: number;
+  systemAudioPeakDb?: number;
+  micPeakDb?: number;
+  droppedFrames: number;
+  audioBufferUnderflows: number;
+  screenLastSampleAgeMs?: number;
+  cameraLastSampleAgeMs?: number;
+  systemAudioLastSampleAgeMs?: number;
+  micLastSampleAgeMs?: number;
+  screenSegments: number;
+  cameraSegments: number;
+  systemAudioSegments: number;
+  micSegments: number;
+  firstTerminalError?: { trackId: string; errorCode: number; message: string };
+}
+
 function sessionOwnsProject(state: SessionState, projectPath?: string): boolean {
   if (state === "recording" || state === "paused" || state === "preparing" || state === "stopping") {
     return true;
@@ -16,7 +36,11 @@ export function useRecording() {
   const [sessionState, setSessionState] = useState<SessionState>("idle");
   const [error, setError] = useState<string>();
   const [elapsedMs, setElapsedMs] = useState(0);
-  const [droppedFrames] = useState(0);
+  const [captureHealth, setCaptureHealth] = useState<CaptureHealth>({
+    screenSamples: 0, cameraSamples: 0, systemAudioSamples: 0, micSamples: 0,
+    droppedFrames: 0, audioBufferUnderflows: 0,
+    screenSegments: 0, cameraSegments: 0, systemAudioSegments: 0, micSegments: 0,
+  });
   const [sessionOwned, setSessionOwned] = useState(false);
   const [lastRecordingResult, setLastRecordingResult] = useState<StopRecordingResult | null>(null);
 
@@ -27,12 +51,54 @@ export function useRecording() {
       state: SessionState;
       elapsedUs: number;
       projectPath?: string;
-      lastRuntimeError?: { message: string };
+      lastRuntimeError?: { trackId: string; errorCode: number; message: string; recoverable: boolean };
+      firstTerminalError?: { trackId: string; errorCode: number; message: string; recoverable: boolean };
+      screenSamples: number;
+      cameraSamples: number;
+      systemAudioSamples: number;
+      micSamples: number;
+      systemAudioPeakDb?: number;
+      micPeakDb?: number;
+      droppedFrames: number;
+      audioBufferUnderflows: number;
+      screenLastSampleAgeMs?: number;
+      cameraLastSampleAgeMs?: number;
+      systemAudioLastSampleAgeMs?: number;
+      micLastSampleAgeMs?: number;
+      screenSegments: number;
+      cameraSegments: number;
+      systemAudioSegments: number;
+      micSegments: number;
     }) => {
       const next = status.state === "completed" ? "idle" : status.state;
       setSessionState(next);
       setElapsedMs(status.elapsedUs / 1000);
       setSessionOwned(sessionOwnsProject(status.state, status.projectPath));
+      // Rust serializes absent Option fields as `null`; normalize to undefined
+      // so components can rely on the declared `number | undefined` types.
+      setCaptureHealth((previous) => ({
+        screenSamples: status.screenSamples, cameraSamples: status.cameraSamples,
+        systemAudioSamples: status.systemAudioSamples, micSamples: status.micSamples,
+        systemAudioPeakDb: status.systemAudioPeakDb ?? undefined, micPeakDb: status.micPeakDb ?? undefined,
+        droppedFrames: status.droppedFrames, audioBufferUnderflows: status.audioBufferUnderflows,
+        screenLastSampleAgeMs: status.screenLastSampleAgeMs ?? undefined,
+        cameraLastSampleAgeMs: status.cameraLastSampleAgeMs ?? undefined,
+        systemAudioLastSampleAgeMs: status.systemAudioLastSampleAgeMs ?? undefined,
+        micLastSampleAgeMs: status.micLastSampleAgeMs ?? undefined,
+        screenSegments: status.screenSegments,
+        cameraSegments: status.cameraSegments,
+        systemAudioSegments: status.systemAudioSegments,
+        micSegments: status.micSegments,
+        firstTerminalError: previous.firstTerminalError ?? (
+          status.firstTerminalError
+            ? {
+                trackId: status.firstTerminalError.trackId,
+                errorCode: status.firstTerminalError.errorCode,
+                message: status.firstTerminalError.message,
+              }
+            : undefined
+        ),
+      }));
       if (status.lastRuntimeError) setError(status.lastRuntimeError.message);
     },
     [],
@@ -89,19 +155,23 @@ export function useRecording() {
   }, [sessionState, applyStatus]);
 
   const startRecording = useCallback(async () => {
-    const sourceId = settings.selectedSourceId;
-    if (!settings.selectionsReady || !sourceId) {
-      console.warn("Cannot start recording before capture source enumeration is ready");
+    const sourceId = settings.selectedSourceId ?? settings.availableSourceFallbackId;
+    const captureScreen = Boolean(settings.selectedSourceId);
+    const hasMedia = captureScreen || (settings.cameraBubble.enabled && Boolean(settings.selectedCameraId)) || Boolean(settings.selectedMicId) || settings.captureSystemAudio;
+    if (!settings.selectionsReady || !sourceId || !hasMedia) {
+      console.warn("Cannot start recording before source selection is ready or with every source off");
       return;
     }
 
     try {
       setError(undefined);
+      setCaptureHealth((health) => ({ ...health, firstTerminalError: undefined }));
       setLastRecordingResult(null);
       setSessionState("preparing");
       const projectName = settings.projectName.trim();
       const res = await api.startRecording({
         sourceId,
+        captureScreen,
         cameraId: settings.cameraBubble.enabled ? settings.selectedCameraId : undefined,
         micId: settings.selectedMicId,
         captureSystemAudio: settings.captureSystemAudio,
@@ -111,6 +181,8 @@ export function useRecording() {
         projectName: projectName || undefined,
         projectDir: settings.projectDir || undefined,
         micGainDb: settings.selectedMicId ? settings.micGainDb : undefined,
+        videoBitrateBps: settings.videoBitrateMbps * 1_000_000,
+        captureMouse: settings.captureMouse,
       });
       setSessionState(res.state);
       setSessionOwned(true);
@@ -191,7 +263,8 @@ export function useRecording() {
     error,
     sessionState,
     elapsedMs,
-    droppedFrames,
+    droppedFrames: captureHealth.droppedFrames,
+    captureHealth,
     sessionOwned,
     lastRecordingResult,
     dismissCompletedModal,

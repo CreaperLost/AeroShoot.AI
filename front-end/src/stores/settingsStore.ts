@@ -12,6 +12,7 @@ import {
   cameraFromLayout,
 } from "../lib/types";
 import { api } from "../lib/ipc";
+import { loadRecordingQuality, Resolution, saveRecordingQuality } from "../lib/recordingQuality";
 
 // The studio and camera HUD share a revisioned native settings owner.
 let hudUpdateQueue: Promise<void> = Promise.resolve();
@@ -46,11 +47,14 @@ function queueHudPatch(patch: Partial<CameraBubbleSettings>) {
 
 interface SettingsStore {
   selectedSourceId: string | null;
+  availableSourceFallbackId: string | null;
   selectedCameraId: string | null;
   selectedMicId: string | null;
   captureSystemAudio: boolean;
   fps: number;
-  resolution: "1080p" | "4K";
+  resolution: Resolution;
+  /** Screen video bitrate in Mbps (10, 20 or 30). */
+  videoBitrateMbps: number;
   cameraBubble: CameraBubbleSettings;
   canvas: CanvasSettings;
   selectionsReady: boolean;
@@ -65,6 +69,8 @@ interface SettingsStore {
   /// Microphone gain in decibels applied to the mic track on the native
   /// side AND shown live on the HUD waveform. Clamped to ±24 dB; 0 = unity.
   micGainDb: number;
+  /** Log pointer motion and clicks during screen recordings. On by default. */
+  captureMouse: boolean;
 
   setProjectName: (name: string) => void;
   setProjectDir: (dir: string | null) => void;
@@ -74,8 +80,10 @@ interface SettingsStore {
   setSelectedMicId: (id: string | null) => void;
   setCaptureSystemAudio: (enabled: boolean) => void;
   setFps: (fps: number) => void;
-  setResolution: (res: "1080p" | "4K") => void;
+  setResolution: (res: Resolution) => void;
+  setVideoBitrateMbps: (mbps: number) => void;
   setMicGainDb: (gainDb: number) => void;
+  setCaptureMouse: (enabled: boolean) => void;
   updateCameraBubble: (settings: Partial<CameraBubbleSettings>) => void;
   updateCanvas: (settings: Partial<CanvasSettings>) => void;
   hydrateLayout: (layout: EditLayout) => void;
@@ -87,13 +95,35 @@ interface SettingsStore {
   ) => void;
 }
 
+const initialQuality = loadRecordingQuality();
+
+const CAPTURE_MOUSE_KEY = "aeroshoot.captureMouse";
+
+function loadCaptureMouse(): boolean {
+  try {
+    return localStorage.getItem(CAPTURE_MOUSE_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function saveCaptureMouse(enabled: boolean) {
+  try {
+    localStorage.setItem(CAPTURE_MOUSE_KEY, String(enabled));
+  } catch {
+    // Storage can be unavailable; the choice still applies for this session.
+  }
+}
+
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
   selectedSourceId: null,
+  availableSourceFallbackId: null,
   selectedCameraId: null,
   selectedMicId: null,
   captureSystemAudio: true,
-  fps: 30,
-  resolution: "1080p",
+  fps: initialQuality.fps,
+  resolution: initialQuality.resolution,
+  videoBitrateMbps: initialQuality.videoBitrateMbps,
   selectionsReady: false,
   projectName: "",
   projectDir: null,
@@ -104,6 +134,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   knownCameras: [],
   layoutOwnedByProject: false,
   micGainDb: 0,
+  captureMouse: loadCaptureMouse(),
 
   setProjectName: (projectName) => set({ projectName }),
   setProjectDir: (projectDir) => set({ projectDir }),
@@ -144,11 +175,25 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
   setSelectedMicId: (id) => set({ selectedMicId: id }),
   setCaptureSystemAudio: (enabled) => set({ captureSystemAudio: enabled }),
-  setFps: (fps) => set({ fps }),
-  setResolution: (resolution) => set({ resolution }),
+  setFps: (fps) => {
+    set({ fps });
+    saveRecordingQuality(get());
+  },
+  setResolution: (resolution) => {
+    set({ resolution });
+    saveRecordingQuality(get());
+  },
+  setVideoBitrateMbps: (videoBitrateMbps) => {
+    set({ videoBitrateMbps });
+    saveRecordingQuality(get());
+  },
   setMicGainDb: (micGainDb) => {
     const clamped = Math.max(-24, Math.min(24, micGainDb));
     set({ micGainDb: clamped });
+  },
+  setCaptureMouse: (captureMouse) => {
+    set({ captureMouse });
+    saveCaptureMouse(captureMouse);
   },
   updateCameraBubble: (settings) => {
     set((state) => ({ cameraBubble: { ...state.cameraBubble, ...settings } }));
@@ -210,7 +255,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     const nextSourceId =
       state.selectedSourceId && sourceIds.has(state.selectedSourceId)
         ? state.selectedSourceId
-        : safeSources.find((s) => s.sourceType === "display")?.id ?? safeSources[0]?.id ?? null;
+        : state.selectionsReady && state.selectedSourceId === null
+          ? null
+          : safeSources.find((s) => s.sourceType === "display")?.id ?? safeSources[0]?.id ?? null;
 
     const nextCameraId =
       state.selectedCameraId && cameraIds.has(state.selectedCameraId)
@@ -220,10 +267,13 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     const nextMicId =
       state.selectedMicId && micIds.has(state.selectedMicId)
         ? state.selectedMicId
-        : safeMics.find((m) => m.isDefault)?.id ?? safeMics[0]?.id ?? null;
+        : state.selectionsReady && state.selectedMicId === null
+          ? null
+          : safeMics.find((m) => m.isDefault)?.id ?? safeMics[0]?.id ?? null;
 
     set({
       selectedSourceId: nextSourceId,
+      availableSourceFallbackId: safeSources.find((s) => s.sourceType === "display")?.id ?? safeSources[0]?.id ?? null,
       selectedCameraId: nextCameraId,
       selectedMicId: nextMicId,
       knownCameras: safeCameras.map((camera) => ({ id: camera.id, name: camera.name })),

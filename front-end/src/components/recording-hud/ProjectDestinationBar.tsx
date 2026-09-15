@@ -67,7 +67,7 @@ export const ProjectDestinationBar: React.FC<ProjectDestinationBarProps> = ({ di
   const locationLabel = projectDir ? shortenPath(projectDir) : "Documents/AeroShootRec";
 
   return (
-    <div className="project-destination-grid w-full bg-studio-900/70 border-b border-studio-800/80 px-5 py-2 text-xs z-20">
+    <div className="flex w-full flex-col gap-2 text-xs">
       <label className="flex items-center gap-2 min-w-0 flex-1">
         <span className="uppercase font-semibold tracking-wider text-studio-400 shrink-0">Project</span>
         <input

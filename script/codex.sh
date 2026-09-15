@@ -14,8 +14,8 @@ Commands:
   setup    Install the frontend dependencies from package-lock.json
   start    Start the Vite development server in the foreground
   stop     Stop this project's Vite server listening on port 1420
-  build    Build the production release of the application
-  install  Build and install the application to /Applications with stable code signing
+  build    Build the signed production application (pass --dmg to also create a DMG)
+  install  Rebuild, verify, and replace /Applications/AeroShoot.app
 USAGE
 }
 

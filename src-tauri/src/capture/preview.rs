@@ -7,11 +7,17 @@
 extern "C" {
     fn aeroshoot_live_preview_start(
         source: *const std::ffi::c_char,
+        capture_screen: bool,
+        capture_system_audio: bool,
         camera: *const std::ffi::c_char,
+        mic: *const std::ffi::c_char,
+        mic_gain_db: f64,
     ) -> *mut std::ffi::c_char;
     fn aeroshoot_live_preview_stop();
     fn aeroshoot_live_preview_read(bytes: *mut std::ffi::c_void, length: i32) -> i32;
     fn aeroshoot_live_preview_read_camera(bytes: *mut std::ffi::c_void, length: i32) -> i32;
+    fn aeroshoot_live_preview_copy_levels_json() -> *mut std::ffi::c_char;
+    fn aeroshoot_macos_free_string(value: *mut std::ffi::c_char);
 }
 
 pub const PREVIEW_WIDTH: usize = 1280;
@@ -76,7 +82,14 @@ pub fn stop() {
     }
 }
 
-pub fn start(source: &str, camera: Option<&str>) -> Result<(), String> {
+pub fn start(
+    source: &str,
+    capture_screen: bool,
+    capture_system_audio: bool,
+    camera: Option<&str>,
+    mic: Option<&str>,
+    mic_gain_db: f64,
+) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     unsafe {
         let source = std::ffi::CString::new(source).map_err(|_| "Invalid source ID")?;
@@ -84,9 +97,17 @@ pub fn start(source: &str, camera: Option<&str>) -> Result<(), String> {
             .map(std::ffi::CString::new)
             .transpose()
             .map_err(|_| "Invalid camera ID")?;
+        let mic = mic
+            .map(std::ffi::CString::new)
+            .transpose()
+            .map_err(|_| "Invalid microphone ID")?;
         let error = aeroshoot_live_preview_start(
             source.as_ptr(),
+            capture_screen,
+            capture_system_audio,
             camera.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+            mic.as_ref().map_or(std::ptr::null(), |m| m.as_ptr()),
+            mic_gain_db.clamp(-24.0, 24.0),
         );
         if !error.is_null() {
             let message = std::ffi::CStr::from_ptr(error)
@@ -99,9 +120,40 @@ pub fn start(source: &str, camera: Option<&str>) -> Result<(), String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (source, camera);
+        let _ = (
+            source,
+            capture_screen,
+            capture_system_audio,
+            camera,
+            mic,
+            mic_gain_db,
+        );
         Err("Native capture preview is unavailable on this platform".into())
     }
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PreviewAudioLevels {
+    pub system_audio_peak_db: Option<f64>,
+    pub mic_peak_db: Option<f64>,
+}
+
+pub fn audio_levels() -> PreviewAudioLevels {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let pointer = aeroshoot_live_preview_copy_levels_json();
+        if pointer.is_null() {
+            return PreviewAudioLevels::default();
+        }
+        let json = std::ffi::CStr::from_ptr(pointer)
+            .to_string_lossy()
+            .into_owned();
+        aeroshoot_macos_free_string(pointer);
+        serde_json::from_str(&json).unwrap_or_default()
+    }
+    #[cfg(not(target_os = "macos"))]
+    PreviewAudioLevels::default()
 }
 
 /// Latest composited (screen + camera-bubble) mailbox frame from the live
@@ -109,7 +161,8 @@ pub fn start(source: &str, camera: Option<&str>) -> Result<(), String> {
 pub fn frame() -> Option<LiveFrame> {
     let mut data = vec![0u8; PREVIEW_BYTES];
     #[cfg(target_os = "macos")]
-    let flags_raw = unsafe { aeroshoot_live_preview_read(data.as_mut_ptr().cast(), data.len() as i32) };
+    let flags_raw =
+        unsafe { aeroshoot_live_preview_read(data.as_mut_ptr().cast(), data.len() as i32) };
     #[cfg(not(target_os = "macos"))]
     let flags_raw = 0;
     let flags = LivePreviewFlags(flags_raw.max(0) as u32);
@@ -125,9 +178,8 @@ pub fn frame() -> Option<LiveFrame> {
 pub fn camera_frame() -> Option<LiveFrame> {
     let mut data = vec![0u8; PREVIEW_BYTES];
     #[cfg(target_os = "macos")]
-    let flags_raw = unsafe {
-        aeroshoot_live_preview_read_camera(data.as_mut_ptr().cast(), data.len() as i32)
-    };
+    let flags_raw =
+        unsafe { aeroshoot_live_preview_read_camera(data.as_mut_ptr().cast(), data.len() as i32) };
     #[cfg(not(target_os = "macos"))]
     let flags_raw = 0;
     let flags = LivePreviewFlags(flags_raw.max(0) as u32);

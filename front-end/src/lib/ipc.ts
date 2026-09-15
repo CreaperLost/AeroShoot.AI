@@ -532,35 +532,29 @@ async function emulateCommand<T>(cmd: string, args?: Record<string, unknown>): P
 // Exported high-level IPC functions
 export const api = {
   listCaptureSources: async (): Promise<CaptureSource[]> => {
-    try {
-      if (isTauriEnvironment()) {
+    if (isTauriEnvironment()) {
+      try {
         const sources = await invokeTauri<CaptureSource[]>("list_capture_sources");
-        if (Array.isArray(sources)) {
-          // Keep strictly physical displays, filter out any mock or window sources
-          const realDisplays = sources.filter((s) => s.sourceType === "display");
-          if (realDisplays.length > 0) {
-            return realDisplays;
-          }
-        }
+        return Array.isArray(sources) ? sources : [];
+      } catch (err) {
+        console.warn("[IPC] native source enumeration failed:", err);
+        throw new Error(`Native source enumeration failed: ${String(err)}`);
       }
-    } catch (err) {
-      console.warn("[IPC] listCaptureSources native call failed:", err);
     }
     return getRealDisplays();
   },
   listDevices: async (): Promise<{ cameras: CameraDevice[]; mics: AudioDevice[] }> => {
-    try {
-      if (isTauriEnvironment()) {
+    if (isTauriEnvironment()) {
+      try {
         const devices = await invokeTauri<{ cameras: CameraDevice[]; mics: AudioDevice[] }>("list_devices");
-        if (devices) {
-          return {
-            cameras: Array.isArray(devices.cameras) ? devices.cameras : [],
-            mics: Array.isArray(devices.mics) ? devices.mics : [],
-          };
-        }
+        return {
+          cameras: Array.isArray(devices?.cameras) ? devices.cameras : [],
+          mics: Array.isArray(devices?.mics) ? devices.mics : [],
+        };
+      } catch (err) {
+        console.warn("[IPC] native device enumeration failed:", err);
+        throw new Error(`Native camera/microphone enumeration failed: ${String(err)}`);
       }
-    } catch (err) {
-      console.warn("[IPC] listDevices native call failed, querying browser:", err);
     }
     return getBrowserDevices();
   },
@@ -607,6 +601,7 @@ export const api = {
     // The native bridge requires a concrete source identifier (for example
     // `display:<CGDirectDisplayID>` on macOS), never a synthetic/null value.
     sourceId: string;
+    captureScreen: boolean;
     cameraId?: string | null;
     micId?: string | null;
     captureSystemAudio: boolean;
@@ -618,6 +613,10 @@ export const api = {
     /** Microphone gain in decibels applied to the captured mic track.
      *  Omit / `undefined` when no mic is selected. */
     micGainDb?: number;
+    /** Screen video bitrate in bits per second; omit for automatic. */
+    videoBitrateBps?: number;
+    /** Log pointer motion and clicks; the backend defaults to true. */
+    captureMouse?: boolean;
   }) =>
     invokeTauri<{
       sessionId: string;
@@ -636,11 +635,27 @@ export const api = {
       audioBufferUnderflows: number;
       gapsTotal: number;
       timestampRecordsDropped: number;
-      lastRuntimeError?: { message: string };
+      lastRuntimeError?: { trackId: string; errorCode: number; message: string; recoverable: boolean };
+      firstTerminalError?: { trackId: string; errorCode: number; message: string; recoverable: boolean };
       projectPath?: string;
+      screenSamples: number;
+      cameraSamples: number;
+      systemAudioSamples: number;
+      micSamples: number;
+      systemAudioPeakDb?: number;
+      micPeakDb?: number;
+      screenLastSampleAgeMs?: number;
+      cameraLastSampleAgeMs?: number;
+      systemAudioLastSampleAgeMs?: number;
+      micLastSampleAgeMs?: number;
+      screenSegments: number;
+      cameraSegments: number;
+      systemAudioSegments: number;
+      micSegments: number;
     }>("get_session_status"),
-  capturePreviewConfigure: (enabled: boolean, sourceId?: string, cameraId?: string) =>
-    invokeTauri<void>("capture_preview_configure", { enabled, sourceId: sourceId ?? null, cameraId: cameraId ?? null }),
+  capturePreviewConfigure: (enabled: boolean, sourceId?: string, cameraId?: string, captureScreen = true, captureSystemAudio = false, micId?: string, micGainDb = 0) =>
+    invokeTauri<void>("capture_preview_configure", { enabled, sourceId: sourceId ?? null, cameraId: cameraId ?? null, micId: micId ?? null, micGainDb, captureScreen, captureSystemAudio }),
+  capturePreviewAudioLevels: () => invokeTauri<{ systemAudioPeakDb?: number; micPeakDb?: number }>("capture_preview_audio_levels"),
   windowIdentity: () => invokeTauri<WindowIdentity>("window_identity"),
   hudSnapshot: () => invokeTauri<HudSnapshot>("hud_snapshot"),
   hudUpdate: (expectedRevision: number, patch: HudSettingsPatch) =>

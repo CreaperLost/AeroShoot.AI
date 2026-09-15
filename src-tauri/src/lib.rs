@@ -67,6 +67,10 @@ async fn capture_preview_configure(
     enabled: bool,
     source_id: Option<String>,
     camera_id: Option<String>,
+    mic_id: Option<String>,
+    mic_gain_db: Option<f64>,
+    capture_screen: Option<bool>,
+    capture_system_audio: Option<bool>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -89,7 +93,11 @@ async fn capture_preview_configure(
         }
         let started = capture::preview::start(
             source_id.as_deref().ok_or("Select a screen source")?,
+            capture_screen.unwrap_or(true),
+            capture_system_audio.unwrap_or(false),
             camera_id.as_deref(),
+            mic_id.as_deref(),
+            mic_gain_db.unwrap_or(0.0),
         );
         if started.is_err() {
             state
@@ -100,6 +108,12 @@ async fn capture_preview_configure(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[cfg(feature = "tauri-app")]
+#[tauri::command]
+fn capture_preview_audio_levels() -> capture::preview::PreviewAudioLevels {
+    capture::preview::audio_levels()
 }
 
 #[cfg(feature = "tauri-app")]
@@ -154,14 +168,24 @@ async fn start_recording(
 
 #[cfg(feature = "tauri-app")]
 #[tauri::command]
-fn pause_recording(state: State<'_, AppState>) -> Result<commands::SessionStateResult, String> {
-    commands::pause_recording_impl(&state)
+async fn pause_recording(app: tauri::AppHandle) -> Result<commands::SessionStateResult, String> {
+    // Sync commands run on the main thread; the lifecycle lock can be held for
+    // seconds by start/stop, so wait for it on a worker instead.
+    tauri::async_runtime::spawn_blocking(move || {
+        commands::pause_recording_impl(&app.state::<AppState>())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(feature = "tauri-app")]
 #[tauri::command]
-fn resume_recording(state: State<'_, AppState>) -> Result<commands::SessionStateResult, String> {
-    commands::resume_recording_impl(&state)
+async fn resume_recording(app: tauri::AppHandle) -> Result<commands::SessionStateResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        commands::resume_recording_impl(&app.state::<AppState>())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(feature = "tauri-app")]
@@ -223,9 +247,9 @@ async fn request_capture_permissions(
 fn mouse_telemetry_permission(request: bool) -> crate::telemetry::native::MouseTelemetryPermission {
     #[cfg(target_os = "macos")]
     {
-        crate::telemetry::native::MouseTelemetryPermission::macos(
-            capture::macos::mouse_permission(request),
-        )
+        crate::telemetry::native::MouseTelemetryPermission::macos(capture::macos::mouse_permission(
+            request,
+        ))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -448,29 +472,44 @@ pub fn run() {
             capture::preview_pump::spawn(app.handle().clone());
             Ok(())
         })
-        .on_window_event(|window, event| {
-            match event {
-                tauri::WindowEvent::CloseRequested { api, .. }
-                    if window.label() == hud::HUD_WINDOW_LABEL =>
-                {
-                    api.prevent_close();
-                    let snapshot = commands::hud_set_visible_impl(&window.state::<AppState>(), false);
-                    if let Ok(snapshot) = snapshot {
-                        let _ = window.hide();
-                        emit_hud(window.app_handle(), &snapshot);
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
+                // Closing the recorder quits the app. Otherwise the hidden HUD
+                // window keeps the process alive with nothing to reopen.
+                // Finalize an active recording first so its project is complete.
+                api.prevent_close();
+                let app = window.app_handle().clone();
+                std::thread::spawn(move || {
+                    let state = app.state::<AppState>();
+                    if state.active_session.read().is_some() {
+                        if let Err(error) = commands::stop_recording_impl(&state) {
+                            eprintln!("[AeroShoot] Stopping the recording before quit failed: {error}");
+                        }
                     }
-                }
-                tauri::WindowEvent::Destroyed if window.label() == hud::HUD_WINDOW_LABEL => {
-                    let _ = commands::hud_close_impl(&window.state::<AppState>());
-                }
-                _ => {}
+                    app.exit(0);
+                });
             }
+            tauri::WindowEvent::CloseRequested { api, .. }
+                if window.label() == hud::HUD_WINDOW_LABEL =>
+            {
+                api.prevent_close();
+                let snapshot = commands::hud_set_visible_impl(&window.state::<AppState>(), false);
+                if let Ok(snapshot) = snapshot {
+                    let _ = window.hide();
+                    emit_hud(window.app_handle(), &snapshot);
+                }
+            }
+            tauri::WindowEvent::Destroyed if window.label() == hud::HUD_WINDOW_LABEL => {
+                let _ = commands::hud_close_impl(&window.state::<AppState>());
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             list_capture_sources,
             list_devices,
             compute_source_geometry,
             capture_preview_configure,
+            capture_preview_audio_levels,
             start_recording,
             pause_recording,
             resume_recording,
@@ -501,5 +540,20 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building aero shoot tauri application")
-        .run(|_app, _event| {});
+        .run(|app, event| {
+            // Clicking the Dock icon with no visible window brings the recorder back.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } = event
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }

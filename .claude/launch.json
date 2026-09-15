@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "front-end",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "front-end", "run", "dev"],
+      "port": 1420
+    }
+  ]
+}

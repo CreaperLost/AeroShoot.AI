@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback } from "react";
-import { TopNavBar } from "./components/navigation/TopNavBar";
 import { RecordScene } from "./components/scenes/RecordScene";
 import { RecordingCompletedModal } from "./components/recording-hud/RecordingCompletedModal";
+import { SceneErrorBoundary } from "./components/SceneErrorBoundary";
 import { useSettingsStore } from "./stores/settingsStore";
 import { useWindowTitle } from "./hooks/useWindowTitle";
 import { useHudSettings } from "./hooks/useHudSettings";
@@ -32,6 +32,7 @@ export const App: React.FC = () => {
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
   const [mics, setMics] = useState<AudioDevice[]>([]);
   const [permissions, setPermissions] = useState<PermissionBundle>(ZERO_PERMISSIONS);
+  const [enumerationError, setEnumerationError] = useState<string>();
 
   const refreshPermissions = useCallback(
     async (
@@ -68,6 +69,11 @@ export const App: React.FC = () => {
         devicesRes.status === "fulfilled"
           ? devicesRes.value
           : { cameras: [], mics: [] };
+
+      const failures: string[] = [];
+      if (sourcesRes.status === "rejected") failures.push(String(sourcesRes.reason));
+      if (devicesRes.status === "rejected") failures.push(String(devicesRes.reason));
+      setEnumerationError(failures.length > 0 ? failures.join(" · ") : undefined);
 
       setSources(loadedSources);
       setCameras(loadedDevices.cameras);
@@ -134,29 +140,22 @@ export const App: React.FC = () => {
     void api.hudSetVisible(false).catch(() => undefined);
   }, []);
 
-  const handleOpenPrivacySettings = () => {
-    void api.openSystemPrivacySettings("ScreenCapture");
-  };
-
   return (
     <div data-ui-root="studio" className="flex flex-col h-screen w-screen overflow-hidden bg-studio-950 text-studio-100 select-none">
-      {/* 1. Recorder Top Bar */}
-      <TopNavBar
-        permissions={permissions}
-        onOpenSettings={handleOpenPrivacySettings}
-        sessionState={recording.sessionState}
-      />
-
-      {/* 2. Main Recording Scene Workspace */}
+      {/* Main Recording Scene Workspace */}
       <main className="flex-1 flex overflow-hidden relative">
-        <RecordScene
-          sources={sources}
-          cameras={cameras}
-          mics={mics}
-          permissions={permissions}
-          refreshPermissions={refreshPermissions}
-          recording={recording}
-        />
+        <SceneErrorBoundary>
+          <RecordScene
+            sources={sources}
+            cameras={cameras}
+            mics={mics}
+            permissions={permissions}
+            enumerationError={enumerationError}
+            refreshPermissions={refreshPermissions}
+            recording={recording}
+            previewHidden={Boolean(recording.lastRecordingResult)}
+          />
+        </SceneErrorBoundary>
       </main>
 
       {/* 3. Recording Complete Modal */}

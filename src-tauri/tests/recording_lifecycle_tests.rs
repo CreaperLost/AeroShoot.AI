@@ -1,9 +1,9 @@
+#[cfg(target_os = "macos")]
+use aeroshoot_lib::commands::NativeCaptureOutcome;
 use aeroshoot_lib::commands::{
     get_session_status_impl, pause_recording_impl, resume_recording_impl, start_recording_impl,
     stop_recording_impl, AppState, StartRecordingOptions,
 };
-#[cfg(target_os = "macos")]
-use aeroshoot_lib::commands::NativeCaptureOutcome;
 use aeroshoot_lib::fixtures::generate_valid_fmp4_segment;
 use aeroshoot_lib::project::{
     DurabilityFault, JournalRecord, ProjectBundle, ProjectJournal, RecoveryEngine,
@@ -17,6 +17,7 @@ use tempfile::tempdir;
 fn start_opts(camera: bool) -> StartRecordingOptions {
     StartRecordingOptions {
         source_id: "screen-main".into(),
+        capture_screen: true,
         camera_id: camera.then(|| "cam-1".into()),
         mic_id: None,
         capture_system_audio: false,
@@ -26,6 +27,8 @@ fn start_opts(camera: bool) -> StartRecordingOptions {
         project_name: Some("H1 Lifecycle".into()),
         project_dir: None,
         mic_gain_db: None,
+        video_bitrate_bps: None,
+        capture_mouse: true,
     }
 }
 
@@ -152,7 +155,12 @@ fn pause_started_journal_failure_keeps_unacked_native_pause() {
     assert!(err.contains("PauseStarted"));
     assert_eq!(state.state_machine.current(), SessionState::Recording);
     assert!(
-        state.active_session.read().as_ref().unwrap().native_pause_unacked,
+        state
+            .active_session
+            .read()
+            .as_ref()
+            .unwrap()
+            .native_pause_unacked,
         "native pause must stay unacked until PauseStarted is journaled"
     );
 
@@ -165,7 +173,14 @@ fn pause_started_journal_failure_keeps_unacked_native_pause() {
 
     let paused = pause_recording_impl(&state).unwrap();
     assert_eq!(paused.state, SessionState::Paused);
-    assert!(!state.active_session.read().as_ref().unwrap().native_pause_unacked);
+    assert!(
+        !state
+            .active_session
+            .read()
+            .as_ref()
+            .unwrap()
+            .native_pause_unacked
+    );
 }
 
 #[test]
@@ -303,8 +318,8 @@ fn injected_sync_failure_preserves_sources_and_prior_commits() {
 #[test]
 fn forced_termination_after_commit_preserves_prior_journal() {
     let dir = tempdir().unwrap();
-    let bundle = ProjectBundle::create_new(dir.path(), "kill-after-commit", "Kill After Commit")
-        .unwrap();
+    let bundle =
+        ProjectBundle::create_new(dir.path(), "kill-after-commit", "Kill After Commit").unwrap();
     let root = bundle.root_path().to_path_buf();
     let journal = ProjectJournal::open_or_create(&root).unwrap();
     let mut writer =
@@ -328,7 +343,10 @@ fn forced_termination_after_commit_preserves_prior_journal() {
         .read_all()
         .unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(fs::read(root.join(&committed.relative_path)).unwrap(), prior);
+    assert_eq!(
+        fs::read(root.join(&committed.relative_path)).unwrap(),
+        prior
+    );
 
     let report = RecoveryEngine::scan_and_recover(&root).unwrap();
     assert!(report.track_reports["screen"].valid_segments >= 1);
@@ -341,8 +359,7 @@ fn forced_termination_after_commit_preserves_prior_journal() {
 #[test]
 fn pause_boundaries_and_late_track_preserve_source_time() {
     let dir = tempdir().unwrap();
-    let bundle =
-        ProjectBundle::create_new(dir.path(), "late-track", "Late Track").unwrap();
+    let bundle = ProjectBundle::create_new(dir.path(), "late-track", "Late Track").unwrap();
     let root = bundle.root_path().to_path_buf();
     fs::create_dir_all(root.join("media/screen")).unwrap();
     fs::create_dir_all(root.join("media/webcam")).unwrap();
@@ -491,7 +508,8 @@ fn native_missing_screen_media_is_retained_on_retry() {
     assert_eq!(state.state_machine.current(), SessionState::Error);
     assert!(state.active_session.read().is_some());
 
-    let second = stop_recording_impl(&state).expect_err("retry must keep the missing-media outcome");
+    let second =
+        stop_recording_impl(&state).expect_err("retry must keep the missing-media outcome");
     assert!(second.contains("No screen media"), "unexpected: {second}");
     assert_eq!(state.state_machine.current(), SessionState::Error);
     assert!(state.last_stop_result.read().is_none());
@@ -517,10 +535,7 @@ fn native_prepare_failure_stop_does_not_complete() {
     }
 
     let first = stop_recording_impl(&state).expect_err("prepare failure is not a successful Stop");
-    assert!(
-        first.contains("never started"),
-        "unexpected: {first}"
-    );
+    assert!(first.contains("never started"), "unexpected: {first}");
     assert_eq!(state.state_machine.current(), SessionState::Error);
     assert!(state.last_stop_result.read().is_none());
 

@@ -6,6 +6,8 @@
 > Current baseline: Completed two-scene studio frontend with dedicated Record Scene & Edit Studio Scene, physical hardware device deck (zero mock devices, real displays, mics with VU meter, webcams with hotplug), responsive aspect-ratio canvas (16:9, 9:16, 4:3, 1:1), and full-height multi-track timeline studio; shared Rust recording foundations (session, journal, segment writer, recovery); and in-progress macOS ScreenCaptureKit/AVFoundation capture bridge.
 > Core Framework: Tauri v2 (Rust) + React / TypeScript / Vite + Native OS Capture Modules
 > **Start here when implementing:** [Section 10 — Agent Execution Guide](#10-agent-execution-guide) provides the current task selection rule, actual file map, ordered work packages, and acceptance examples. Read it together with the subsystem requirements; it does not waive native qualification gates.
+>
+> **Current recording recovery work:** [`ACTIVE_RECORDING_WORK.md`](ACTIVE_RECORDING_WORK.md) is the maintained short list of observed defects, priorities, and qualification gates. Use it for day-to-day sequencing; this document remains the architectural target.
 
 ---
 

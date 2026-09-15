@@ -299,14 +299,20 @@ func previewPresentBgra(
     else {
       return 5
     }
+    // Tag frames with the window's display color space and no alpha. The
+    // previous ITU-R 709 premultiplied tag made Core Animation color-convert and
+    // unpremultiply every 1280x720 frame on the main thread (the app's dominant
+    // idle CPU cost). This affects only the preview, never recorded media.
+    let space = surface.view.window?.colorSpace?.cgColorSpace
+      ?? CGColorSpace(name: CGColorSpace.sRGB)!
     guard let image = CGImage(
       width: Int(width),
       height: Int(height),
       bitsPerComponent: 8,
       bitsPerPixel: 32,
       bytesPerRow: bytesPerRow,
-      space: CGColorSpace(name: CGColorSpace.itur_709)!,
-      bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)
+      space: space,
+      bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)
         .union(.byteOrder32Little),
       provider: provider,
       decode: nil,

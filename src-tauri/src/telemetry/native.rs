@@ -331,7 +331,10 @@ mod tests {
         assert!(denied.get("camera").is_none());
         assert!(denied.get("microphone").is_none());
         let unsupported = serde_json::to_value(MouseTelemetryPermission::unsupported()).unwrap();
-        assert_eq!(unsupported, json!({"supported": false, "authorized": false}));
+        assert_eq!(
+            unsupported,
+            json!({"supported": false, "authorized": false})
+        );
     }
 
     #[test]
@@ -383,7 +386,8 @@ mod tests {
         replace["cursor_mode"] = json!("replace");
         assert!(logger.append(&replace.to_string()).is_err());
         logger.append(&geometry().to_string()).unwrap();
-        let geo_text = std::fs::read_to_string(dir.path().join("telemetry/geometry.jsonl")).unwrap();
+        let geo_text =
+            std::fs::read_to_string(dir.path().join("telemetry/geometry.jsonl")).unwrap();
         assert!(geo_text.contains("\"sampling_interval_us\":100000"));
         assert!(geo_text.contains("\"cursor_mode\":\"baked\""));
     }

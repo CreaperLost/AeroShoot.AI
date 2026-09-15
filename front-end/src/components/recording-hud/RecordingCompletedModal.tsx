@@ -25,7 +25,7 @@ export const RecordingCompletedModal: React.FC<RecordingCompletedModalProps> = (
   result,
   onDismiss,
 }) => {
-  const { selectedCameraId, selectedMicId, captureSystemAudio } = useSettingsStore();
+  const { selectedSourceId, selectedCameraId, selectedMicId, captureSystemAudio, captureMouse } = useSettingsStore();
 
   const handleShowInFinder = () => {
     if (result.projectPath) {
@@ -126,14 +126,16 @@ export const RecordingCompletedModal: React.FC<RecordingCompletedModalProps> = (
               </div>
             )}
 
-            {/* Mouse Telemetry */}
-            <div className="flex items-center justify-between px-3 py-2 rounded-lg bg-studio-950/50 border border-studio-800/80">
-              <div className="flex items-center gap-2 text-studio-200">
-                <MousePointer className="w-4 h-4 text-teal-400" />
-                <span className="font-medium">Mouse Telemetry (Moves & Clicks)</span>
+            {/* Mouse Telemetry (only written for screen recordings with tracking on) */}
+            {captureMouse && selectedSourceId && (
+              <div className="flex items-center justify-between px-3 py-2 rounded-lg bg-studio-950/50 border border-studio-800/80">
+                <div className="flex items-center gap-2 text-studio-200">
+                  <MousePointer className="w-4 h-4 text-teal-400" />
+                  <span className="font-medium">Mouse Telemetry (Moves & Clicks)</span>
+                </div>
+                <span className="font-mono text-studio-400 text-[11px]">telemetry/events.jsonl</span>
               </div>
-              <span className="font-mono text-studio-400 text-[11px]">telemetry/events.jsonl</span>
-            </div>
+            )}
           </div>
         </div>
 

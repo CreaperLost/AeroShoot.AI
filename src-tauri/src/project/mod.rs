@@ -4,6 +4,7 @@ pub mod lock;
 pub mod manifest;
 pub mod media_validator;
 pub mod pcm;
+pub mod qualification;
 pub mod reader;
 pub mod recovery;
 pub mod revision;
@@ -14,8 +15,13 @@ pub use layout::EditLayout;
 pub use lock::{LockError, ProjectLock};
 pub use manifest::{ManifestError, PauseInterval, ProjectManifest, TrackDescriptor, TrackType};
 pub use media_validator::{MediaValidationError, MediaValidationInfo, MediaValidator};
+pub use qualification::{
+    build_capture_qualification_report, save_capture_qualification_report,
+    CaptureQualificationReport, MouseQualificationReport, QualificationFailure,
+    QualificationRuntimeError, QualificationTrackReport,
+};
 pub use recovery::{ProjectRecoveryReport, RecoveryEngine, RecoveryError, TrackRecoveryReport};
-pub use revision::{save_edit_document, EditDocument, RetainedInterval};
+pub use revision::{load_edit_document, save_edit_document, EditDocument, RetainedInterval};
 pub use segment_writer::{
     DurabilityFault, SegmentCommitResult, SegmentWriterError, TrackSegmentWriter,
 };

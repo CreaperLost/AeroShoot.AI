@@ -623,7 +623,15 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(stream.events.iter().find(|event| !matches!(event.kind, CanonicalKind::Gap { .. })).unwrap().version, 1);
+        assert_eq!(
+            stream
+                .events
+                .iter()
+                .find(|event| !matches!(event.kind, CanonicalKind::Gap { .. }))
+                .unwrap()
+                .version,
+            1
+        );
         assert!(stream
             .events
             .iter()
@@ -692,10 +700,7 @@ mod tests {
             .unwrap()
             .contains("application"));
         assert!(stream.geometries["disp"].supported);
-        assert_eq!(
-            stream.geometries["disp"].sampling_interval_us,
-            100_000
-        );
+        assert_eq!(stream.geometries["disp"].sampling_interval_us, 100_000);
         assert_eq!(stream.events.len(), 4);
         assert!(matches!(
             &stream.events[1].kind,

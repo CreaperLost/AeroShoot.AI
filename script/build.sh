@@ -6,7 +6,7 @@
 #   1. Sets up PATH and verifies required toolchains (Node, Cargo, Swift)
 #   2. Removes previous frontend/Rust/bundle artifacts so the release is not stale
 #   3. Installs frontend dependencies (if needed) & builds the Vite production bundle
-#   4. Builds the optimized Rust/Swift native desktop release and packages the macOS .app
+#   4. Builds the optimized Rust/Swift native desktop release and assembles the macOS .app
 # ==============================================================================
 
 set -euo pipefail
@@ -109,12 +109,10 @@ clean_previous_artifacts() {
   echo "==> [1/4] Cleaning previous build artifacts..."
 
   local removed=0
-  local cargo_target="${CARGO_TARGET_DIR:-$TAURI_DIR/target}"
   local paths=(
     "$FRONTEND_DIR/dist"
     "$FRONTEND_DIR/node_modules/.vite"
-    "$ROOT_DIR/target"
-    "$cargo_target"
+    "$TAURI_DIR/target/release/bundle/macos/AeroShoot.app"
     "$DMG_STAGING_DIR"
   )
 
@@ -190,40 +188,16 @@ build_desktop_release() {
   echo "==> [3/4] Compiling and packaging desktop application..."
   cd "$ROOT_DIR"
 
-  local tauri_build_success=0
-
-  # Attempt 1: Try cargo tauri build
-  if command -v cargo-tauri >/dev/null 2>&1 || cargo tauri --version >/dev/null 2>&1; then
-    echo "    Building with cargo-tauri..."
-    if cargo tauri build --bundles app --features tauri-app "$@"; then
-      tauri_build_success=1
-    fi
-  fi
-
-  # Attempt 2: Try npx @tauri-apps/cli build
-  if [[ "$tauri_build_success" -eq 0 ]] && command -v npx >/dev/null 2>&1; then
-    echo "    Building with npx @tauri-apps/cli..."
-    if npx --yes @tauri-apps/cli build --bundles app --features tauri-app "$@"; then
-      tauri_build_success=1
-    fi
-  fi
-
-  # Fallback: Direct cargo build --release + bundle assembly
-  if [[ "$tauri_build_success" -eq 0 ]]; then
-    echo "    Tauri CLI unavailable or exited non-zero; falling back to direct cargo release build..."
-    cargo build --release --manifest-path "$TAURI_DIR/Cargo.toml" --features tauri-app,custom-protocol "$@"
-
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-      assemble_macos_app_bundle
-    fi
-  fi
+  # The repository does not pin a Tauri CLI dependency. Building through a
+  # global cargo-tauri or network-installed npx package made identical source
+  # trees take different paths. Cargo + the checked-in bundle assembly is the
+  # single supported production path.
+  cargo build --release --manifest-path "$TAURI_DIR/Cargo.toml" --features tauri-app,custom-protocol "$@"
 
   if [[ "$(uname -s)" == "Darwin" ]]; then
+    assemble_macos_app_bundle
     local app_dir="$TAURI_DIR/target/release/bundle/macos/AeroShoot.app"
-    if [[ -d "$app_dir" ]]; then
-      sign_macos_app_bundle "$app_dir"
-      package_signed_dmg "$app_dir"
-    fi
+    sign_macos_app_bundle "$app_dir"
   fi
 }
 
@@ -319,15 +293,24 @@ sign_macos_app_bundle() {
 
   echo "==> [Signing] Code-signing macOS application bundle with stable Designated Requirement..."
 
-  local signing_identity=""
-  if command -v security >/dev/null 2>&1; then
-    signing_identity="$(security find-identity -v -p codesigning 2>/dev/null | grep -E "Developer ID Application|Apple Development" | head -n 1 | awk -F'"' '{print $2}' || true)"
+  # A certificate identity keeps the designated requirement stable across
+  # rebuilds, so macOS privacy grants (Screen Recording, Camera, Microphone,
+  # Input Monitoring) survive reinstalls. Ad-hoc signatures can lose them.
+  local signing_identity="${AEROSHOOT_SIGN_IDENTITY:-}"
+  if [[ -z "$signing_identity" ]] && command -v security >/dev/null 2>&1; then
+    signing_identity="$(security find-identity -v -p codesigning 2>/dev/null | grep -E "Developer ID Application|Apple Development|AeroShoot Development" | head -n 1 | awk -F'"' '{print $2}' || true)"
   fi
 
   if [[ -n "$signing_identity" ]]; then
     echo "    Using Keychain signing identity: $signing_identity"
+    # Hardened runtime is required only for notarized Developer ID builds; without
+    # camera/microphone entitlements it would block those devices in local builds.
+    local runtime_flags=()
+    if [[ "$signing_identity" == Developer\ ID\ Application* ]]; then
+      runtime_flags=(--options runtime)
+    fi
     codesign --force --deep --sign "$signing_identity" \
-      --options runtime \
+      ${runtime_flags[@]+"${runtime_flags[@]}"} \
       --identifier "ai.aeroshoot.studio" \
       "$app_dir"
   else
@@ -346,6 +329,7 @@ sign_macos_app_bundle() {
 install_macos_app() {
   local src_app="$TAURI_DIR/target/release/bundle/macos/AeroShoot.app"
   local dest_app="/Applications/AeroShoot.app"
+  local staged_app="/Applications/.AeroShoot.install.$$"
   if [[ ! -d "$src_app" ]]; then
     echo "Error: Built app bundle not found at $src_app" >&2
     return 1
@@ -354,14 +338,23 @@ install_macos_app() {
   echo "==> [Install] Installing AeroShoot to $dest_app..."
   pkill -x "AeroShoot" 2>/dev/null || pkill -x "aeroshoot" 2>/dev/null || true
 
+  rm -rf "$staged_app"
+  if ! ditto "$src_app" "$staged_app"; then
+    echo "Error: cannot stage the application in /Applications. Check directory permissions." >&2
+    return 1
+  fi
+  if ! codesign --verify --deep --strict "$staged_app"; then
+    rm -rf "$staged_app"
+    echo "Error: staged application failed signature verification." >&2
+    return 1
+  fi
   rm -rf "$dest_app"
-  cp -R "$src_app" "$dest_app"
-
-  sign_macos_app_bundle "$dest_app"
-  echo "==> [Install] Successfully installed and signed $dest_app"
+  mv "$staged_app" "$dest_app"
+  echo "==> [Install] Successfully installed verified app at $dest_app"
 }
 
 report_artifacts() {
+  local include_dmg="${1:-0}"
   echo "==> [4/4] Build completed successfully!"
   echo ""
   echo "Artifacts produced:"
@@ -374,7 +367,7 @@ report_artifacts() {
   if [[ -d "$mac_app" ]]; then
     echo "  • macOS Application: $mac_app"
   fi
-  if [[ -n "$mac_dmg" && -f "$mac_dmg" ]]; then
+  if [[ "$include_dmg" -eq 1 && -n "$mac_dmg" && -f "$mac_dmg" ]]; then
     echo "  • macOS DMG Installer: $mac_dmg"
   fi
   if [[ -f "$release_bin" ]]; then
@@ -393,11 +386,14 @@ report_artifacts() {
 
 main() {
   local do_install=0
+  local do_dmg=0
   local build_args=()
 
   for arg in "$@"; do
     if [[ "$arg" == "--install" || "$arg" == "-i" ]]; then
       do_install=1
+    elif [[ "$arg" == "--dmg" ]]; then
+      do_dmg=1
     else
       build_args+=("$arg")
     fi
@@ -413,11 +409,19 @@ main() {
     build_desktop_release
   fi
 
+  if [[ "$do_dmg" -eq 1 ]]; then
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+      echo "Error: --dmg is available only on macOS." >&2
+      exit 2
+    fi
+    package_signed_dmg "$TAURI_DIR/target/release/bundle/macos/AeroShoot.app"
+  fi
+
   if [[ "$do_install" -eq 1 && "$(uname -s)" == "Darwin" ]]; then
     install_macos_app
   fi
 
-  report_artifacts
+  report_artifacts "$do_dmg"
 }
 
 main "$@"

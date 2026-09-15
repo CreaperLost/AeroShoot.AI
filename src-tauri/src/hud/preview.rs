@@ -424,7 +424,10 @@ mod tests {
         owner.present_frame(&frame, generation).unwrap();
         let status = owner.status();
         assert_eq!(status.presented_kind, "live");
-        assert_eq!(status.presented_bytes as usize, crate::capture::preview::PREVIEW_BYTES);
+        assert_eq!(
+            status.presented_bytes as usize,
+            crate::capture::preview::PREVIEW_BYTES
+        );
         assert_eq!(status.copies, 1);
         // Stale generation is rejected.
         assert!(owner

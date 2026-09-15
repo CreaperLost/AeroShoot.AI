@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 
 pub const EDIT_SCHEMA_VERSION: u32 = 1;
+const MAX_EDIT_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -58,4 +59,57 @@ pub fn save_edit_document(root: &Path, document: &EditDocument) -> Result<(), St
     let json = serde_json::to_string_pretty(document).map_err(|e| e.to_string())?;
     fs::write(path, json).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub fn load_edit_document(root: &Path) -> Result<Option<EditDocument>, String> {
+    let path = root.join("project.json");
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !metadata.is_file() {
+        return Err("project.json is not a regular file".into());
+    }
+    if metadata.len() > MAX_EDIT_DOCUMENT_BYTES {
+        return Err("project.json exceeds the 8 MiB safety limit".into());
+    }
+    let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+    let document: EditDocument =
+        serde_json::from_slice(&bytes).map_err(|error| format!("Invalid project.json: {error}"))?;
+    if document.schema_version != EDIT_SCHEMA_VERSION {
+        return Err(format!(
+            "Unsupported project.json schema version {}",
+            document.schema_version
+        ));
+    }
+    Ok(Some(document))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_document_is_none_and_saved_document_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(load_edit_document(temp.path()).unwrap(), None);
+        let mut expected = EditDocument::default();
+        expected.layout.aspect_ratio = "9:16".into();
+        save_edit_document(temp.path(), &expected).unwrap();
+        assert_eq!(load_edit_document(temp.path()).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn rejects_unknown_schema_version() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("project.json"),
+            r#"{"schemaVersion":999,"revision":0,"retainedIntervals":[]}"#,
+        )
+        .unwrap();
+        assert!(load_edit_document(temp.path())
+            .unwrap_err()
+            .contains("Unsupported"));
+    }
 }

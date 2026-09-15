@@ -23,5 +23,4 @@ command = "./script/codex.sh stop"
 [[actions]]
 name = "Build"
 icon = "tool"
-command = "./script/build.sh"
-
+command = "./script/build.sh --dmg"

@@ -2,6 +2,7 @@ import AVFoundation
 import ScreenCaptureKit
 import CoreImage
 import AppKit
+import AudioToolbox
 
 // Capture callbacks retain only the newest pixel buffer per video source.
 // Recording and idle monitoring use the same mailbox; no frames go through JS.
@@ -9,19 +10,68 @@ enum LivePreviewFrames {
   static let lock = NSLock()
   static var screen: CVPixelBuffer?
   static var camera: CVPixelBuffer?
+  static var showScreen = true
   static func offer(_ sample: CMSampleBuffer, camera isCamera: Bool) {
     guard let pixel = CMSampleBufferGetImageBuffer(sample) else { return }
     lock.lock(); defer { lock.unlock() }
     if isCamera { camera = pixel } else { screen = pixel }
   }
-  static func clear() { lock.lock(); screen = nil; camera = nil; lock.unlock() }
+  static func clear() { lock.lock(); screen = nil; camera = nil; showScreen = true; lock.unlock() }
 }
 
-private final class LiveMonitor: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
+private enum LivePreviewLevels {
+  static let lock = NSLock()
+  static var systemPeakDb: Double?
+  static var micPeakDb: Double?
+  static func clear() { lock.lock(); systemPeakDb = nil; micPeakDb = nil; lock.unlock() }
+  private static func peakDb(_ sample: CMSampleBuffer) -> Double? {
+    guard let description = CMSampleBufferGetFormatDescription(sample),
+      let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee else { return nil }
+    var retained: CMBlockBuffer?
+    var list = AudioBufferList(mNumberBuffers: 1,
+      mBuffers: AudioBuffer(mNumberChannels: 0, mDataByteSize: 0, mData: nil))
+    guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample,
+      bufferListSizeNeededOut: nil, bufferListOut: &list,
+      bufferListSize: MemoryLayout<AudioBufferList>.size,
+      blockBufferAllocator: kCFAllocatorDefault,
+      blockBufferMemoryAllocator: kCFAllocatorDefault,
+      flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+      blockBufferOut: &retained) == noErr else { return nil }
+    var peak = 0.0
+    let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+    for buffer in UnsafeMutableAudioBufferListPointer(&list) {
+      guard let raw = buffer.mData else { continue }
+      if isFloat && asbd.mBitsPerChannel == 32 {
+        let count = Int(buffer.mDataByteSize) / MemoryLayout<Float32>.size
+        let values = raw.bindMemory(to: Float32.self, capacity: count)
+        for index in 0..<count { peak = max(peak, abs(Double(values[index]))) }
+      } else if asbd.mBitsPerChannel == 16 {
+        let count = Int(buffer.mDataByteSize) / MemoryLayout<Int16>.size
+        let values = raw.bindMemory(to: Int16.self, capacity: count)
+        for index in 0..<count { peak = max(peak, abs(Double(values[index])) / 32768.0) }
+      } else { return nil }
+    }
+    return peak > 0 ? 20 * log10(min(peak, 1)) : -120
+  }
+  static func updateSystem(_ sample: CMSampleBuffer) {
+    guard let peak = peakDb(sample) else { return }
+    lock.lock(); systemPeakDb = peak; lock.unlock()
+  }
+  static func updateMic(_ sample: CMSampleBuffer, gainDb: Double) {
+    guard let raw = peakDb(sample) else { return }
+    let adjusted = min(0, max(-120, raw + min(24, max(-24, gainDb))))
+    lock.lock(); micPeakDb = adjusted; lock.unlock()
+  }
+}
+
+private final class LiveMonitor: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
   let queue = DispatchQueue(label: "ai.aeroshoot.live-preview", autoreleaseFrequency: .workItem)
   var stream: SCStream?
   var camera: AVCaptureSession?
-  func start(source: String, cameraID: String?) throws {
+  var micGainDb = 0.0
+  func start(source: String, captureScreen: Bool, captureSystemAudio: Bool, cameraID: String?, micID: String?, micGainDb: Double) throws {
+    self.micGainDb = micGainDb
+    if captureScreen || captureSystemAudio {
     let semaphore = DispatchSemaphore(value: 0)
     var content: SCShareableContent?
     var failure: Error?
@@ -46,35 +96,52 @@ private final class LiveMonitor: NSObject, SCStreamOutput, SCStreamDelegate, AVC
     config.width = 1280; config.height = 720
     config.minimumFrameInterval = CMTime(value: 1, timescale: 15)
     config.queueDepth = 3; config.pixelFormat = kCVPixelFormatType_32BGRA
-    config.showsCursor = true; config.capturesAudio = false
+    config.showsCursor = true; config.capturesAudio = captureSystemAudio
+    config.sampleRate = 48_000; config.channelCount = 2
     if #available(macOS 14.0, *) {
       config.preservesAspectRatio = true
     }
     let next = SCStream(filter: filter, configuration: config, delegate: self)
-    try next.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+    if captureScreen { try next.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue) }
+    if captureSystemAudio { try next.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue) }
     stream = next
     let started = DispatchSemaphore(value: 0)
     next.startCapture { error in failure = error; started.signal() }
     guard started.wait(timeout: .now() + 10) == .success else { throw NSError(domain: "AeroShoot", code: 4, userInfo: [NSLocalizedDescriptionKey: "Screen preview startup timed out"]) }
     if let failure { throw failure }
-    if let cameraID {
+    }
+    if cameraID != nil || micID != nil {
       do {
-        guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else {
-          throw NSError(domain: "AeroShoot", code: 5, userInfo: [NSLocalizedDescriptionKey: "Allow Camera access to preview the selected webcam"])
-        }
-        guard let device = AVCaptureDevice(uniqueID: cameraID) else { throw NSError(domain: "AeroShoot", code: 6, userInfo: [NSLocalizedDescriptionKey: "Selected webcam is unavailable"]) }
         let session = AVCaptureSession()
         session.beginConfiguration()
         session.sessionPreset = .hd1280x720
-        let input = try AVCaptureDeviceInput(device: device)
-        let output = AVCaptureVideoDataOutput()
-        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-        output.alwaysDiscardsLateVideoFrames = true
-        output.setSampleBufferDelegate(self, queue: queue)
-        guard session.canAddInput(input), session.canAddOutput(output) else { throw NSError(domain: "AeroShoot", code: 7, userInfo: [NSLocalizedDescriptionKey: "Cannot open webcam preview"]) }
-        session.addInput(input); session.addOutput(output); session.commitConfiguration()
+        if let cameraID {
+          guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else {
+            throw NSError(domain: "AeroShoot", code: 5, userInfo: [NSLocalizedDescriptionKey: "Allow Camera access to preview the selected webcam"])
+          }
+          guard let device = AVCaptureDevice(uniqueID: cameraID) else { throw NSError(domain: "AeroShoot", code: 6, userInfo: [NSLocalizedDescriptionKey: "Selected webcam is unavailable"]) }
+          let input = try AVCaptureDeviceInput(device: device)
+          let output = AVCaptureVideoDataOutput()
+          output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+          output.alwaysDiscardsLateVideoFrames = true
+          output.setSampleBufferDelegate(self, queue: queue)
+          guard session.canAddInput(input), session.canAddOutput(output) else { throw NSError(domain: "AeroShoot", code: 7, userInfo: [NSLocalizedDescriptionKey: "Cannot open webcam preview"]) }
+          session.addInput(input); session.addOutput(output)
+        }
+        if let micID {
+          guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            throw NSError(domain: "AeroShoot", code: 9, userInfo: [NSLocalizedDescriptionKey: "Allow Microphone access to meter the selected input"])
+          }
+          guard let device = AVCaptureDevice(uniqueID: micID) else { throw NSError(domain: "AeroShoot", code: 10, userInfo: [NSLocalizedDescriptionKey: "Selected microphone is unavailable"]) }
+          let input = try AVCaptureDeviceInput(device: device)
+          let output = AVCaptureAudioDataOutput()
+          output.setSampleBufferDelegate(self, queue: queue)
+          guard session.canAddInput(input), session.canAddOutput(output) else { throw NSError(domain: "AeroShoot", code: 11, userInfo: [NSLocalizedDescriptionKey: "Cannot open microphone meter"]) }
+          session.addInput(input); session.addOutput(output)
+        }
+        session.commitConfiguration()
         camera = session; session.startRunning()
-        guard session.isRunning else { throw NSError(domain: "AeroShoot", code: 8, userInfo: [NSLocalizedDescriptionKey: "Webcam preview did not start"]) }
+        guard session.isRunning else { throw NSError(domain: "AeroShoot", code: 8, userInfo: [NSLocalizedDescriptionKey: "Camera/microphone preview did not start"]) }
       } catch {
         // Screen preview remains useful when the camera is busy or denied.
         camera = nil
@@ -96,7 +163,9 @@ private final class LiveMonitor: NSObject, SCStreamOutput, SCStreamDelegate, AVC
     stream = nil; queue.sync {}
   }
   func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
-    guard type == .screen, sample.isValid,
+    guard sample.isValid else { return }
+    if type == .audio { LivePreviewLevels.updateSystem(sample); return }
+    guard type == .screen,
       let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
       let status = attachments.first?[.status] as? Int, let frameStatus = SCFrameStatus(rawValue: status) else { return }
     if frameStatus == .complete || frameStatus == .idle {
@@ -104,24 +173,38 @@ private final class LiveMonitor: NSObject, SCStreamOutput, SCStreamDelegate, AVC
     }
   }
   func captureOutput(_ output: AVCaptureOutput, didOutput sample: CMSampleBuffer, from connection: AVCaptureConnection) {
-    LivePreviewFrames.offer(sample, camera: true)
+    if output is AVCaptureAudioDataOutput {
+      LivePreviewLevels.updateMic(sample, gainDb: micGainDb)
+    } else {
+      LivePreviewFrames.offer(sample, camera: true)
+    }
   }
 }
 // Configuration calls are serialized by Rust's command lock; reads use the mailbox lock.
 private var liveMonitor: LiveMonitor?
 private let liveContext = CIContext(options: [.cacheIntermediates: false])
 @_cdecl("aeroshoot_live_preview_stop")
-func livePreviewStop() { liveMonitor?.stop(); liveMonitor = nil; LivePreviewFrames.clear() }
+func livePreviewStop() { liveMonitor?.stop(); liveMonitor = nil; LivePreviewFrames.clear(); LivePreviewLevels.clear() }
 @_cdecl("aeroshoot_live_preview_start")
-func livePreviewStart(_ source: UnsafePointer<CChar>?, _ camera: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>? {
+func livePreviewStart(_ source: UnsafePointer<CChar>?, _ captureScreen: Bool, _ captureSystemAudio: Bool, _ camera: UnsafePointer<CChar>?, _ mic: UnsafePointer<CChar>?, _ micGainDb: Double) -> UnsafeMutablePointer<CChar>? {
   livePreviewStop()
   guard let source else { return strdup("No screen source selected") }
   let monitor = LiveMonitor()
   do {
-    try monitor.start(source: String(cString: source), cameraID: camera.map { String(cString: $0) })
+    LivePreviewFrames.lock.lock(); LivePreviewFrames.showScreen = captureScreen; LivePreviewFrames.lock.unlock()
+    try monitor.start(source: String(cString: source), captureScreen: captureScreen, captureSystemAudio: captureSystemAudio, cameraID: camera.map { String(cString: $0) }, micID: mic.map { String(cString: $0) }, micGainDb: micGainDb)
     liveMonitor = monitor
     return nil
   } catch { monitor.stop(); return strdup(error.localizedDescription) }
+}
+
+@_cdecl("aeroshoot_live_preview_copy_levels_json")
+func livePreviewCopyLevelsJson() -> UnsafeMutablePointer<CChar>? {
+  LivePreviewLevels.lock.lock(); let systemPeak = LivePreviewLevels.systemPeakDb; let micPeak = LivePreviewLevels.micPeakDb; LivePreviewLevels.lock.unlock()
+  let object: [String: Any] = ["systemAudioPeakDb": systemPeak ?? NSNull(), "micPeakDb": micPeak ?? NSNull()]
+  guard let data = try? JSONSerialization.data(withJSONObject: object),
+    let text = String(data: data, encoding: .utf8) else { return nil }
+  return strdup(text)
 }
 private func livePreviewPlaced(_ pixel: CVPixelBuffer, _ rect: CGRect, cover: Bool) -> CIImage {
   let source = CIImage(cvPixelBuffer: pixel)
@@ -146,7 +229,8 @@ func livePreviewRead(_ bytes: UnsafeMutableRawPointer?, _ length: Int32) -> Int3
   return autoreleasepool {
   guard let bytes, length >= 1280 * 720 * 4 else { return 0 }
   LivePreviewFrames.lock.lock()
-  let screen = LivePreviewFrames.screen, camera = LivePreviewFrames.camera
+  let screen = LivePreviewFrames.showScreen ? LivePreviewFrames.screen : nil
+  let camera = LivePreviewFrames.camera
   LivePreviewFrames.lock.unlock()
   guard screen != nil || camera != nil else { return 0 }
   let bounds = CGRect(x: 0, y: 0, width: 1280, height: 720)

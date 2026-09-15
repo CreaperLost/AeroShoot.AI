@@ -1,6 +1,19 @@
 import Foundation
 import CoreGraphics
 import CoreMedia
+import IOKit.hid
+
+/// Live Input Monitoring state. `CGPreflightListenEventAccess` can report a
+/// value cached for the running process, so also read the TCC decision
+/// through IOKit, which reflects a grant made in System Settings.
+func listenEventAccessGranted() -> Bool {
+  IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted || CGPreflightListenEventAccess()
+}
+
+/// Consecutive pointer moves closer together than this are merged, giving a
+/// ~60 Hz path: smooth enough for editor cursor smoothing and zoom following,
+/// without persisting every raw event from high-rate mice.
+private let moveSampleIntervalUs: UInt64 = 16_667
 
 // Borrowed UTF-8 JSON; Rust owns append-only persistence. Runs on the drain
 // worker, never on the event tap. Nonzero means persistence failed.
@@ -67,7 +80,7 @@ final class MouseHookMac {
 #if MOUSE_CONTRACT_TESTS
     if let override = listenAccessOverride { return override }
 #endif
-    return CGPreflightListenEventAccess()
+    return listenEventAccessGranted()
   }
 
   private func gap(_ reason: String, _ start: UInt64, _ end: UInt64, count: UInt64 = 0) -> [String: Any] {
@@ -185,11 +198,13 @@ final class MouseHookMac {
       "geometry_id": id, "norm_x": x, "norm_y": y,
       "inside_source": x >= 0 && x < 1 && y >= 0 && y < 1,
       "payload": payload]
-    // Replace only the immediately preceding movement. Button/scroll ordering
-    // is preserved; movement while dwelling remains derivable from timestamps.
+    // Replace only an immediately preceding movement within the sampling
+    // interval. Button/scroll ordering is preserved; movement while dwelling
+    // remains derivable from timestamps.
     if payload["kind"] as? String == "move", let last = records.last,
        let prior = last["payload"] as? [String: Any], prior["kind"] as? String == "move",
-       last["geometry_id"] as? String == id, lost == nil {
+       last["geometry_id"] as? String == id, lost == nil,
+       let priorTime = last["t_us"] as? UInt64, time >= priorTime, time - priorTime < moveSampleIntervalUs {
       records[records.count - 1] = record
     } else { enqueue(record, at: time) }
   }
@@ -296,8 +311,10 @@ final class MouseHookMac {
 // preflight, so denying telemetry never creates a repeated prompt loop.
 @_cdecl("aeroshoot_macos_mouse_permission")
 func mousePermission(_ request: Bool) -> Bool {
-  if request && !CGPreflightListenEventAccess() { return CGRequestListenEventAccess() }
-  return CGPreflightListenEventAccess()
+  if request && !listenEventAccessGranted() {
+    return IOHIDRequestAccess(kIOHIDRequestTypeListenEvent) || CGRequestListenEventAccess()
+  }
+  return listenEventAccessGranted()
 }
 
 #if MOUSE_CONTRACT_TESTS

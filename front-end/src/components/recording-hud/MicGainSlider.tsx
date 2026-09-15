@@ -1,10 +1,11 @@
 import React from "react";
-import { MIC_GAIN_RANGE } from "./MicPreview";
 import { RotateCcw } from "lucide-react";
+
+const MIC_GAIN_RANGE = { min: -24, max: 24 } as const;
 
 /**
  * Slider that controls the live mic gain (in decibels). 0 dB = unity.
- * Range matches the MicPreview and the native clamp on the Swift side.
+ * Range matches the native preview and recording clamps on the Swift side.
  *
  * The slider is intentionally a controlled component: the owning settings
  * store owns the value so the gain is shared across the HUD, the recording

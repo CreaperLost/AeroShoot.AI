@@ -11,6 +11,7 @@ use tempfile::tempdir;
 fn opts() -> StartRecordingOptions {
     StartRecordingOptions {
         source_id: "screen-main".into(),
+        capture_screen: true,
         camera_id: Some("cam-1".into()),
         mic_id: None,
         capture_system_audio: false,
@@ -20,12 +21,17 @@ fn opts() -> StartRecordingOptions {
         project_name: None,
         project_dir: None,
         mic_gain_db: None,
+        video_bitrate_bps: None,
+        capture_mouse: true,
     }
 }
 
 #[test]
 fn window_label_routing_rejects_unknown_identities() {
-    assert_eq!(resolve_ui_root(STUDIO_WINDOW_LABEL).unwrap(), UiRootKind::Studio);
+    assert_eq!(
+        resolve_ui_root(STUDIO_WINDOW_LABEL).unwrap(),
+        UiRootKind::Studio
+    );
     assert_eq!(resolve_ui_root(HUD_WINDOW_LABEL).unwrap(), UiRootKind::Hud);
     assert!(window_identity_from_label("main").ui_root == Some(UiRootKind::Studio));
     assert!(!window_identity_from_label(HUD_WINDOW_LABEL).rejected);
@@ -131,7 +137,10 @@ fn camera_removal_is_visible_in_hud_snapshot() {
     let removed = hud_reconcile_cameras_impl(&state, Vec::new(), None).unwrap();
     assert!(!removed.camera_available);
     assert_eq!(removed.camera_id.as_deref(), Some("cam-1"));
-    assert!(removed.diagnostics.iter().any(|d| d.contains("unavailable")));
+    assert!(removed
+        .diagnostics
+        .iter()
+        .any(|d| d.contains("unavailable")));
 }
 
 #[test]
@@ -159,7 +168,10 @@ fn closing_hud_does_not_stop_recording_or_start_a_second_session() {
     let hidden = hud_set_visible_impl(&state, false).unwrap();
     assert!(!hidden.hud_visible);
     assert!(hidden.hud_attached);
-    assert_eq!(get_session_status_impl(&state).state, SessionState::Recording);
+    assert_eq!(
+        get_session_status_impl(&state).state,
+        SessionState::Recording
+    );
     let reshown = hud_set_visible_impl(&state, true).unwrap();
     assert!(reshown.hud_visible);
     assert!(reshown.hud_attached);
@@ -274,10 +286,7 @@ fn studio_preview_present_frame_updates_kind_and_bytes() {
         .unwrap_err()
         .contains("Stale"));
     studio_preview_detach_impl(&state).unwrap();
-    assert_eq!(
-        studio_preview_status_impl(&state).presented_kind,
-        "none"
-    );
+    assert_eq!(studio_preview_status_impl(&state).presented_kind, "none");
 }
 
 #[test]

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../../lib/ipc";
 import { PreviewHitMode, PreviewStatus } from "../../lib/types";
 
@@ -8,8 +8,8 @@ interface NativePreviewHostProps {
   hitMode?: PreviewHitMode;
   className?: string;
   surface?: "studio" | "hud";
-  fitAspectRatio?: number;
   showStatus?: boolean;
+  surfaceVisible?: boolean;
 }
 
 export function NativePreviewHost({
@@ -18,10 +18,11 @@ export function NativePreviewHost({
   hitMode = "consume",
   className = "w-full max-w-4xl aspect-video",
   surface = "studio",
-  fitAspectRatio,
   showStatus = true,
+  surfaceVisible = true,
 }: NativePreviewHostProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const surfaceVisibleRef = useRef(surfaceVisible);
   const [status, setStatus] = useState<PreviewStatus | null>(null);
   const [error, setError] = useState<string>();
 
@@ -32,18 +33,39 @@ export function NativePreviewHost({
   // window-label-rejection errors.
   const isHud = windowLabel === "camera_overlay";
 
+  // Visibility is layout state, not ownership state. Keep the native child
+  // attached while menus open so asynchronous detach/attach calls cannot race
+  // and resurrect an AppKit surface above the WebView dropdown.
+  const scheduleLayoutRef = useRef<() => void>(() => undefined);
+  useLayoutEffect(() => {
+    surfaceVisibleRef.current = surfaceVisible;
+    scheduleLayoutRef.current();
+  }, [surfaceVisible]);
+
   useEffect(() => {
     let cancelled = false;
     let revision = 0;
     let generation: number | undefined;
-    let animation = 0;
+    let frame = 0;
     let lastGeometry = "";
     let sending = false;
+    let dirty = false;
+    // Measure on demand (resize, scroll, visibility, a slow fallback) instead of
+    // walking computed styles on every animation frame, which kept the WebView busy.
+    const schedule = () => {
+      if (cancelled || frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        update();
+      });
+    };
     const update = () => {
-      if (cancelled) return;
-      animation = requestAnimationFrame(update);
       const el = hostRef.current;
-      if (!el || generation === undefined || sending) return;
+      if (cancelled || !el || generation === undefined) return;
+      if (sending) {
+        dirty = true;
+        return;
+      }
       const rect = el.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return;
       let left = Math.max(0, rect.left), top = Math.max(0, rect.top);
@@ -57,7 +79,7 @@ export function NativePreviewHost({
         ancestor = ancestor.parentElement;
       }
       const clip: [number, number, number, number] = [left - rect.left, top - rect.top, Math.max(0, right - left), Math.max(0, bottom - top)];
-      const visible = !document.hidden && clip[2] > 0 && clip[3] > 0;
+      const visible = surfaceVisibleRef.current && !document.hidden && clip[2] > 0 && clip[3] > 0;
       const viewport = { windowLabel, x: rect.left, y: rect.top, width: rect.width, height: rect.height,
         backingScale: window.devicePixelRatio || 1, visible, occluded: !visible, generation, clip };
       const key = JSON.stringify(viewport);
@@ -67,8 +89,23 @@ export function NativePreviewHost({
       void layout({ ...viewport, revision: ++revision })
         .then(next => { if (!cancelled) { lastGeometry = key; setStatus(next); setError(undefined); } })
         .catch(err => { if (!cancelled) setError(String(err)); })
-        .finally(() => { sending = false; });
+        .finally(() => {
+          sending = false;
+          if (dirty) {
+            dirty = false;
+            schedule();
+          }
+        });
     };
+    scheduleLayoutRef.current = schedule;
+    const resizeObserver = new ResizeObserver(schedule);
+    resizeObserver.observe(document.documentElement);
+    if (hostRef.current) resizeObserver.observe(hostRef.current);
+    window.addEventListener("resize", schedule);
+    window.addEventListener("scroll", schedule, true);
+    document.addEventListener("visibilitychange", schedule);
+    // Catches moves that change neither size nor scroll, e.g. a banner above the host.
+    const fallback = window.setInterval(schedule, 500);
     const attach = isHud
       ? api.hudPreviewAttach(windowLabel, hitMode).then(() => api.hudPreviewStatus())
       : api.studioPreviewAttach(windowLabel, hitMode).then(() => api.studioPreviewStatus());
@@ -79,11 +116,17 @@ export function NativePreviewHost({
         return;
       }
       setStatus(attached); setError(undefined);
-      update();
+      schedule();
     }).catch(err => { if (!cancelled) setError(String(err)); });
     return () => {
       cancelled = true;
-      cancelAnimationFrame(animation);
+      cancelAnimationFrame(frame);
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("scroll", schedule, true);
+      document.removeEventListener("visibilitychange", schedule);
+      window.clearInterval(fallback);
+      scheduleLayoutRef.current = () => undefined;
       if (generation !== undefined) {
         void (isHud ? api.hudClose() : api.studioPreviewDetach()).catch(() => undefined);
       }
@@ -91,23 +134,25 @@ export function NativePreviewHost({
   }, [windowLabel, hitMode, surface, isHud]);
 
   return (
-    <div className={`w-full flex flex-col items-center gap-2 ${fitAspectRatio || surface === "hud" ? "h-full min-h-0" : ""}`}>
+    <div className="w-full flex-1 h-full min-h-0 flex flex-col items-center gap-2">
       <div
         className={
-          fitAspectRatio || surface === "hud"
+          surface === "hud"
             ? "w-full flex-1 min-h-0 flex items-center justify-center overflow-hidden"
-            : "contents"
+            : "preview-stage w-full flex-1 min-h-0 flex items-center justify-center overflow-hidden"
         }
       >
+        {/* The AppKit view mirrors this box and draws above all web content,
+            so the studio host must always fit inside its stage; a fixed-size
+            box that overflows would paint over the rows above it. */}
         <div
           ref={hostRef}
           data-native-preview-host
           className={
             surface === "hud"
               ? `pointer-events-none shrink-0 w-full h-full ${className}`
-              : `pointer-events-none rounded-xl border border-studio-800 bg-black/50 ${fitAspectRatio ? "w-full h-full min-h-0" : `shrink-0 ${className}`}`
+              : "pointer-events-none preview-fit rounded-xl border border-studio-800 bg-black/50"
           }
-          data-content-aspect-ratio={fitAspectRatio}
         />
       </div>
       {showStatus && <p className="text-xs text-studio-400 max-w-md text-center shrink-0">

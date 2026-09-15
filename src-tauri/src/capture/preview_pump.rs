@@ -74,9 +74,8 @@ fn tick(app: &tauri::AppHandle, state: &AppState) {
     let studio_status = state.studio_preview.lock().status();
     let hud_status = state.hud_preview.lock().status();
     let recording = state.active_session.read().is_some();
-    let hud_visible = hud_status.attached
-        && hud_status.visible
-        && state.hud.lock().desired_visible(recording);
+    let hud_visible =
+        hud_status.attached && hud_status.visible && state.hud.lock().desired_visible(recording);
 
     // Studio: full composited (screen + camera bubble) frame.
     let studio_frame = if studio_status.attached && studio_status.visible {

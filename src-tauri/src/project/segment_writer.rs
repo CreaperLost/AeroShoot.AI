@@ -136,7 +136,7 @@ impl TrackSegmentWriter {
             track_type,
             codec,
             extension,
-            target_duration_us: 2_000_000, // 2-second target segments
+            target_duration_us: 60_000_000, // 60-second target segments
             current_seq,
             active_temp_file: None,
             active_temp_path: None,
@@ -580,6 +580,18 @@ mod tests {
     }
 
     #[test]
+    fn target_duration_matches_native_sixty_second_rotation() {
+        let dir = tempdir().unwrap();
+        let writer = TrackSegmentWriter::new(
+            dir.path(),
+            "screen".into(),
+            TrackType::Screen,
+            "h264".into(),
+        );
+        assert_eq!(writer.target_duration_us(), 60_000_000);
+    }
+
+    #[test]
     fn test_segment_writer_commit_order() {
         let dir = tempdir().unwrap();
         let journal = ProjectJournal::open_or_create(dir.path()).unwrap();
@@ -704,7 +716,10 @@ mod tests {
         assert_eq!(committed.relative_path, "media/mic/000001.wav");
         assert_eq!(journal.read_all().unwrap().len(), 1);
         assert!(!writer.has_pending_publication());
-        assert_eq!(fs::read(dir.path().join(&committed.relative_path)).unwrap(), data);
+        assert_eq!(
+            fs::read(dir.path().join(&committed.relative_path)).unwrap(),
+            data
+        );
     }
 
     #[test]

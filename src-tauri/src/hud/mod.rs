@@ -388,11 +388,7 @@ impl HudOwner {
     }
 
     /// Detach the HUD surface. Must not stop recording or drop the capture session.
-    pub fn close(
-        &mut self,
-        session_recording: bool,
-        capture_session_alive: bool,
-    ) -> HudSnapshot {
+    pub fn close(&mut self, session_recording: bool, capture_session_alive: bool) -> HudSnapshot {
         self.hud_attached = false;
         self.requested_visible = false;
         self.started_independent_capture = false;
@@ -465,10 +461,7 @@ mod tests {
     #[test]
     fn window_identity_maps_only_verified_labels() {
         assert_eq!(resolve_ui_root("main").unwrap(), UiRootKind::Studio);
-        assert_eq!(
-            resolve_ui_root("camera_overlay").unwrap(),
-            UiRootKind::Hud
-        );
+        assert_eq!(resolve_ui_root("camera_overlay").unwrap(), UiRootKind::Hud);
         assert!(resolve_ui_root("other").unwrap_err().contains("Rejected"));
         assert!(resolve_ui_root("").unwrap_err().contains("Rejected"));
         let rejected = window_identity_from_label("webview-2");
@@ -556,7 +549,10 @@ mod tests {
         assert!(!reconnecting.view.mirror);
 
         let mut live = HudSubscriber::new();
-        live.on_event(owner.events().first().unwrap(), &owner.snapshot(false, false));
+        live.on_event(
+            owner.events().first().unwrap(),
+            &owner.snapshot(false, false),
+        );
         assert_eq!(live.last_seen, 1);
         assert!(!live.recovered_from_snapshot);
         // Drop revision 2; a later event (if any) or the current snapshot recovers.
@@ -588,9 +584,7 @@ mod tests {
             )
             .unwrap();
         assert!(owner.snapshot(false, true).camera_available);
-        owner
-            .attach_preview(HUD_WINDOW_LABEL, true, true)
-            .unwrap();
+        owner.attach_preview(HUD_WINDOW_LABEL, true, true).unwrap();
         let removed = owner
             .reconcile_cameras(Vec::new(), None, true, true)
             .unwrap();
@@ -622,9 +616,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        owner
-            .set_requested_visible(true, false, false)
-            .unwrap();
+        owner.set_requested_visible(true, false, false).unwrap();
         let idle = owner.snapshot(false, false);
         assert!(!idle.hud_visible);
         assert!(idle.exclusion_established);

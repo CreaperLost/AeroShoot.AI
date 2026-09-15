@@ -428,9 +428,16 @@ unsafe extern "C" fn mouse_sink(json: *const c_char) -> c_int {
         let mut logger = MOUSE_LOGGER.lock().unwrap();
         match logger.as_mut().map(|logger| logger.append(json)) {
             Some(Ok(())) => {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                // Only gap records carry a reason; avoid re-parsing every move and click.
+                let gap = json.contains("\"reason\"")
+                    .then(|| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .flatten();
+                if let Some(value) = gap {
                     if let Some(reason) = value.pointer("/payload/reason").and_then(|v| v.as_str()) {
-                        if matches!(reason, "input_monitoring_unavailable" | "input_monitoring_revoked" | "event_tap_unavailable" | "unsupported_source_geometry") {
+                        // Missing Input Monitoring at start is shown by the recorder's
+                        // mouse-tracking control before recording, so only mid-session
+                        // failures are surfaced as runtime errors. The gap stays in the log.
+                        if matches!(reason, "input_monitoring_revoked" | "event_tap_unavailable" | "unsupported_source_geometry") {
                             if let Some(target) = RUNTIME_ERROR_TARGET.lock().unwrap().as_ref() {
                                 target.diagnostics.apply(&SessionEvent::RuntimeError {
                                     track_id: "telemetry".into(), error_code: 700,
@@ -565,9 +572,9 @@ unsafe extern "C" fn c_segment_callback(
         if target.closed.load(Ordering::SeqCst) {
             return -600;
         }
-        let writer = writers.entry(id.to_string()).or_insert_with(|| {
-            TrackSegmentWriter::new(root, id.to_string(), kind, String::new())
-        });
+        let writer = writers
+            .entry(id.to_string())
+            .or_insert_with(|| TrackSegmentWriter::new(root, id.to_string(), kind, String::new()));
         match writer.commit_native_segment(
             Path::new(path.as_ref()),
             segment_index as u32,
@@ -677,6 +684,7 @@ pub fn decode_encoder_result(result: AeroShootEncoderResult) -> Result<(), (i32,
 #[serde(rename_all = "camelCase")]
 pub struct NativeRecordingConfig<'a> {
     pub source_id: &'a str,
+    pub capture_screen: bool,
     pub camera_id: Option<&'a str>,
     pub mic_id: Option<&'a str>,
     pub capture_system_audio: bool,
@@ -693,6 +701,11 @@ pub struct NativeRecordingConfig<'a> {
     /// Clamped on the Swift side to a sane window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mic_gain_db: Option<f32>,
+    /// Average bitrate for the screen track; `None` uses the automatic rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_bitrate_bps: Option<u32>,
+    /// Start the pointer hook and telemetry log (screen recordings only).
+    pub capture_mouse: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -703,6 +716,16 @@ pub struct NativeCaptureStats {
     pub timestamp_records_dropped: u64,
     pub gaps_total: u64,
     pub last_error: Option<String>,
+    pub screen_samples: u64,
+    pub camera_samples: u64,
+    pub system_audio_samples: u64,
+    pub mic_samples: u64,
+    pub system_audio_peak_db: Option<f64>,
+    pub mic_peak_db: Option<f64>,
+    pub screen_last_sample_age_ms: Option<u64>,
+    pub camera_last_sample_age_ms: Option<u64>,
+    pub system_audio_last_sample_age_ms: Option<u64>,
+    pub mic_last_sample_age_ms: Option<u64>,
 }
 
 pub struct MacCaptureSession {
@@ -715,11 +738,18 @@ unsafe impl Sync for MacCaptureSession {}
 
 impl MacCaptureSession {
     pub fn start(config: NativeRecordingConfig<'_>) -> Result<Self, String> {
-        *MOUSE_LOGGER.lock().unwrap() = Some(crate::telemetry::native::NativeMouseLogger::create(
-            config.project_path,
-        )?);
-        unsafe {
-            aeroshoot_macos_register_mouse_sink(Some(mouse_sink));
+        if config.capture_screen && config.capture_mouse {
+            *MOUSE_LOGGER.lock().unwrap() = Some(
+                crate::telemetry::native::NativeMouseLogger::create(config.project_path)?,
+            );
+            unsafe {
+                aeroshoot_macos_register_mouse_sink(Some(mouse_sink));
+            }
+        } else {
+            *MOUSE_LOGGER.lock().unwrap() = None;
+            unsafe {
+                aeroshoot_macos_register_mouse_sink(None);
+            }
         }
         let json = serde_json::to_string(&config).map_err(|error| error.to_string())?;
         let json = CString::new(json).map_err(|error| error.to_string())?;
@@ -792,6 +822,54 @@ impl MacCaptureSession {
             .ok()
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default()
+    }
+
+    /// Wait until every selected source that is expected to produce continuous
+    /// samples has delivered at least one callback. System audio is excluded:
+    /// ScreenCaptureKit legitimately emits no audio buffers while the system is
+    /// silent, and a successful `startCapture` completion is its readiness
+    /// signal. This prevents the app from advertising Recording while a stale
+    /// display, busy camera, or unavailable microphone is producing nothing.
+    pub fn wait_until_ready(
+        &self,
+        capture_screen: bool,
+        camera_enabled: bool,
+        mic_enabled: bool,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        if !capture_screen && !camera_enabled && !mic_enabled {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let stats = self.stats();
+            if let Some(error) = stats.last_error.filter(|error| !error.is_empty()) {
+                return Err(format!("native capture failed during startup: {error}"));
+            }
+            let screen_ready = !capture_screen || stats.screen_samples > 0;
+            let camera_ready = !camera_enabled || stats.camera_samples > 0;
+            let mic_ready = !mic_enabled || stats.mic_samples > 0;
+            if screen_ready && camera_ready && mic_ready {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                let mut pending = Vec::new();
+                if !screen_ready {
+                    pending.push("screen");
+                }
+                if !camera_ready {
+                    pending.push("webcam");
+                }
+                if !mic_ready {
+                    pending.push("microphone");
+                }
+                return Err(format!(
+                    "Timed out waiting for first native sample from {}",
+                    pending.join(", ")
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
     }
 
     pub fn stop(mut self) {
@@ -921,6 +999,7 @@ mod tests {
         let project_path = Path::new("/tmp/example.aero");
         let cfg = NativeRecordingConfig {
             source_id: "src-1",
+            capture_screen: true,
             camera_id: Some("cam-1"),
             mic_id: Some("mic-1"),
             capture_system_audio: true,
@@ -933,6 +1012,8 @@ mod tests {
             project_path,
             session_offset_us: 1_234,
             mic_gain_db: Some(6.0),
+            video_bitrate_bps: None,
+            capture_mouse: true,
         };
         let json = serde_json::to_string(&cfg).expect("serialize config");
         // camelCase field that the Swift side decodes.
@@ -941,6 +1022,8 @@ mod tests {
         // Rust caller doesn't pass a gain we should omit it entirely.
         let cfg_none = NativeRecordingConfig {
             mic_gain_db: None,
+            video_bitrate_bps: None,
+            capture_mouse: true,
             ..cfg
         };
         let json_none = serde_json::to_string(&cfg_none).expect("serialize config");
@@ -1001,9 +1084,7 @@ mod tests {
 
         let track = CString::new("mic").unwrap();
         let path = CString::new(temp.to_string_lossy().as_ref()).unwrap();
-        let status = unsafe {
-            c_segment_callback(track.as_ptr(), 0, 0, 48_000, 0, path.as_ptr())
-        };
+        let status = unsafe { c_segment_callback(track.as_ptr(), 0, 0, 48_000, 0, path.as_ptr()) };
         assert_eq!(status, -600);
         assert!(dir.path().join("media/mic/000001.wav").exists());
         assert!(journal.read_all().unwrap().is_empty());

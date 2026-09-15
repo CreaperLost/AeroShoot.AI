@@ -144,10 +144,7 @@ impl EditLayout {
     /// so 9:16 / 1:1 / 4:3 do not stretch inside a 16:9 encoder frame.
     pub fn fit_export_size(&self, width: u32, height: u32) -> Result<(u32, u32), String> {
         self.validate()?;
-        let standard = matches!(
-            (width, height),
-            (1280, 720) | (1920, 1080) | (3840, 2160)
-        );
+        let standard = matches!((width, height), (1280, 720) | (1920, 1080) | (3840, 2160));
         if !standard {
             return Ok((width, height));
         }
@@ -369,9 +366,11 @@ mod tests {
     #[test]
     fn wallpaper_ingest_rejects_url_symlink_and_oversize() {
         let dir = tempdir().unwrap();
-        assert!(ingest_wallpaper(dir.path(), Path::new("https://example.com/bg.png"))
-            .unwrap_err()
-            .contains("URL"));
+        assert!(
+            ingest_wallpaper(dir.path(), Path::new("https://example.com/bg.png"))
+                .unwrap_err()
+                .contains("URL")
+        );
         let file = dir.path().join("ok.png");
         fs::write(&file, b"\x89PNG").unwrap();
         let rel = ingest_wallpaper(dir.path(), &file).unwrap();

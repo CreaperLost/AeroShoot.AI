@@ -1,5 +1,6 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Domain events that the capture pipeline can publish to the session state
@@ -79,8 +80,10 @@ pub struct SessionDiagnostics {
 #[derive(Debug, Clone, Default)]
 struct SessionDiagnosticsInner {
     last_runtime_error: Option<RuntimeErrorRecord>,
+    first_terminal_error: Option<RuntimeErrorRecord>,
     last_runtime_error_t_us: u64,
     gaps_total: u64,
+    segment_counts: BTreeMap<String, u64>,
 }
 
 impl SessionDiagnostics {
@@ -109,16 +112,32 @@ impl SessionDiagnostics {
                     recoverable: *recoverable,
                 };
                 guard.last_runtime_error = Some(record.clone());
+                if !recoverable && guard.first_terminal_error.is_none() {
+                    guard.first_terminal_error = Some(record.clone());
+                }
                 guard.last_runtime_error_t_us = *t_us;
                 guard.gaps_total = guard.gaps_total.saturating_add(1);
                 Some(record)
             }
-            SessionEvent::SegmentRotated { .. } => None,
+            SessionEvent::SegmentRotated {
+                track_id,
+                segment_index,
+                ..
+            } => {
+                let count = u64::from(*segment_index).saturating_add(1);
+                let current = guard.segment_counts.entry(track_id.clone()).or_default();
+                *current = (*current).max(count);
+                None
+            }
         }
     }
 
     pub fn last_runtime_error(&self) -> Option<RuntimeErrorRecord> {
         self.inner.read().last_runtime_error.clone()
+    }
+
+    pub fn first_terminal_error(&self) -> Option<RuntimeErrorRecord> {
+        self.inner.read().first_terminal_error.clone()
     }
 
     pub fn last_runtime_error_t_us(&self) -> u64 {
@@ -129,13 +148,24 @@ impl SessionDiagnostics {
         self.inner.read().gaps_total
     }
 
+    pub fn segment_count(&self, track_id: &str) -> u64 {
+        self.inner
+            .read()
+            .segment_counts
+            .get(track_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Reset all diagnostics — used by `start_recording` so a fresh
     /// session does not inherit the previous session's errors.
     pub fn reset(&self) {
         let mut guard = self.inner.write();
         guard.last_runtime_error = None;
+        guard.first_terminal_error = None;
         guard.last_runtime_error_t_us = 0;
         guard.gaps_total = 0;
+        guard.segment_counts.clear();
     }
 }
 
@@ -178,6 +208,19 @@ mod tests {
         assert!(diag.last_runtime_error().is_none());
         // Segment rotations do not bump the gaps counter.
         assert_eq!(diag.gaps_total(), 0);
+        assert_eq!(diag.segment_count("screen"), 8);
+        // A duplicated/out-of-order callback must not move progress backward.
+        let older = SessionEvent::SegmentRotated {
+            track_id: "screen".into(),
+            segment_index: 3,
+            host_anchor_us: 0,
+            media_timescale: 90_000,
+            media_start_value: 0,
+        };
+        diag.apply(&older);
+        assert_eq!(diag.segment_count("screen"), 8);
+        diag.reset();
+        assert_eq!(diag.segment_count("screen"), 0);
     }
 
     #[test]

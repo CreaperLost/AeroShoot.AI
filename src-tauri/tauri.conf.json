@@ -20,9 +20,9 @@
       {
         "title": "AeroShoot — Untitled",
         "width": 1280,
-        "height": 860,
+        "height": 800,
         "minWidth": 960,
-        "minHeight": 640,
+        "minHeight": 600,
         "center": true,
         "decorations": true,
         "transparent": false

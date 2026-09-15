@@ -54,7 +54,7 @@ pub enum NativeCaptureOutcome {
     PrepareFailed { message: String },
     StopFailed { code: i32, message: String },
     StopSucceeded,
-    NoScreenMedia,
+    MissingOrInvalidMedia { message: String },
 }
 
 pub struct AppState {
@@ -187,6 +187,8 @@ impl Default for AppState {
 #[serde(rename_all = "camelCase")]
 pub struct StartRecordingOptions {
     pub source_id: String,
+    #[serde(default = "default_true")]
+    pub capture_screen: bool,
     #[serde(default)]
     pub camera_id: Option<String>,
     #[serde(default)]
@@ -207,7 +209,23 @@ pub struct StartRecordingOptions {
     /// (typically ±24 dB) to avoid runaway amplification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mic_gain_db: Option<f32>,
+    /// Average bitrate for the screen video track in bits per second. `None`
+    /// keeps the automatic rate derived from resolution and frame rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_bitrate_bps: Option<u32>,
+    /// Log pointer motion and clicks beside the screen track. On by default.
+    #[serde(default = "default_true")]
+    pub capture_mouse: bool,
 }
+
+fn default_true() -> bool {
+    true
+}
+
+/// Bounds for a user-selected screen bitrate. The recorder offers 10, 20 and
+/// 30 Mbps; anything outside that range is clamped.
+const MIN_VIDEO_BITRATE_BPS: u32 = 10_000_000;
+const MAX_VIDEO_BITRATE_BPS: u32 = 30_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -237,6 +255,10 @@ pub struct SessionStatusResult {
     /// session is clean.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_runtime_error: Option<RuntimeErrorRecord>,
+    /// First non-recoverable native error. Unlike `last_runtime_error`, this
+    /// remains stable so a short-lived later event cannot hide the root cause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_terminal_error: Option<RuntimeErrorRecord>,
     /// Aggregate number of gaps / discontinuities observed across every
     /// track in the active session. Mirrors the journal's `Discontinuity`
     /// records so the UI can show "N gaps" without re-scanning disk.
@@ -246,6 +268,24 @@ pub struct SessionStatusResult {
     pub timestamp_records_dropped: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_path: Option<String>,
+    #[serde(default)]
+    pub screen_samples: u64,
+    #[serde(default)]
+    pub camera_samples: u64,
+    #[serde(default)]
+    pub system_audio_samples: u64,
+    #[serde(default)]
+    pub mic_samples: u64,
+    pub system_audio_peak_db: Option<f64>,
+    pub mic_peak_db: Option<f64>,
+    pub screen_last_sample_age_ms: Option<u64>,
+    pub camera_last_sample_age_ms: Option<u64>,
+    pub system_audio_last_sample_age_ms: Option<u64>,
+    pub mic_last_sample_age_ms: Option<u64>,
+    pub screen_segments: u64,
+    pub camera_segments: u64,
+    pub system_audio_segments: u64,
+    pub mic_segments: u64,
 }
 
 /// Result envelope for the new `compute_source_geometry` Tauri command.
@@ -467,6 +507,11 @@ pub fn start_recording_impl(
     let _cmd_guard = state.command_lock.lock();
 
     if state.native_capture_enabled {
+        // The studio preview view stays attached: the recording session feeds
+        // the same mailbox. Never touch the AppKit view from here — this runs
+        // on a blocking worker, and the Swift adapter's `DispatchQueue.main.sync`
+        // while holding the `studio_preview` lock deadlocks against main-thread
+        // layout/detach commands and the preview pump.
         crate::capture::preview::stop();
     }
 
@@ -474,7 +519,9 @@ pub fn start_recording_impl(
     // microphone are optional tracks: if those TCC grants are missing, drop
     // them and still record the screen instead of failing the whole session.
     let permissions = get_permission_status_impl(state);
-    if !permissions.screen_recording.is_authorized() {
+    if (options.capture_screen || options.capture_system_audio)
+        && !permissions.screen_recording.is_authorized()
+    {
         let _ = state.state_machine.transition_to(SessionState::Error);
         return Err(
             "Screen recording permission denied. Please grant permission in macOS System Settings."
@@ -487,6 +534,13 @@ pub fn start_recording_impl(
     }
     if !permissions.microphone.is_authorized() {
         options.mic_id = None;
+    }
+    if !options.capture_screen
+        && options.camera_id.is_none()
+        && options.mic_id.is_none()
+        && !options.capture_system_audio
+    {
+        return Err("Select at least one media source before recording".into());
     }
     let initial_layout = options.layout.clone().unwrap_or_default();
     initial_layout.validate()?;
@@ -552,25 +606,31 @@ pub fn start_recording_impl(
     // Parse recording options
     let (width, height) = match options.resolution.as_str() {
         "4k" | "4K" => (3840, 2160),
+        "1440p" => (2560, 1440),
         "720p" => (1280, 720),
         _ => (1920, 1080),
     };
     let fps = if options.fps > 0 { options.fps } else { 30 };
+    let video_bitrate_bps = options
+        .video_bitrate_bps
+        .map(|bps| bps.clamp(MIN_VIDEO_BITRATE_BPS, MAX_VIDEO_BITRATE_BPS));
 
     // 1. Primary screen track
-    bundle.manifest_mut().tracks.push(TrackDescriptor {
-        id: "screen".into(),
-        track_type: TrackType::Screen,
-        codec: "h264".into(),
-        relative_path: "media/screen/000001.mp4".into(),
-        width: Some(width),
-        height: Some(height),
-        fps: Some(fps),
-        sample_rate: None,
-        channels: None,
-        gaps_total: 0,
-        media_timescale: None,
-    });
+    if options.capture_screen {
+        bundle.manifest_mut().tracks.push(TrackDescriptor {
+            id: "screen".into(),
+            track_type: TrackType::Screen,
+            codec: "h264".into(),
+            relative_path: "media/screen/000001.mp4".into(),
+            width: Some(width),
+            height: Some(height),
+            fps: Some(fps),
+            sample_rate: None,
+            channels: None,
+            gaps_total: 0,
+            media_timescale: None,
+        });
+    }
 
     // 2. Conditional webcam track
     if options.camera_id.is_some() {
@@ -643,8 +703,8 @@ pub fn start_recording_impl(
         });
     let geometry =
         crate::capture::compute_source_geometry(&resolved_source, width, height, FitMode::Fit);
-    bundle.manifest_mut().source_geometry = Some(geometry);
-    bundle.manifest_mut().cursor_mode = Some("baked".into());
+    bundle.manifest_mut().source_geometry = options.capture_screen.then_some(geometry);
+    bundle.manifest_mut().cursor_mode = options.capture_screen.then(|| "baked".into());
 
     let manifest_path = bundle.root_path().join("manifest.json");
     bundle
@@ -677,10 +737,10 @@ pub fn start_recording_impl(
                 Some(bundle.root_path().to_path_buf()),
             );
 
-            let started_at = std::time::Instant::now();
             match crate::capture::macos::MacCaptureSession::start(
                 crate::capture::macos::NativeRecordingConfig {
                     source_id: &options.source_id,
+                    capture_screen: options.capture_screen,
                     camera_id: options.camera_id.as_deref(),
                     mic_id: options.mic_id.as_deref(),
                     capture_system_audio: options.capture_system_audio,
@@ -693,9 +753,47 @@ pub fn start_recording_impl(
                     project_path: bundle.root_path(),
                     session_offset_us: epoch.current_elapsed_us(),
                     mic_gain_db: options.mic_gain_db,
+                    video_bitrate_bps,
+                    capture_mouse: options.capture_mouse,
                 },
             ) {
-                Ok(session) => native_session = Some(session),
+                Ok(session) => {
+                    let ready = session.wait_until_ready(
+                        options.capture_screen,
+                        options.camera_id.is_some(),
+                        options.mic_id.is_some(),
+                        std::time::Duration::from_secs(5),
+                    );
+                    if let Err(error) = ready {
+                        drop(session);
+                        crate::capture::macos::clear_callback_targets();
+                        let failed = ActiveSession {
+                            session_id: session_id.clone(),
+                            project_name: display_name,
+                            epoch,
+                            project_bundle: bundle,
+                            segment_writer: None,
+                            extra_writers: Vec::new(),
+                            native_session: None,
+                            native_outcome: NativeCaptureOutcome::PrepareFailed {
+                                message: error.clone(),
+                            },
+                            pause_intervals: Vec::new(),
+                            current_pause_start_us: None,
+                            started_at_us,
+                            initial_layout: initial_layout.clone(),
+                            native_pause_unacked: false,
+                        };
+                        return Err(retain_failed_session(
+                            state,
+                            failed,
+                            "session",
+                            LIFECYCLE_PREPARE,
+                            format!("Native capture did not become ready: {error}"),
+                        ));
+                    }
+                    native_session = Some(session);
+                }
                 Err(error) => {
                     crate::capture::macos::clear_callback_targets();
                     let failed = ActiveSession {
@@ -724,28 +822,18 @@ pub fn start_recording_impl(
                     ));
                 }
             }
-
-            // Defensive 5 s startup budget: if the macOS capture session
-            // returned a handle but never produced a callback (i.e. the
-            // `startCaptureHandler` completion is silently lost), we
-            // still succeed at the Rust level so the UI can show a
-            // "recording" state. The runtime-error callback is the
-            // canonical signal; if it never fires, the user can stop
-            // manually. A future Swift update will signal
-            // startCaptureHandler completion via the runtime-error
-            // channel with a reserved code; when that lands, this
-            // budget becomes a hard timeout enforced by a side channel.
-            let _ = started_at; // captured for the future timeout enforcement
         }
     } else {
-        let mut writer = bundle.create_segment_writer("screen", TrackType::Screen, "h264");
-        writer
-            .begin_segment(0)
-            .map_err(|e| format!("Failed to open segment: {e}"))?;
-        writer
-            .write_data(&generate_valid_fmp4_segment(0, 33_333, true))
-            .map_err(|e| format!("Failed writing initial segment data: {e}"))?;
-        segment_writer = Some(writer);
+        if options.capture_screen {
+            let mut writer = bundle.create_segment_writer("screen", TrackType::Screen, "h264");
+            writer
+                .begin_segment(0)
+                .map_err(|e| format!("Failed to open segment: {e}"))?;
+            writer
+                .write_data(&generate_valid_fmp4_segment(0, 33_333, true))
+                .map_err(|e| format!("Failed writing initial segment data: {e}"))?;
+            segment_writer = Some(writer);
+        }
 
         if options.camera_id.is_some() {
             let mut writer = bundle.create_segment_writer("webcam", TrackType::Webcam, "h264");
@@ -828,13 +916,7 @@ const LIFECYCLE_FINALIZE: i32 = -610;
 const LIFECYCLE_JOURNAL: i32 = -611;
 const LIFECYCLE_NATIVE_PAUSE: i32 = -612;
 
-fn record_lifecycle_error(
-    state: &AppState,
-    track_id: &str,
-    code: i32,
-    message: &str,
-    t_us: u64,
-) {
+fn record_lifecycle_error(state: &AppState, track_id: &str, code: i32, message: &str, t_us: u64) {
     state.diagnostics.apply(&SessionEvent::RuntimeError {
         track_id: track_id.to_string(),
         error_code: code,
@@ -890,10 +972,9 @@ fn sticky_native_stop_error(session: &ActiveSession) -> Option<(i32, String)> {
                  Previously committed segments remain available for recovery."
             ),
         )),
-        NativeCaptureOutcome::NoScreenMedia => Some((
+        NativeCaptureOutcome::MissingOrInvalidMedia { message } => Some((
             LIFECYCLE_FINALIZE,
-            "No screen media was saved. Capture received no writable frames; the project has been retained for diagnostics."
-                .into(),
+            format!("{message}. The project has been retained for diagnostics."),
         )),
         _ => None,
     }
@@ -1062,9 +1143,12 @@ pub fn resume_recording_impl(state: &AppState) -> Result<SessionStateResult, Str
     }
 
     for writer in &mut session.extra_writers {
-        writer
-            .begin_segment(now_us)
-            .map_err(|e| format!("Failed to open {} segment on resume: {e}", writer.track_id()))?;
+        writer.begin_segment(now_us).map_err(|e| {
+            format!(
+                "Failed to open {} segment on resume: {e}",
+                writer.track_id()
+            )
+        })?;
         if writer.track_type() == TrackType::Webcam {
             let d = generate_valid_fmp4_segment(now_us, 33_333, true);
             writer
@@ -1164,13 +1248,7 @@ pub fn stop_recording_impl(state: &AppState) -> Result<StopRecordingResult, Stri
     if let Some(writer) = session.segment_writer.as_mut() {
         if let Err(e) = writer.finalize(final_segment_end_us, session.project_bundle.journal()) {
             let msg = format!("Storage finalization failed for screen track: {e}");
-            record_lifecycle_error(
-                state,
-                "screen",
-                LIFECYCLE_FINALIZE,
-                &msg,
-                gross_duration_us,
-            );
+            record_lifecycle_error(state, "screen", LIFECYCLE_FINALIZE, &msg, gross_duration_us);
             let _ = state.state_machine.transition_to(SessionState::Error);
             *state.active_session.write() = Some(session);
             return Err(msg);
@@ -1187,7 +1265,13 @@ pub fn stop_recording_impl(state: &AppState) -> Result<StopRecordingResult, Stri
     }
     if let Some((track_id, e)) = extra_writer_err {
         let msg = format!("Storage finalization failed for track {track_id}: {e}");
-        record_lifecycle_error(state, &track_id, LIFECYCLE_FINALIZE, &msg, gross_duration_us);
+        record_lifecycle_error(
+            state,
+            &track_id,
+            LIFECYCLE_FINALIZE,
+            &msg,
+            gross_duration_us,
+        );
         let _ = state.state_machine.transition_to(SessionState::Error);
         *state.active_session.write() = Some(session);
         return Err(msg);
@@ -1207,21 +1291,80 @@ pub fn stop_recording_impl(state: &AppState) -> Result<StopRecordingResult, Stri
             Ok(records) => records,
             Err(e) => {
                 let msg = e.to_string();
-                record_lifecycle_error(state, "session", LIFECYCLE_JOURNAL, &msg, gross_duration_us);
+                record_lifecycle_error(
+                    state,
+                    "session",
+                    LIFECYCLE_JOURNAL,
+                    &msg,
+                    gross_duration_us,
+                );
                 let _ = state.state_machine.transition_to(SessionState::Error);
                 *state.active_session.write() = Some(session);
                 return Err(msg);
             }
         };
-        let has_screen = records.iter().any(|r| matches!(r,
-            JournalRecord::SegmentCommitted { track_id, size_bytes, .. } if track_id == "screen" && *size_bytes > 0));
-        if !has_screen {
-            session.native_outcome = NativeCaptureOutcome::NoScreenMedia;
-            let msg = "No screen media was saved. Capture received no writable frames; the project has been retained for diagnostics.";
-            record_lifecycle_error(state, "screen", LIFECYCLE_FINALIZE, msg, gross_duration_us);
+        let expected_tracks: Vec<String> = session
+            .project_bundle
+            .manifest()
+            .tracks
+            .iter()
+            .map(|track| track.id.clone())
+            .collect();
+        let mut committed_tracks = std::collections::HashSet::new();
+        let mut oversized_segments = Vec::new();
+        for record in &records {
+            if let JournalRecord::SegmentCommitted {
+                track_id,
+                relative_path,
+                start_us,
+                end_us,
+                size_bytes,
+                ..
+            } = record
+            {
+                if *size_bytes > 0 {
+                    committed_tracks.insert(track_id.as_str());
+                }
+                if end_us.saturating_sub(*start_us) > 60_000_000 {
+                    oversized_segments.push(relative_path.as_str());
+                }
+            }
+        }
+        let missing_tracks: Vec<&str> = expected_tracks
+            .iter()
+            .map(String::as_str)
+            .filter(|track_id| !committed_tracks.contains(track_id))
+            .collect();
+        if !missing_tracks.is_empty() || !oversized_segments.is_empty() {
+            let mut problems = Vec::new();
+            if !missing_tracks.is_empty() {
+                problems.push(format!(
+                    "No valid committed media was saved for {}",
+                    missing_tracks.join(", ")
+                ));
+            }
+            if !oversized_segments.is_empty() {
+                problems.push(format!(
+                    "Segments exceeded the 60-second limit: {}",
+                    oversized_segments.join(", ")
+                ));
+            }
+            let msg = problems.join("; ");
+            session.native_outcome = NativeCaptureOutcome::MissingOrInvalidMedia {
+                message: msg.clone(),
+            };
+            record_lifecycle_error(
+                state,
+                "session",
+                LIFECYCLE_FINALIZE,
+                &msg,
+                gross_duration_us,
+            );
             let _ = state.state_machine.transition_to(SessionState::Error);
             *state.active_session.write() = Some(session);
-            return Err(msg.into());
+            return Err(format!(
+                "{msg}. The project has been retained for diagnostics."
+            ));
         }
     }
 
@@ -1246,6 +1389,28 @@ pub fn stop_recording_impl(state: &AppState) -> Result<StopRecordingResult, Stri
         })
         .collect();
 
+    let final_records = match session.project_bundle.journal().read_all() {
+        Ok(records) => records,
+        Err(error) => {
+            let msg = format!("Storage error reading final journal: {error}");
+            record_lifecycle_error(state, "session", LIFECYCLE_JOURNAL, &msg, gross_duration_us);
+            let _ = state.state_machine.transition_to(SessionState::Error);
+            *state.active_session.write() = Some(session);
+            return Err(msg);
+        }
+    };
+    let mut gaps_by_track = std::collections::HashMap::<String, u64>::new();
+    for record in &final_records {
+        if let JournalRecord::Discontinuity { track_id, .. } = record {
+            let count = gaps_by_track.entry(track_id.clone()).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+    for track in &mut session.project_bundle.manifest_mut().tracks {
+        track.gaps_total = gaps_by_track.get(&track.id).copied().unwrap_or(0);
+    }
+    session.project_bundle.manifest_mut().gaps_total = gaps_by_track.values().copied().sum();
+
     if let Err(e) = session
         .project_bundle
         .manifest()
@@ -1256,9 +1421,42 @@ pub fn stop_recording_impl(state: &AppState) -> Result<StopRecordingResult, Stri
         return Err(format!("Storage error saving manifest backup: {}", e));
     }
 
+    // Telemetry is written only when mouse tracking was on for a screen recording.
+    let telemetry_recorded = session
+        .project_bundle
+        .root_path()
+        .join("telemetry/events.jsonl")
+        .exists();
+    let mouse_stream = if session.project_bundle.manifest().cursor_mode.is_some() && telemetry_recorded {
+        match crate::telemetry::reader::read_telemetry(session.project_bundle.root_path()) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                let _ = state.state_machine.transition_to(SessionState::Error);
+                *state.active_session.write() = Some(session);
+                return Err(format!("Mouse telemetry qualification failed: {error}"));
+            }
+        }
+    } else {
+        None
+    };
+    let qualification = crate::project::build_capture_qualification_report(
+        session.project_bundle.manifest(),
+        &final_records,
+        mouse_stream.as_ref(),
+    );
+    if let Err(error) = crate::project::save_capture_qualification_report(
+        session.project_bundle.root_path(),
+        &qualification,
+    ) {
+        let _ = state.state_machine.transition_to(SessionState::Error);
+        *state.active_session.write() = Some(session);
+        return Err(format!(
+            "Storage error saving capture qualification report: {error}"
+        ));
+    }
+
     // Seed the non-destructive edit document with the canvas and camera layout
-    // that the user saw while recording. Without this, every new project opened
-    // in Edit Studio silently fell back to 16:9 regardless of the selected ratio.
+    // that the user saw while recording.
     let mut retained = Vec::new();
     let mut cursor = 0;
     for (pause_start, pause_end) in &session.pause_intervals {
@@ -1337,7 +1535,22 @@ pub fn get_session_status_impl(state: &AppState) -> SessionStatusResult {
         };
 
     #[cfg(target_os = "macos")]
-    let (dropped_frames, audio_buffer_underflows, native_gaps, timestamp_records_dropped) = state
+    let (
+        dropped_frames,
+        audio_buffer_underflows,
+        native_gaps,
+        timestamp_records_dropped,
+        screen_samples,
+        camera_samples,
+        system_audio_samples,
+        mic_samples,
+        system_audio_peak_db,
+        mic_peak_db,
+        screen_last_sample_age_ms,
+        camera_last_sample_age_ms,
+        system_audio_last_sample_age_ms,
+        mic_last_sample_age_ms,
+    ) = state
         .active_session
         .read()
         .as_ref()
@@ -1349,12 +1562,36 @@ pub fn get_session_status_impl(state: &AppState) -> SessionStatusResult {
                 stats.audio_buffer_underflows,
                 stats.gaps_total,
                 stats.timestamp_records_dropped,
+                stats.screen_samples,
+                stats.camera_samples,
+                stats.system_audio_samples,
+                stats.mic_samples,
+                stats.system_audio_peak_db,
+                stats.mic_peak_db,
+                stats.screen_last_sample_age_ms,
+                stats.camera_last_sample_age_ms,
+                stats.system_audio_last_sample_age_ms,
+                stats.mic_last_sample_age_ms,
             )
         })
-        .unwrap_or((0, 0, 0, 0));
+        .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, None, None, None, None, None, None));
     #[cfg(not(target_os = "macos"))]
-    let (dropped_frames, audio_buffer_underflows, native_gaps, timestamp_records_dropped) =
-        (0, 0, 0, 0);
+    let (
+        dropped_frames,
+        audio_buffer_underflows,
+        native_gaps,
+        timestamp_records_dropped,
+        screen_samples,
+        camera_samples,
+        system_audio_samples,
+        mic_samples,
+        system_audio_peak_db,
+        mic_peak_db,
+        screen_last_sample_age_ms,
+        camera_last_sample_age_ms,
+        system_audio_last_sample_age_ms,
+        mic_last_sample_age_ms,
+    ) = (0, 0, 0, 0, 0, 0, 0, 0, None, None, None, None, None, None);
 
     let project_path = state
         .active_session
@@ -1368,12 +1605,26 @@ pub fn get_session_status_impl(state: &AppState) -> SessionStatusResult {
         dropped_frames,
         audio_buffer_underflows,
         last_runtime_error: state.diagnostics.last_runtime_error(),
+        first_terminal_error: state.diagnostics.first_terminal_error(),
         gaps_total: state.diagnostics.gaps_total().max(native_gaps),
         timestamp_records_dropped,
         project_path,
+        screen_samples,
+        camera_samples,
+        system_audio_samples,
+        mic_samples,
+        system_audio_peak_db,
+        mic_peak_db,
+        screen_last_sample_age_ms,
+        camera_last_sample_age_ms,
+        system_audio_last_sample_age_ms,
+        mic_last_sample_age_ms,
+        screen_segments: state.diagnostics.segment_count("screen"),
+        camera_segments: state.diagnostics.segment_count("webcam"),
+        system_audio_segments: state.diagnostics.segment_count("system"),
+        mic_segments: state.diagnostics.segment_count("mic"),
     }
 }
-
 
 /// Computes the active source / destination geometry for the given
 /// `source_id`. The Frontend calls this to preview the active rect before
@@ -1585,9 +1836,24 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn start_options_accept_optional_video_bitrate() {
+        let with: StartRecordingOptions = serde_json::from_str(
+            r#"{"sourceId":"display:1","fps":60,"resolution":"1440p","videoBitrateBps":20000000}"#,
+        )
+        .unwrap();
+        assert_eq!(with.video_bitrate_bps, Some(20_000_000));
+        let without: StartRecordingOptions =
+            serde_json::from_str(r#"{"sourceId":"display:1","fps":30,"resolution":"1080p"}"#)
+                .unwrap();
+        assert_eq!(without.video_bitrate_bps, None);
+        assert!(without.capture_mouse, "mouse tracking defaults to on");
+    }
+
+    #[test]
     fn test_ipc_serialization_roundtrip_camel_case() {
         let opt = StartRecordingOptions {
             source_id: "src-1".into(),
+            capture_screen: true,
             camera_id: Some("cam-1".into()),
             mic_id: Some("mic-1".into()),
             capture_system_audio: true,
@@ -1597,6 +1863,8 @@ mod tests {
             project_name: None,
             project_dir: None,
             mic_gain_db: Some(-6.0),
+            video_bitrate_bps: None,
+            capture_mouse: true,
         };
 
         let json = serde_json::to_string(&opt).unwrap();
@@ -1606,6 +1874,8 @@ mod tests {
         // Skipped when None (frontend contract — `undefined` is the same).
         let opt_no_gain = StartRecordingOptions {
             mic_gain_db: None,
+            video_bitrate_bps: None,
+            capture_mouse: true,
             ..opt.clone()
         };
         let json_no_gain = serde_json::to_string(&opt_no_gain).unwrap();
@@ -1632,6 +1902,7 @@ mod tests {
         portrait_layout.aspect_ratio = "9:16".into();
         let opts = StartRecordingOptions {
             source_id: "screen-main".into(),
+            capture_screen: true,
             camera_id: None,
             mic_id: None,
             capture_system_audio: false,
@@ -1641,6 +1912,8 @@ mod tests {
             project_name: None,
             project_dir: None,
             mic_gain_db: None,
+            video_bitrate_bps: None,
+            capture_mouse: true,
         };
 
         // First recording
@@ -1755,6 +2028,7 @@ mod tests {
             &state,
             StartRecordingOptions {
                 source_id: "screen-main".into(),
+                capture_screen: true,
                 camera_id: None,
                 mic_id: None,
                 capture_system_audio: false,
@@ -1764,6 +2038,8 @@ mod tests {
                 project_name: Some(" Launch Demo ".into()),
                 project_dir: Some(nested.to_string_lossy().into_owned()),
                 mic_gain_db: None,
+                video_bitrate_bps: None,
+                capture_mouse: true,
             },
         )
         .unwrap();
@@ -1781,6 +2057,7 @@ mod tests {
             &state,
             StartRecordingOptions {
                 source_id: "screen-main".into(),
+                capture_screen: true,
                 camera_id: None,
                 mic_id: None,
                 capture_system_audio: false,
@@ -1790,6 +2067,8 @@ mod tests {
                 project_name: Some("Launch Demo".into()),
                 project_dir: Some(nested.to_string_lossy().into_owned()),
                 mic_gain_db: None,
+                video_bitrate_bps: None,
+                capture_mouse: true,
             },
         );
         assert!(collision.unwrap_err().contains("already exists"));
@@ -1798,6 +2077,7 @@ mod tests {
             &state,
             StartRecordingOptions {
                 source_id: "screen-main".into(),
+                capture_screen: true,
                 camera_id: None,
                 mic_id: None,
                 capture_system_audio: false,
@@ -1807,6 +2087,8 @@ mod tests {
                 project_name: None,
                 project_dir: Some(nested.to_string_lossy().into_owned()),
                 mic_gain_db: None,
+                video_bitrate_bps: None,
+                capture_mouse: true,
             },
         )
         .unwrap();
@@ -1819,6 +2101,7 @@ mod tests {
             &state,
             StartRecordingOptions {
                 source_id: "screen-main".into(),
+                capture_screen: true,
                 camera_id: None,
                 mic_id: None,
                 capture_system_audio: false,
@@ -1828,6 +2111,8 @@ mod tests {
                 project_name: None,
                 project_dir: Some(nested.to_string_lossy().into_owned()),
                 mic_gain_db: None,
+                video_bitrate_bps: None,
+                capture_mouse: true,
             },
         )
         .unwrap();
@@ -1838,6 +2123,7 @@ mod tests {
             &state,
             StartRecordingOptions {
                 source_id: "screen-main".into(),
+                capture_screen: true,
                 camera_id: None,
                 mic_id: None,
                 capture_system_audio: false,
@@ -1847,6 +2133,8 @@ mod tests {
                 project_name: Some("Nope".into()),
                 project_dir: Some("relative/path".into()),
                 mic_gain_db: None,
+                video_bitrate_bps: None,
+                capture_mouse: true,
             },
         );
         assert!(relative.unwrap_err().contains("absolute"));
@@ -1861,6 +2149,83 @@ mod tests {
         assert!(err.contains(".aero"));
         assert!(resolve_project_parent(Some("/tmp/aeroshoot/../secret"), dir.path()).is_err());
         assert!(resolve_project_parent(Some("/tmp/does-not-exist-aeroshoot"), dir.path()).is_err());
+    }
+
+    #[test]
+    fn optional_screen_session_creates_only_selected_tracks() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new_test(dir.path().to_path_buf());
+        let started = start_recording_impl(
+            &state,
+            StartRecordingOptions {
+                source_id: "screen-main".into(),
+                capture_screen: false,
+                camera_id: Some("camera-1".into()),
+                mic_id: Some("mic-1".into()),
+                capture_system_audio: false,
+                fps: 30,
+                resolution: "1080p".into(),
+                layout: None,
+                project_name: Some("Camera and Mic".into()),
+                project_dir: None,
+                mic_gain_db: Some(3.0),
+                video_bitrate_bps: None,
+                capture_mouse: true,
+            },
+        )
+        .unwrap();
+        let manifest = state
+            .active_session
+            .read()
+            .as_ref()
+            .unwrap()
+            .project_bundle
+            .manifest()
+            .clone();
+        assert!(manifest
+            .tracks
+            .iter()
+            .all(|track| track.track_type != TrackType::Screen));
+        assert!(manifest
+            .tracks
+            .iter()
+            .any(|track| track.track_type == TrackType::Webcam));
+        assert!(manifest
+            .tracks
+            .iter()
+            .any(|track| track.track_type == TrackType::MicAudio));
+        assert!(manifest.source_geometry.is_none());
+        assert!(manifest.cursor_mode.is_none());
+        assert_eq!(
+            stop_recording_impl(&state).unwrap().session_id,
+            started.session_id
+        );
+    }
+
+    #[test]
+    fn recording_with_every_media_source_off_is_rejected() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new_test(dir.path().to_path_buf());
+        let result = start_recording_impl(
+            &state,
+            StartRecordingOptions {
+                source_id: "screen-main".into(),
+                capture_screen: false,
+                camera_id: None,
+                mic_id: None,
+                capture_system_audio: false,
+                fps: 30,
+                resolution: "1080p".into(),
+                layout: None,
+                project_name: None,
+                project_dir: None,
+                mic_gain_db: None,
+                video_bitrate_bps: None,
+                capture_mouse: true,
+            },
+        );
+        assert!(result.unwrap_err().contains("at least one media source"));
+        assert!(state.active_session.read().is_none());
     }
 
     #[test]

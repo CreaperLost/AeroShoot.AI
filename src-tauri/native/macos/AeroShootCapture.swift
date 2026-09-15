@@ -444,6 +444,7 @@ private func atomicRename(from src: String, to dst: String) -> Bool {
 
 private struct NativeConfig: Decodable {
   let sourceId: String
+  let captureScreen: Bool
   let cameraId: String?
   let micId: String?
   let captureSystemAudio: Bool
@@ -455,6 +456,9 @@ private struct NativeConfig: Decodable {
   let preservesAspectRatio: Bool?
   let projectPath: String
   let sessionOffsetUs: UInt64
+  let micGainDb: Float?
+  let videoBitrateBps: Int?
+  let captureMouse: Bool?
 }
 
 private struct NativeRect: Decodable {
@@ -488,6 +492,16 @@ private struct StatsDTO: Encodable {
   let timestampRecordsDropped: UInt64
   let gapsTotal: UInt64
   let lastError: String?
+  let screenSamples: UInt64
+  let cameraSamples: UInt64
+  let systemAudioSamples: UInt64
+  let micSamples: UInt64
+  let systemAudioPeakDb: Double?
+  let micPeakDb: Double?
+  let screenLastSampleAgeMs: UInt64?
+  let cameraLastSampleAgeMs: UInt64?
+  let systemAudioLastSampleAgeMs: UInt64?
+  let micLastSampleAgeMs: UInt64?
 }
 
 // MARK: - Legacy C exports (preserved verbatim for back-compat with src-tauri/src/capture/macos.rs)
@@ -742,8 +756,8 @@ private let kMicGainClampLowDb: Float = -24.0
 private let kMicGainClampHighDb: Float = 24.0
 
 /// Convert a decibel gain to a linear multiplier. `-inf dB` is clamped to
-/// zero so a fully-attenuated slider mutes the track instead of leaving it
-/// at unity.
+/// the configured lower bound remains a real attenuation value rather than
+/// being mistaken for unity.
 @inline(__always)
 private func linearGain(forDb db: Float) -> Float {
   let clamped = min(max(db, kMicGainClampLowDb), kMicGainClampHighDb)
@@ -757,9 +771,9 @@ private func linearGain(forDb db: Float) -> Float {
 /// for callers that always pass 0 dB) or when the format is unsupported.
 @discardableResult
 private func applyMicGain(_ sampleBuffer: CMSampleBuffer, gainDb: Float) -> CMSampleBuffer {
-  // Short-circuit for unity gain and any sub-clamp-low value (mute).
+  // Only unity can skip processing. Values outside the public range are
+  // clamped by `linearGain`; in particular −24 dB must not become 0 dB.
   if gainDb >= -0.001 && gainDb <= 0.001 { return sampleBuffer }
-  if gainDb <= kMicGainClampLowDb { return sampleBuffer }
 
   guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
     return sampleBuffer
@@ -810,6 +824,49 @@ private func applyMicGain(_ sampleBuffer: CMSampleBuffer, gainDb: Float) -> CMSa
     }
   }
   return sampleBuffer
+}
+
+/// Read the highest absolute PCM sample without changing the buffer. The
+/// value is used only for UI metering; unsupported formats return nil rather
+/// than inventing silence.
+private func audioPeakDb(_ sampleBuffer: CMSampleBuffer) -> Double? {
+  guard let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+        let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee else {
+    return nil
+  }
+  var retained: CMBlockBuffer?
+  var list = AudioBufferList(
+    mNumberBuffers: 1,
+    mBuffers: AudioBuffer(mNumberChannels: 0, mDataByteSize: 0, mData: nil)
+  )
+  let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+    sampleBuffer,
+    bufferListSizeNeededOut: nil,
+    bufferListOut: &list,
+    bufferListSize: MemoryLayout<AudioBufferList>.size,
+    blockBufferAllocator: kCFAllocatorDefault,
+    blockBufferMemoryAllocator: kCFAllocatorDefault,
+    flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+    blockBufferOut: &retained
+  )
+  guard status == noErr else { return nil }
+  var peak: Double = 0
+  let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+  for buffer in UnsafeMutableAudioBufferListPointer(&list) {
+    guard let raw = buffer.mData else { continue }
+    if isFloat && asbd.mBitsPerChannel == 32 {
+      let count = Int(buffer.mDataByteSize) / MemoryLayout<Float32>.size
+      let samples = raw.bindMemory(to: Float32.self, capacity: count)
+      for index in 0..<count { peak = max(peak, abs(Double(samples[index]))) }
+    } else if asbd.mBitsPerChannel == 16 {
+      let count = Int(buffer.mDataByteSize) / MemoryLayout<Int16>.size
+      let samples = raw.bindMemory(to: Int16.self, capacity: count)
+      for index in 0..<count { peak = max(peak, abs(Double(samples[index])) / 32768.0) }
+    } else {
+      return nil
+    }
+  }
+  return peak > 0 ? 20.0 * log10(min(peak, 1.0)) : -120.0
 }
 
 private final class Recorder: NSObject, SCStreamDelegate, SCStreamOutput, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
@@ -985,7 +1042,7 @@ private final class Recorder: NSObject, SCStreamDelegate, SCStreamOutput, AVCapt
     timestampLog?.close()
   }
 
-  func stats() -> StatsDTO { stateLock.lock(); defer { stateLock.unlock() }; return StatsDTO(droppedFrames: droppedFrames, audioBufferUnderflows: audioUnderflows, timestampRecordsDropped: 0, gapsTotal: 0, lastError: lastError) }
+  func stats() -> StatsDTO { stateLock.lock(); defer { stateLock.unlock() }; return StatsDTO(droppedFrames: droppedFrames, audioBufferUnderflows: audioUnderflows, timestampRecordsDropped: 0, gapsTotal: 0, lastError: lastError, screenSamples: 0, cameraSamples: 0, systemAudioSamples: 0, micSamples: 0, systemAudioPeakDb: nil, micPeakDb: nil, screenLastSampleAgeMs: nil, cameraLastSampleAgeMs: nil, systemAudioLastSampleAgeMs: nil, micLastSampleAgeMs: nil) }
 }
 
 private func decodeConfig(_ pointer: UnsafePointer<CChar>) throws -> NativeConfig {
@@ -1458,6 +1515,8 @@ private final class RotatingMediaWriter {
   let videoHeight: Int
   let videoFps: Int
   let audioChannels: Int
+  /// Explicit average bitrate; nil derives it from size and frame rate.
+  let videoBitrate: Int?
 
   private(set) var currentIndex: Int = 0
   // Sequence allocation belongs to the writer, not to the sample callback.
@@ -1483,7 +1542,8 @@ private final class RotatingMediaWriter {
   // continue recording and can make a broken temp file look committable.
   private var terminalFailure: (code: Int32, reason: String)?
 
-  init(trackId: String, kind: TrackKind, directory: String, videoWidth: Int, videoHeight: Int, videoFps: Int, audioChannels: Int) {
+  init(trackId: String, kind: TrackKind, directory: String, videoWidth: Int, videoHeight: Int, videoFps: Int, audioChannels: Int, videoBitrate: Int? = nil) {
+    self.videoBitrate = videoBitrate
     self.trackId = trackId
     self.kind = kind
     self.directory = directory
@@ -1530,7 +1590,7 @@ private final class RotatingMediaWriter {
       w.movieFragmentInterval = CMTime(seconds: 2, preferredTimescale: 600)
       w.shouldOptimizeForNetworkUse = true
       let properties: [String: Any] = [
-        AVVideoAverageBitRateKey: max(4_000_000, videoWidth * videoHeight * max(videoFps, 1) / 5),
+        AVVideoAverageBitRateKey: videoBitrate ?? max(4_000_000, videoWidth * videoHeight * max(videoFps, 1) / 5),
         AVVideoMaxKeyFrameIntervalDurationKey: 2,
         AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
         AVVideoAllowFrameReorderingKey: false
@@ -1670,9 +1730,19 @@ private final class RotatingMediaWriter {
     if !pts.isValid || pts.value < 0 { pts = .zero }
     var duration = CMSampleBufferGetDuration(sample)
     if !duration.isValid || duration.value <= 0 {
-      duration = kind == .video
-        ? videoFrameDuration(fps: videoFps)
-        : CMTime(value: 1, timescale: 48_000)
+      if kind == .video {
+        duration = videoFrameDuration(fps: videoFps)
+      } else {
+        let frames = max(CMSampleBufferGetNumSamples(sample), 1)
+        let sampleRate: Double = {
+          guard let description = CMSampleBufferGetFormatDescription(sample),
+            let stream = CMAudioFormatDescriptionGetStreamBasicDescription(description)
+          else { return 48_000 }
+          return stream.pointee.mSampleRate > 0 ? stream.pointee.mSampleRate : 48_000
+        }()
+        let timescale = CMTimeScale(max(1, min(Double(Int32.max), sampleRate.rounded())))
+        duration = CMTime(value: CMTimeValue(frames), timescale: timescale)
+      }
     }
     var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
     var output: CMSampleBuffer?
@@ -1892,7 +1962,7 @@ private final class PerTrackRecorder {
   private var lastMappedPtsTimescale: Int32 = 0
   private let ptsLock = NSLock()
 
-  init(trackId: String, kind: RotatingMediaWriter.TrackKind, directory: String, videoWidth: Int, videoHeight: Int, videoFps: Int, audioChannels: Int, coalesceKey: String?) {
+  init(trackId: String, kind: RotatingMediaWriter.TrackKind, directory: String, videoWidth: Int, videoHeight: Int, videoFps: Int, audioChannels: Int, coalesceKey: String?, videoBitrate: Int? = nil) {
     self.trackId = trackId
     self.kind = kind
     self.directory = directory
@@ -1904,7 +1974,8 @@ private final class PerTrackRecorder {
       videoWidth: videoWidth,
       videoHeight: videoHeight,
       videoFps: videoFps,
-      audioChannels: audioChannels
+      audioChannels: audioChannels,
+      videoBitrate: videoBitrate
     )
   }
 
@@ -1987,6 +2058,13 @@ private final class PerTrackRecorder {
 // out samples to per-track recorders, runs a periodic rotation timer, and
 // reports start/stop results via the typed EncoderResult.
 
+// Keep each committed audio/video segment below the qualification limit while
+// avoiding the old two-second file churn. The setting is intentionally shared
+// by every enabled track so screen, webcam, mic, and system audio stay on the
+// same 60-second rotation cadence.
+private let kRecordingSegmentDurationSec: TimeInterval = 60.0
+private let kMaximumRecordingSegmentDurationSec: TimeInterval = 60.0
+
 private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
   let config: NativeConfig
   let screenQueue = DispatchQueue(label: "ai.aeroshoot.active.screen", qos: .userInteractive, autoreleaseFrequency: .workItem)
@@ -2007,12 +2085,22 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   private var mouseHook: MouseHookMac?
   private var timestampLog: BoundedTimestampLog?
   private var rotationTimer: DispatchSourceTimer?
-  private let segmentDurationSec: TimeInterval = 2.0
+  private let segmentDurationSec = kRecordingSegmentDurationSec
   private var lastStartError: Error?
   private var appendFailure: AeroShootEncoderResult?
   private var runtimeNotificationsInstalled = false
   private var lastScreenPixel: CVPixelBuffer?
   private let lastFrameLock = NSLock()
+  private var screenSamples: UInt64 = 0
+  private var cameraSamples: UInt64 = 0
+  private var systemAudioSamples: UInt64 = 0
+  private var micSamples: UInt64 = 0
+  private var systemAudioPeakDb: Double?
+  private var micPeakDb: Double?
+  private var screenLastSampleAt: TimeInterval?
+  private var cameraLastSampleAt: TimeInterval?
+  private var systemAudioLastSampleAt: TimeInterval?
+  private var micLastSampleAt: TimeInterval?
 
   init(config: NativeConfig) {
     self.config = config
@@ -2023,6 +2111,9 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   // MARK: Start
 
   func start() -> AeroShootEncoderResult {
+    guard segmentDurationSec > 0 && segmentDurationSec <= kMaximumRecordingSegmentDurationSec else {
+      return encoderResultFailed(code: -602, message: "segment duration must be in (0, 60] seconds")
+    }
     let fm = FileManager.default
     let projectPath = config.projectPath
     for folder in ["media/screen", "media/webcam", "media/system", "media/mic", "telemetry"] {
@@ -2033,7 +2124,7 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
       }
     }
     do {
-      try requireHardwareH264(width: config.width, height: config.height)
+      if config.captureScreen { try requireHardwareH264(width: config.width, height: config.height) }
       if config.cameraId != nil { try requireHardwareH264(width: 1280, height: 720) }
     } catch {
       return encoderResultFailed(code: 0, message: "hardware H.264 unavailable: \(error.localizedDescription)")
@@ -2047,7 +2138,9 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     let webcamDir = (projectPath as NSString).appendingPathComponent("media/webcam")
     let systemDir = (projectPath as NSString).appendingPathComponent("media/system")
     let micDir = (projectPath as NSString).appendingPathComponent("media/mic")
-    screenTracker = PerTrackRecorder(trackId: "screen", kind: .video, directory: screenDir, videoWidth: config.width, videoHeight: config.height, videoFps: config.fps, audioChannels: 0, coalesceKey: nil)
+    if config.captureScreen {
+      screenTracker = PerTrackRecorder(trackId: "screen", kind: .video, directory: screenDir, videoWidth: config.width, videoHeight: config.height, videoFps: config.fps, audioChannels: 0, coalesceKey: nil, videoBitrate: config.videoBitrateBps)
+    }
     if config.captureSystemAudio {
       // Keep callback/journal IDs aligned with the manifest and media path.
       systemTracker = PerTrackRecorder(trackId: "system", kind: .audio, directory: systemDir, videoWidth: 0, videoHeight: 0, videoFps: 0, audioChannels: 2, coalesceKey: nil)
@@ -2061,19 +2154,23 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
 
     installRuntimeObservers()
 
-    do {
-      try startScreen()
-    } catch {
-      return encoderResultFailed(code: Int32((error as NSError).code), message: "screen start failed: \(error.localizedDescription)")
+    if config.captureScreen || config.captureSystemAudio {
+      do {
+        try startScreen()
+      } catch {
+        return encoderResultFailed(code: Int32((error as NSError).code), message: "screen/audio start failed: \(error.localizedDescription)")
+      }
     }
     if config.cameraId != nil || config.micId != nil {
       startActiveAVCapture()
     }
 
-    let mouse = MouseHookMac(sourceID: config.sourceId, width: config.width, height: config.height,
-      epoch: sessionHostEpoch, offsetUs: config.sessionOffsetUs)
-    mouseHook = mouse
-    mouse.start()
+    if config.captureScreen && (config.captureMouse ?? true) {
+      let mouse = MouseHookMac(sourceID: config.sourceId, width: config.width, height: config.height,
+        epoch: sessionHostEpoch, offsetUs: config.sessionOffsetUs)
+      mouseHook = mouse
+      mouse.start()
+    }
     startRotationTimer()
     return encoderResultOK()
   }
@@ -2188,7 +2285,9 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
       streamConfig.destinationRect = destinationRect.cgRect
     }
     let stream = SCStream(filter: filter, configuration: streamConfig, delegate: self)
-    try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: screenQueue)
+    if config.captureScreen {
+      try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: screenQueue)
+    }
     if config.captureSystemAudio { try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: systemAudioQueue) }
 
     guard let streamClock = stream.synchronizationClock, let timestampLog else {
@@ -2374,10 +2473,13 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
         return
       }
       guard let toAppend else { return }
+      stateLock.lock(); screenSamples &+= 1; screenLastSampleAt = CACurrentMediaTime(); stateLock.unlock()
       LivePreviewFrames.offer(toAppend, camera: false)
       let outcome = screenTracker?.append(toAppend, journal: timestampLog!) ?? .backpressured
       handleAppendOutcome(outcome, tracker: screenTracker, isAudio: false)
     } else if outputType == .audio {
+      let peak = audioPeakDb(sampleBuffer)
+      stateLock.lock(); systemAudioSamples &+= 1; systemAudioPeakDb = peak; systemAudioLastSampleAt = CACurrentMediaTime(); stateLock.unlock()
       let outcome = systemTracker?.append(sampleBuffer, journal: timestampLog!) ?? .backpressured
       handleAppendOutcome(outcome, tracker: systemTracker, isAudio: true)
     }
@@ -2397,11 +2499,15 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     if output is AVCaptureVideoDataOutput {
       guard CMSampleBufferGetImageBuffer(sampleBuffer) != nil else { return }
       let timed = copySampleWithDuration(sampleBuffer, duration: videoFrameDuration(fps: config.fps))
+      stateLock.lock(); cameraSamples &+= 1; cameraLastSampleAt = CACurrentMediaTime(); stateLock.unlock()
       LivePreviewFrames.offer(timed, camera: true)
       let outcome = cameraTracker?.append(timed, journal: timestampLog!) ?? .backpressured
       handleAppendOutcome(outcome, tracker: cameraTracker, isAudio: false)
     } else {
-      let outcome = micTracker?.append(sampleBuffer, journal: timestampLog!) ?? .backpressured
+      let processed = applyMicGain(sampleBuffer, gainDb: config.micGainDb ?? 0)
+      let peak = audioPeakDb(processed)
+      stateLock.lock(); micSamples &+= 1; micPeakDb = peak; micLastSampleAt = CACurrentMediaTime(); stateLock.unlock()
+      let outcome = micTracker?.append(processed, journal: timestampLog!) ?? .backpressured
       handleAppendOutcome(outcome, tracker: micTracker, isAudio: true)
     }
   }
@@ -2528,9 +2634,21 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     let a = (systemTracker?.audioUnderflowsValue() ?? 0) + (micTracker?.audioUnderflowsValue() ?? 0)
     stateLock.lock()
     let error = appendFailure.map { decodeMessage($0) }
+    let now = CACurrentMediaTime()
+    func age(_ timestamp: TimeInterval?) -> UInt64? {
+      timestamp.map { UInt64(max(0, (now - $0) * 1000)) }
+    }
+    let sampleState = (screenSamples, cameraSamples, systemAudioSamples, micSamples,
+      systemAudioPeakDb, micPeakDb, age(screenLastSampleAt), age(cameraLastSampleAt),
+      age(systemAudioLastSampleAt), age(micLastSampleAt))
     stateLock.unlock()
     let counters = timestampLog?.snapshotCounters() ?? (gapsTotal: 0, droppedRecords: 0)
-    return StatsDTO(droppedFrames: d, audioBufferUnderflows: a, timestampRecordsDropped: counters.droppedRecords, gapsTotal: counters.gapsTotal, lastError: error)
+    return StatsDTO(droppedFrames: d, audioBufferUnderflows: a, timestampRecordsDropped: counters.droppedRecords, gapsTotal: counters.gapsTotal, lastError: error,
+      screenSamples: sampleState.0, cameraSamples: sampleState.1,
+      systemAudioSamples: sampleState.2, micSamples: sampleState.3,
+      systemAudioPeakDb: sampleState.4, micPeakDb: sampleState.5,
+      screenLastSampleAgeMs: sampleState.6, cameraLastSampleAgeMs: sampleState.7,
+      systemAudioLastSampleAgeMs: sampleState.8, micLastSampleAgeMs: sampleState.9)
   }
 }
 
@@ -2851,6 +2969,8 @@ public func aeroshootMacOSRegisterRuntimeErrorCallback(_ handle: UnsafeMutableRa
 // Exercise the actual capture writer, rather than a separate fixture encoder.
 enum RecordingWriterContracts {
   static func run() throws {
+    precondition(kRecordingSegmentDurationSec > 0 && kRecordingSegmentDurationSec <= kMaximumRecordingSegmentDurationSec,
+      "recording segments must never exceed 60 seconds")
     let root = URL(fileURLWithPath: CommandLine.arguments[1])
     aeroshootRegisterSegmentCallback { _, _, _, _, _, path in
       guard let path else { return -1 }
@@ -3091,4 +3211,3 @@ enum MicGainContracts {
   }
 }
 #endif
-
