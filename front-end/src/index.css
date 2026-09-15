@@ -21,13 +21,6 @@
     user-select: text;
     -webkit-user-select: text;
   }
-
-  html.hud-root,
-  html.hud-root body,
-  body.hud-root {
-    background: transparent;
-    overflow: hidden;
-  }
 }
 
 @layer components {

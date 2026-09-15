@@ -20,6 +20,9 @@ private enum PreviewHitMode: Int32 {
 private final class AeroShootPreviewView: NSView {
   var fill = NSColor(calibratedRed: 0.06, green: 0.09, blue: 0.18, alpha: 1)
   var image: CGImage?
+  /// Newest GPU-rendered live frame. Held until replaced so its pool buffer
+  /// is never recycled while it is on screen.
+  var liveBuffer: CVPixelBuffer?
   var hitMode = PreviewHitMode.consume
   var generation: UInt64 = 0
   var copies: UInt64 = 0
@@ -29,7 +32,7 @@ private final class AeroShootPreviewView: NSView {
   var clipRect: NSRect?
 
   override var isFlipped: Bool { true }
-  override var isOpaque: Bool { image == nil && fill.alphaComponent >= 1 }
+  override var isOpaque: Bool { image == nil && liveBuffer == nil && fill.alphaComponent >= 1 }
   override var wantsUpdateLayer: Bool { true }
 
   override func hitTest(_ point: NSPoint) -> NSView? {
@@ -67,7 +70,11 @@ private final class AeroShootPreviewView: NSView {
 
   override func updateLayer() {
     layer?.backgroundColor = fill.cgColor
-    layer?.contents = image
+    if let liveBuffer, let surface = CVPixelBufferGetIOSurface(liveBuffer)?.takeUnretainedValue() {
+      layer?.contents = surface
+    } else {
+      layer?.contents = image
+    }
     applyShape()
   }
 }
@@ -129,6 +136,19 @@ private final class PreviewSurface {
   func detach() {
     view.removeFromSuperview()
     view.image = nil
+    view.liveBuffer = nil
+  }
+}
+
+extension PreviewSurface: LivePreviewTarget {
+  func presentLivePreview(_ buffer: CVPixelBuffer) {
+    guard view.superview != nil else { return }
+    view.image = nil
+    view.liveBuffer = buffer
+    view.copies += 1
+    view.presentedBytes = UInt64(CVPixelBufferGetDataSize(buffer))
+    view.presentedKind = "live"
+    view.updateLayer()
   }
 }
 
@@ -173,6 +193,7 @@ func previewDetach(_ handle: UnsafeMutableRawPointer?) {
   guard let handle else { return }
   onMain {
     let surface = Unmanaged<PreviewSurface>.fromOpaque(handle).takeRetainedValue()
+    LivePreviewRenderer.shared.setTarget(nil)
     surface.detach()
   }
 }
@@ -206,6 +227,8 @@ func previewSetGeometry(
     surface.visible = visible
     surface.view.occluded = occluded
     surface.view.isHidden = !visible || occluded
+    // Render live frames only while the preview can be seen.
+    LivePreviewRenderer.shared.setTarget(visible && !occluded ? surface : nil)
     let parent = surface.view.superview
     let web = parent.flatMap(findWebView) ?? parent
     let css = NSRect(x: x, y: y, width: width, height: height)
@@ -593,6 +616,46 @@ enum AeroShootPreviewTests {
     hudView.updateLayer()
     assert(hudView.layer?.contentsGravity == .resizeAspect)
 
+    // Live frames render on the GPU into preview-owned IOSurfaces, upright.
+    var source: CVPixelBuffer?
+    precondition(CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_32BGRA,
+      [kCVPixelBufferIOSurfacePropertiesKey: [String: Any]()] as CFDictionary, &source) == kCVReturnSuccess)
+    let sourceBuffer = source!
+    CVPixelBufferLockBaseAddress(sourceBuffer, [])
+    let sourceRow = CVPixelBufferGetBytesPerRow(sourceBuffer)
+    let sourceBase = CVPixelBufferGetBaseAddress(sourceBuffer)!.assumingMemoryBound(to: UInt8.self)
+    for row in 0..<64 {
+      for col in 0..<64 {
+        let offset = row * sourceRow + col * 4
+        let top = row < 32
+        sourceBase[offset] = top ? 0 : 255      // blue
+        sourceBase[offset + 1] = 0
+        sourceBase[offset + 2] = top ? 255 : 0  // red
+        sourceBase[offset + 3] = 255
+      }
+    }
+    CVPixelBufferUnlockBaseAddress(sourceBuffer, [])
+    LivePreviewFrames.lock.lock()
+    LivePreviewFrames.screen = sourceBuffer
+    LivePreviewFrames.sequence &+= 1
+    LivePreviewFrames.lock.unlock()
+    precondition(previewSetGeometry(handle, 16, 16, 160, 90, 2, true, false, 4, 1) == 0)
+    LivePreviewRenderer.shared.renderNow()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    guard let rendered = takeSurface(handle)?.view.liveBuffer else {
+      fatalError("live preview frame was not presented")
+    }
+    precondition(CVPixelBufferGetIOSurface(rendered) != nil)
+    precondition(takeSurface(handle)?.view.layer?.contents != nil)
+    CVPixelBufferLockBaseAddress(rendered, .readOnly)
+    let renderedRow = CVPixelBufferGetBytesPerRow(rendered)
+    let renderedBase = CVPixelBufferGetBaseAddress(rendered)!.assumingMemoryBound(to: UInt8.self)
+    let topRed = renderedBase[20 * renderedRow + 640 * 4 + 2]
+    let bottomBlue = renderedBase[700 * renderedRow + 640 * 4]
+    CVPixelBufferUnlockBaseAddress(rendered, .readOnly)
+    precondition(topRed > 200 && bottomBlue > 200, "live preview must keep the source upright")
+    LivePreviewFrames.clear()
+
     previewDetach(handle)
     previewDetach(hudHandle)
     let reopened = previewAttach(Unmanaged.passUnretained(window).toOpaque(), 7)
@@ -602,7 +665,7 @@ enum AeroShootPreviewTests {
     previewDetach(reopened)
     window.close()
     hud.close()
-    print("Native preview contracts passed (child overlay, decode fixture, HUD hit test)")
+    print("Native preview contracts passed (child overlay, decode fixture, hit test, GPU live frame)")
   }
 }
 #endif

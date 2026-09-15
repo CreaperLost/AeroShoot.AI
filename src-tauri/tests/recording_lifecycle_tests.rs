@@ -504,13 +504,19 @@ fn native_missing_screen_media_is_retained_on_retry() {
     }
 
     let first = stop_recording_impl(&state).expect_err("missing screen media");
-    assert!(first.contains("No screen media"), "unexpected: {first}");
+    assert!(
+        first.contains("No valid committed media was saved for screen"),
+        "unexpected: {first}"
+    );
     assert_eq!(state.state_machine.current(), SessionState::Error);
     assert!(state.active_session.read().is_some());
 
     let second =
         stop_recording_impl(&state).expect_err("retry must keep the missing-media outcome");
-    assert!(second.contains("No screen media"), "unexpected: {second}");
+    assert!(
+        second.contains("No valid committed media was saved for screen"),
+        "unexpected: {second}"
+    );
     assert_eq!(state.state_machine.current(), SessionState::Error);
     assert!(state.last_stop_result.read().is_none());
 }

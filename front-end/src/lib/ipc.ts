@@ -11,10 +11,6 @@ import {
   PermissionState,
   MouseTelemetryPermission,
   EditLayout,
-  WindowIdentity,
-  HudSnapshot,
-  HudSettingsPatch,
-  HudCameraInfo,
 } from "./types";
 
 declare global {
@@ -220,37 +216,6 @@ export async function getBrowserDevices(): Promise<{ cameras: CameraDevice[]; mi
 // Emulation layer
 let mockSessionState: SessionState = "idle";
 let mockSessionStartUs = 0;
-let mockHudRevision = 0;
-let mockHud: HudSnapshot = {
-  revision: 0,
-  settings: {
-    enabled: true,
-    shape: "circle",
-    size: "md",
-    mirror: true,
-    borderColor: "#6366f1",
-    borderWidth: 3,
-    shadow: false,
-  },
-  cameraId: null,
-  cameraName: null,
-  cameraAvailable: false,
-  hudAttached: false,
-  hudVisible: true,
-  exclusionEstablished: false,
-  hideDuringRecord: true,
-  sessionRecording: false,
-  captureSessionAlive: false,
-  startedIndependentCapture: false,
-  hitMode: "circle_pass_through",
-  diagnostics: [],
-};
-
-function bumpMockHud(patch: Partial<HudSnapshot> = {}): HudSnapshot {
-  mockHudRevision += 1;
-  mockHud = { ...mockHud, ...patch, revision: mockHudRevision };
-  return mockHud;
-}
 
 async function emulateCommand<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   console.log(`[Synthetic Backend] ${cmd}`, args);
@@ -371,85 +336,7 @@ async function emulateCommand<T>(cmd: string, args?: Record<string, unknown>): P
     case "pick_wallpaper_source":
       throw new Error("Choosing a wallpaper file requires the desktop app.");
 
-    case "window_identity":
-      return Promise.resolve({
-        label: "main",
-        uiRoot: "studio",
-        rejected: false,
-      } as unknown as T);
-
-    case "hud_snapshot":
-      return Promise.resolve(mockHud as unknown as T);
-
-    case "hud_update": {
-      const expected = Number(args?.expectedRevision ?? -1);
-      if (expected !== mockHud.revision) {
-        return Promise.reject(new Error("Stale HUD settings revision"));
-      }
-      const patch = (args?.patch ?? {}) as HudSettingsPatch;
-      const settings = { ...mockHud.settings, ...patch };
-      return Promise.resolve(
-        bumpMockHud({
-          settings,
-          hitMode:
-            settings.shape === "circle"
-              ? "circle_pass_through"
-              : settings.shape === "squircle"
-                ? "squircle_pass_through"
-                : "pass_through",
-        }) as unknown as T,
-      );
-    }
-
-    case "hud_reconcile_cameras": {
-      const cameras = (args?.cameras as HudCameraInfo[] | undefined) ?? [];
-      const requestedId = args?.selectedCameraId as string | null | undefined;
-      const currentId = requestedId ?? mockHud.cameraId;
-      const found = currentId ? cameras.find((c) => c.id === currentId) : cameras[0];
-      return Promise.resolve(
-        bumpMockHud({
-          cameraId: found?.id ?? currentId,
-          cameraName: found?.name ?? null,
-          cameraAvailable: Boolean(found),
-        }) as unknown as T,
-      );
-    }
-
-    case "hud_preview_attach":
-      if (args?.windowLabel !== "camera_overlay") {
-        return Promise.reject(new Error("HUD preview can only attach to 'camera_overlay'"));
-      }
-      return Promise.resolve(
-        bumpMockHud({ hudAttached: true, startedIndependentCapture: false }) as unknown as T,
-      );
-
-    case "hud_preview_layout":
-    case "hud_preview_status":
-      return Promise.resolve({
-        attached: mockHud.hudAttached,
-        windowLabel: mockHud.hudAttached ? "camera_overlay" : null,
-        generation: 1,
-        layoutRevision: 0,
-        arrangement: "child_overlay",
-        supported: false,
-        presentedKind: "none",
-        copiesPerPresent: 1,
-        copies: 0,
-        presentedBytes: 0,
-        backingScale: 1,
-        physical: null,
-        visible: mockHud.hudVisible,
-        occluded: !mockHud.hudVisible,
-        hitMode: mockHud.hitMode,
-        diagnostics: [],
-      } as unknown as T);
-
     case "studio_preview_attach":
-      if (args?.windowLabel === "camera_overlay") {
-        return Promise.reject(
-          new Error("Studio preview cannot attach to 'camera_overlay'; use the HUD commands instead"),
-        );
-      }
       return Promise.resolve({
         attached: true,
         windowLabel: args?.windowLabel ?? null,
@@ -490,27 +377,6 @@ async function emulateCommand<T>(cmd: string, args?: Record<string, unknown>): P
         hitMode: "consume",
         diagnostics: [],
       } as unknown as T);
-
-    case "hud_close":
-      return Promise.resolve(
-        bumpMockHud({
-          hudAttached: false,
-          hudVisible: false,
-          startedIndependentCapture: false,
-          captureSessionAlive: mockSessionState === "recording" || mockSessionState === "paused",
-          sessionRecording: mockSessionState === "recording" || mockSessionState === "paused",
-        }) as unknown as T,
-      );
-
-    case "hud_set_visible":
-      return Promise.resolve(
-        bumpMockHud({
-          hudVisible:
-            Boolean(args?.visible) &&
-            mockHud.settings.enabled &&
-            (mockSessionState === "recording" || mockSessionState === "paused"),
-        }) as unknown as T,
-      );
 
     case "set_window_title": {
       const title = args?.title as string | undefined;
@@ -574,8 +440,8 @@ export const api = {
   /**
    * Triggers the macOS permission flow for screen recording, camera, and
    * microphone. Resolves once all requested permissions have reached a
-   * terminal state. The HUD should call this on mount and again after the
-   * user has visited System Settings so the UI can refresh.
+   * terminal state. Call it again after the user has visited System Settings
+   * so the UI can refresh.
    */
   requestCapturePermissions: async (options?: {
     screen?: boolean;
@@ -656,25 +522,12 @@ export const api = {
   capturePreviewConfigure: (enabled: boolean, sourceId?: string, cameraId?: string, captureScreen = true, captureSystemAudio = false, micId?: string, micGainDb = 0) =>
     invokeTauri<void>("capture_preview_configure", { enabled, sourceId: sourceId ?? null, cameraId: cameraId ?? null, micId: micId ?? null, micGainDb, captureScreen, captureSystemAudio }),
   capturePreviewAudioLevels: () => invokeTauri<{ systemAudioPeakDb?: number; micPeakDb?: number }>("capture_preview_audio_levels"),
-  windowIdentity: () => invokeTauri<WindowIdentity>("window_identity"),
-  hudSnapshot: () => invokeTauri<HudSnapshot>("hud_snapshot"),
-  hudUpdate: (expectedRevision: number, patch: HudSettingsPatch) =>
-    invokeTauri<HudSnapshot>("hud_update", { expectedRevision, patch }),
-  hudReconcileCameras: (cameras: HudCameraInfo[], selectedCameraId?: string | null) =>
-    invokeTauri<HudSnapshot>("hud_reconcile_cameras", { cameras, selectedCameraId }),
-  hudPreviewAttach: (windowLabel: string, hitMode: PreviewHitMode = "circle_pass_through") =>
-    invokeTauri<HudSnapshot>("hud_preview_attach", { windowLabel, hitMode }),
-  hudPreviewLayout: (viewport: PreviewViewport) =>
-    invokeTauri<PreviewStatus>("hud_preview_layout", { viewport }),
-  hudPreviewStatus: () => invokeTauri<PreviewStatus>("hud_preview_status"),
   studioPreviewAttach: (windowLabel: string, hitMode: PreviewHitMode = "consume") =>
     invokeTauri<PreviewStatus>("studio_preview_attach", { windowLabel, hitMode }),
   studioPreviewLayout: (viewport: PreviewViewport) =>
     invokeTauri<PreviewStatus>("studio_preview_layout", { viewport }),
   studioPreviewStatus: () => invokeTauri<PreviewStatus>("studio_preview_status"),
   studioPreviewDetach: () => invokeTauri<PreviewStatus>("studio_preview_detach"),
-  hudClose: () => invokeTauri<HudSnapshot>("hud_close"),
-  hudSetVisible: (visible: boolean) => invokeTauri<HudSnapshot>("hud_set_visible", { visible }),
   getDefaultProjectsDir: () => invokeTauri<string>("get_default_projects_dir"),
   pickSaveDirectory: () => invokeTauri<string | null>("pick_save_directory"),
   showInFinder: (path: string): Promise<void> =>

@@ -256,6 +256,8 @@ pub fn build_capture_qualification_report(
                 CanonicalKind::Click { .. } => {
                     button_transition_count = button_transition_count.saturating_add(1)
                 }
+                // Shape changes carry no pointer position or input.
+                CanonicalKind::CursorChanged { .. } => {}
             }
         }
         let supported_geometry_count = stream

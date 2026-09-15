@@ -77,6 +77,7 @@ struct PendingPublication {
 /// 2. no-overwrite hard-link into the committed path
 /// 3. directory sync
 /// 4. journal append
+///
 /// A journal failure after step 2/3 leaves `pending_publication` so a retry
 /// cannot treat the earlier failure as success or overwrite the file.
 pub struct TrackSegmentWriter {
@@ -430,7 +431,7 @@ impl TrackSegmentWriter {
             }
             Err(error) => {
                 self.active_temp_file = OpenOptions::new()
-                    .write(true)
+                    
                     .append(true)
                     .open(&temp_path)
                     .ok();

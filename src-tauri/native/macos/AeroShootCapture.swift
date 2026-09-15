@@ -459,6 +459,7 @@ private struct NativeConfig: Decodable {
   let micGainDb: Float?
   let videoBitrateBps: Int?
   let captureMouse: Bool?
+  let hideCursor: Bool?
 }
 
 private struct NativeRect: Decodable {
@@ -1565,24 +1566,45 @@ private final class RotatingMediaWriter {
     }
   }
 
-  private func openNextWriter() throws {
+  private typealias SegmentSlot = (index: Int, tmpPath: String, finalPath: String)
+
+  /// Reserves the next unused one-based file number. Call with `lock` held.
+  private func allocateSegmentPath() throws -> SegmentSlot {
     try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
-    var allocatedTmpPath = ""
     while true {
       let fileNumber = String(format: "%06d", nextIndex + 1)
       let (tmpPath, finalPath, _) = paths(for: fileNumber)
+      let index = nextIndex
+      nextIndex += 1
       if !FileManager.default.fileExists(atPath: tmpPath) &&
           !FileManager.default.fileExists(atPath: finalPath) {
-        currentIndex = nextIndex
-        nextIndex += 1
-        currentTmpPath = tmpPath
-        currentFinalPath = finalPath
-        allocatedTmpPath = tmpPath
-        break
+        return (index, tmpPath, finalPath)
       }
-      nextIndex += 1
     }
-    let url = URL(fileURLWithPath: allocatedTmpPath)
+  }
+
+  private func install(writer newWriter: AVAssetWriter, input newInput: AVAssetWriterInput, slot: SegmentSlot) {
+    writer = newWriter
+    input = newInput
+    currentIndex = slot.index
+    currentTmpPath = slot.tmpPath
+    currentFinalPath = slot.finalPath
+    started = false
+    segmentOriginPts = nil
+  }
+
+  /// Opens a writer lazily on the capture queue (first segment, or when a
+  /// rotation could not open the next writer ahead of time).
+  private func openNextWriter() throws {
+    let slot = try allocateSegmentPath()
+    let made = try makeWriter(tmpPath: slot.tmpPath)
+    install(writer: made.writer, input: made.input, slot: slot)
+  }
+
+  /// Creates a writer for `tmpPath`. Touches no shared state, so a rotation can
+  /// run it without the lock while capture keeps appending to the current file.
+  private func makeWriter(tmpPath: String) throws -> (writer: AVAssetWriter, input: AVAssetWriterInput) {
+    let url = URL(fileURLWithPath: tmpPath)
 
     switch kind {
     case .video:
@@ -1608,8 +1630,7 @@ private final class RotatingMediaWriter {
         throw NSError(domain: "AeroShoot", code: 30, userInfo: [NSLocalizedDescriptionKey: "H.264 writer input unavailable for track \(trackId)"])
       }
       w.add(inp)
-      writer = w
-      input = inp
+      return (w, inp)
     case .audio:
       let w = try AVAssetWriter(outputURL: url, fileType: .wav)
       let settings: [String: Any] = [
@@ -1627,11 +1648,8 @@ private final class RotatingMediaWriter {
         throw NSError(domain: "AeroShoot", code: 31, userInfo: [NSLocalizedDescriptionKey: "PCM writer input unavailable for track \(trackId)"])
       }
       w.add(inp)
-      writer = w
-      input = inp
+      return (w, inp)
     }
-    started = false
-    segmentOriginPts = nil
   }
 
   private func paths(for fileNumber: String) -> (tmp: String, final: String, ext: String) {
@@ -1681,13 +1699,16 @@ private final class RotatingMediaWriter {
       currentMediaStartValue = 0
       currentMediaTimescale = Int32(max(startPTS.timescale, 1))
       currentHostAnchorUs = hostUs
-      guard writer.startWriting() else {
-        lastError = writer.error
-        let failure = (Int32((writer.error as NSError?)?.code ?? -1), writer.error?.localizedDescription ?? "startWriting failed")
-        terminalFailure = failure
-        return .failed(code: failure.0, reason: failure.1)
+      // A writer opened ahead of a rotation is already writing.
+      if writer.status == .unknown {
+        guard writer.startWriting() else {
+          lastError = writer.error
+          let failure = (Int32((writer.error as NSError?)?.code ?? -1), writer.error?.localizedDescription ?? "startWriting failed")
+          terminalFailure = failure
+          return .failed(code: failure.0, reason: failure.1)
+        }
+        writer.startSession(atSourceTime: .zero)
       }
-      writer.startSession(atSourceTime: .zero)
       guard writer.status == .writing else {
         let failure = (Int32((writer.error as NSError?)?.code ?? -1), writer.error?.localizedDescription ?? "writer failed while starting session")
         terminalFailure = failure
@@ -1699,8 +1720,12 @@ private final class RotatingMediaWriter {
     // here used to drop the IDR and leave an empty, uncommittable segment.
     // Do not park the capture callback queue: a 1s sleep dropped real-time
     // frames and collapsed a 10s take into about 1s of media.
+    // Audio arrives as small ~10 ms buffers on dedicated queues, so a brief wait
+    // is safe and avoids silently dropping audio when the PCM writer is
+    // momentarily busy (a 2-minute take lost ~10 s of mic/system audio). Video
+    // must not wait here; see the note above.
     if !input.isReadyForMoreMediaData {
-      _ = waitUntilReady(input, timeout: justOpened ? 0.05 : 0.0)
+      _ = waitUntilReady(input, timeout: justOpened || kind == .audio ? 0.05 : 0.0)
     }
     if !input.isReadyForMoreMediaData {
       return .backpressured
@@ -1798,9 +1823,8 @@ private final class RotatingMediaWriter {
     forceNextKeyframe = true
   }
 
-  // Validate the current tmp file. Returns true if it can be committed.
-  private func validateCurrent() -> Bool {
-    let path = currentTmpPath
+  // Validate a finished tmp file. Returns true if it can be committed.
+  private func validate(path: String) -> Bool {
     guard FileManager.default.fileExists(atPath: path) else { return false }
     switch kind {
     case .video:
@@ -1829,72 +1853,126 @@ private final class RotatingMediaWriter {
     }
   }
 
-  // Finish and validate the temporary file, then submit it to Rust for durable
-  // publication and journaling. Metadata is captured from the first
-  // sample of this segment, rather than reusing the track's session anchor.
+  /// A segment swapped out of the writer, with everything needed to finish,
+  /// validate and publish it after the lock is released.
+  private struct ClosingSegment {
+    let writer: AVAssetWriter
+    let input: AVAssetWriterInput
+    let tmpPath: String
+    let index: Int
+    let hostAnchorUs: Int64
+    let timescale: Int32
+    let mediaStartValue: Int64
+  }
+
+  // Close the current segment and submit it to Rust for durable publication and
+  // journaling. The next writer is opened and started first, then swapped in
+  // under the lock, and the old file is finished afterwards, so capture callbacks
+  // never wait for AVAssetWriter to flush a file (that wait dropped ~200 ms of
+  // video at every rotation). Metadata comes from the closed segment's first sample.
   func commitSegment() -> AeroShootEncoderResult {
     lock.lock()
-    defer { lock.unlock() }
     if let terminalFailure {
+      lock.unlock()
       return encoderResultFailed(code: terminalFailure.code, message: terminalFailure.reason)
     }
-    guard let writer = writer, let input = input, started else {
+    guard writer != nil, input != nil, started else {
+      lock.unlock()
       // A track that has not received a sample has no segment to commit. This
       // is a successful no-op; it must not manufacture a journal record.
-      return terminalFailure.map { encoderResultFailed(code: $0.code, message: $0.reason) } ?? encoderResultOK()
+      return encoderResultOK()
     }
-    input.markAsFinished()
+    let slot = try? allocateSegmentPath()
+    lock.unlock()
+
+    // Open the next file while capture keeps appending to the current one.
+    var next: (writer: AVAssetWriter, input: AVAssetWriterInput)?
+    if let slot, let made = try? makeWriter(tmpPath: slot.tmpPath), made.writer.startWriting() {
+      made.writer.startSession(atSourceTime: .zero)
+      next = made
+    }
+
+    lock.lock()
+    guard let writer = writer, let input = input, started else {
+      // Another commit (pause or stop) closed this segment meanwhile.
+      lock.unlock()
+      discardPrepared(next?.writer, slot?.tmpPath)
+      return encoderResultOK()
+    }
+    let closing = ClosingSegment(writer: writer, input: input, tmpPath: currentTmpPath, index: currentIndex,
+      hostAnchorUs: currentHostAnchorUs, timescale: currentMediaTimescale, mediaStartValue: currentMediaStartValue)
+    if let next, let slot {
+      install(writer: next.writer, input: next.input, slot: slot)
+    } else {
+      // Could not open ahead of time; the next sample opens a writer instead.
+      self.writer = nil
+      self.input = nil
+      started = false
+      segmentOriginPts = nil
+      discardPrepared(nil, slot?.tmpPath)
+    }
+    lock.unlock()
+    return finalize(closing)
+  }
+
+  /// Finishes, validates and publishes a swapped-out segment. Runs without the
+  /// lock; new samples are already going to the next writer.
+  private func finalize(_ segment: ClosingSegment) -> AeroShootEncoderResult {
+    segment.input.markAsFinished()
     let semaphore = DispatchSemaphore(value: 0)
-    writer.finishWriting { semaphore.signal() }
-    // The completion only signals this semaphore and never takes our lock.
-    // Keep append/finalization serialized until publication is complete;
-    // otherwise callbacks can append to an input already marked as finished.
+    segment.writer.finishWriting { semaphore.signal() }
     let waitResult = semaphore.wait(timeout: .now() + 15)
-    self.input = nil
-    self.writer = nil
-    self.started = false
-    self.segmentOriginPts = nil
-    self.lastError = writer.error
-    let writerStatus = writer.status
+    let status = segment.writer.status
+    let error = segment.writer.error
+    lock.lock(); lastError = error; lock.unlock()
 
     if waitResult == .timedOut {
-      // Don't trust this file; keep the tmp in place for forensics but report
-      // a timeout to the caller. The next segment is opened by the caller.
-      let failure = (Int32(-4), "AVAssetWriter finishWriting timed out for track \(trackId)")
-      terminalFailure = failure
+      // Don't trust this file; keep the tmp in place for forensics.
+      latchFailure(-4, "AVAssetWriter finishWriting timed out for track \(trackId)")
       return encoderResultTimeout(trackId: trackId)
     }
-    if writerStatus == .failed {
-      let code = Int32((writer.error as NSError?)?.code ?? -1)
-      let failure = (code, writer.error?.localizedDescription ?? "AVAssetWriter failed for track \(trackId)")
-      terminalFailure = failure
-      return encoderResultFailed(code: failure.0, message: failure.1)
+    if status == .failed {
+      let code = Int32((error as NSError?)?.code ?? -1)
+      let reason = error?.localizedDescription ?? "AVAssetWriter failed for track \(trackId)"
+      latchFailure(code, reason)
+      return encoderResultFailed(code: code, message: reason)
     }
-    if writerStatus != .completed {
-      let failure = (Int32(writerStatus.rawValue), "AVAssetWriter status \(writerStatus.rawValue) for track \(trackId)")
-      terminalFailure = failure
-      return encoderResultFailed(code: failure.0, message: failure.1)
+    if status != .completed {
+      let reason = "AVAssetWriter status \(status.rawValue) for track \(trackId)"
+      latchFailure(Int32(status.rawValue), reason)
+      return encoderResultFailed(code: Int32(status.rawValue), message: reason)
     }
-    if !validateCurrent() {
-      let failure = (Int32(-5), "validation failed for track \(trackId) at segment \(currentIndex)")
-      terminalFailure = failure
-      return encoderResultFailed(code: failure.0, message: failure.1)
+    if !validate(path: segment.tmpPath) {
+      let reason = "validation failed for track \(trackId) at segment \(segment.index)"
+      latchFailure(-5, reason)
+      return encoderResultFailed(code: -5, message: reason)
     }
     // Rust exclusively owns durable publication and journal ordering.
     let commitStatus = invokeSegmentCallback(
       trackId: trackId,
-      filePath: currentTmpPath,
-      hostAnchorUs: currentHostAnchorUs,
-      segmentIndex: Int32(currentIndex),
-      timescale: currentMediaTimescale,
-      mediaStartValue: currentMediaStartValue
+      filePath: segment.tmpPath,
+      hostAnchorUs: segment.hostAnchorUs,
+      segmentIndex: Int32(segment.index),
+      timescale: segment.timescale,
+      mediaStartValue: segment.mediaStartValue
     )
     if commitStatus != 0 {
-      let failure = (commitStatus, "Rust segment commit failed for track \(trackId)")
-      terminalFailure = failure
-      return encoderResultFailed(code: failure.0, message: failure.1)
+      let reason = "Rust segment commit failed for track \(trackId)"
+      latchFailure(commitStatus, reason)
+      return encoderResultFailed(code: commitStatus, message: reason)
     }
     return encoderResultOK()
+  }
+
+  private func latchFailure(_ code: Int32, _ reason: String) {
+    lock.lock(); defer { lock.unlock() }
+    terminalFailure = (code, reason)
+  }
+
+  /// Cancels a writer opened for a segment that will not be used and removes its file.
+  private func discardPrepared(_ preparedWriter: AVAssetWriter?, _ tmpPath: String?) {
+    if let preparedWriter, preparedWriter.status == .writing { preparedWriter.cancelWriting() }
+    if let tmpPath { try? FileManager.default.removeItem(atPath: tmpPath) }
   }
 
   // Finalize: finish the in-flight writer (with a timeout) and validate.
@@ -1905,7 +1983,15 @@ private final class RotatingMediaWriter {
   func finish(timeout: TimeInterval) -> (success: Bool, status: AVAssetWriter.Status, error: Error?) {
     lock.lock()
     defer { lock.unlock() }
-    guard let writer = writer, let input = input, started else {
+    guard let writer = writer, let input = input else {
+      return (true, .completed, nil)
+    }
+    guard started else {
+      // A writer opened ahead of a rotation that never received a sample.
+      discardPrepared(writer, currentTmpPath)
+      self.writer = nil
+      self.input = nil
+      segmentOriginPts = nil
       return (true, .completed, nil)
     }
     input.markAsFinished()
@@ -2062,7 +2148,11 @@ private final class PerTrackRecorder {
 // avoiding the old two-second file churn. The setting is intentionally shared
 // by every enabled track so screen, webcam, mic, and system audio stay on the
 // same 60-second rotation cadence.
-private let kRecordingSegmentDurationSec: TimeInterval = 60.0
+// Rotate with headroom under the 60-second qualification limit. The timer starts
+// only after native start completes, but a segment begins at its first sample
+// (up to the 5 s start-ready wait earlier) and ends after its last frame, so a
+// 60-second cadence produced 60.4-60.7 s segments that failed Stop.
+private let kRecordingSegmentDurationSec: TimeInterval = 55.0
 private let kMaximumRecordingSegmentDurationSec: TimeInterval = 60.0
 
 private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
@@ -2083,6 +2173,10 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   private var cameraTracker: PerTrackRecorder?
   private var micTracker: PerTrackRecorder?
   private var mouseHook: MouseHookMac?
+  /// Kept so the cursor can be put back into a running stream.
+  private var streamConfiguration: SCStreamConfiguration?
+  /// True while the cursor is hidden from the video for the editor to redraw.
+  private var cursorHidden = false
   private var timestampLog: BoundedTimestampLog?
   private var rotationTimer: DispatchSourceTimer?
   private let segmentDurationSec = kRecordingSegmentDurationSec
@@ -2101,6 +2195,10 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   private var cameraLastSampleAt: TimeInterval?
   private var systemAudioLastSampleAt: TimeInterval?
   private var micLastSampleAt: TimeInterval?
+
+  /// Last callback arrival per video source, for `delivery_gap` diagnostics.
+  private var lastScreenCallbackAt: CFTimeInterval = 0
+  private var lastCameraCallbackAt: CFTimeInterval = 0
 
   init(config: NativeConfig) {
     self.config = config
@@ -2166,12 +2264,15 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     }
 
     if config.captureScreen && (config.captureMouse ?? true) {
+      stateLock.lock(); let hidden = cursorHidden; stateLock.unlock()
       let mouse = MouseHookMac(sourceID: config.sourceId, width: config.width, height: config.height,
-        epoch: sessionHostEpoch, offsetUs: config.sessionOffsetUs)
+        epoch: sessionHostEpoch, offsetUs: config.sessionOffsetUs, cursorMode: hidden ? "replace" : "baked")
+      mouse.onTrackingLost = { [weak self] _ in self?.showCursorInVideo() }
       mouseHook = mouse
       mouse.start()
     }
     startRotationTimer()
+    LivePreviewRenderer.shared.setRecording(true)
     return encoderResultOK()
   }
 
@@ -2215,6 +2316,32 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     if appendFailure == nil { appendFailure = encoderResultFailed(code: code, message: message) }
     stateLock.unlock()
     invokeRuntimeErrorCallback(trackId: trackId, code: code, message: message)
+  }
+
+  /// Pointer tracking stopped while the cursor was hidden from the video. Put
+  /// the cursor back so it is never missing, and log when it reappears so the
+  /// editor stops drawing its own cursor from that moment.
+  private func showCursorInVideo() {
+    stateLock.lock()
+    guard cursorHidden, let stream, let configuration = streamConfiguration else {
+      stateLock.unlock()
+      return
+    }
+    cursorHidden = false
+    stateLock.unlock()
+    configuration.showsCursor = true
+    stream.updateConfiguration(configuration) { [weak self] error in
+      self?.finishShowingCursor(error: error)
+    }
+  }
+
+  private func finishShowingCursor(error: Error?) {
+    if let error {
+      invokeRuntimeErrorCallback(trackId: "screen", code: 701,
+        message: "Mouse tracking stopped and the cursor could not be shown in the video: \(error.localizedDescription)")
+      return
+    }
+    mouseHook?.markCursorShownInVideo()
   }
 
   // MARK: ScreenCaptureKit start
@@ -2271,7 +2398,10 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     streamConfig.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(config.fps, 1)))
     streamConfig.queueDepth = 6
     streamConfig.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-    streamConfig.showsCursor = true
+    // Hide the cursor only when pointer tracking records it for the editor to
+    // redraw; otherwise it stays baked into the video and is never missing.
+    streamConfig.showsCursor = !(config.hideCursor ?? false)
+    stateLock.lock(); streamConfiguration = streamConfig; cursorHidden = !streamConfig.showsCursor; stateLock.unlock()
     streamConfig.capturesAudio = config.captureSystemAudio
     streamConfig.sampleRate = 48_000
     streamConfig.channelCount = 2
@@ -2451,6 +2581,10 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     stateLock.lock(); let shouldAppend = !paused; stateLock.unlock()
     guard shouldAppend, sampleBuffer.isValid else { return }
     if outputType == .screen {
+      let arrived = CACurrentMediaTime()
+      let previous = lastScreenCallbackAt
+      lastScreenCallbackAt = arrived
+      defer { noteCaptureTiming(track: "screen", arrivedAt: arrived, previous: previous) }
       guard
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
         let statusValue = attachments.first?[.status] as? Int,
@@ -2497,6 +2631,10 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     stateLock.lock(); let shouldAppend = !paused; stateLock.unlock()
     guard shouldAppend, sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
     if output is AVCaptureVideoDataOutput {
+      let arrived = CACurrentMediaTime()
+      let previous = lastCameraCallbackAt
+      lastCameraCallbackAt = arrived
+      defer { noteCaptureTiming(track: "webcam", arrivedAt: arrived, previous: previous) }
       guard CMSampleBufferGetImageBuffer(sampleBuffer) != nil else { return }
       let timed = copySampleWithDuration(sampleBuffer, duration: videoFrameDuration(fps: config.fps))
       stateLock.lock(); cameraSamples &+= 1; cameraLastSampleAt = CACurrentMediaTime(); stateLock.unlock()
@@ -2509,6 +2647,23 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
       stateLock.lock(); micSamples &+= 1; micPeakDb = peak; micLastSampleAt = CACurrentMediaTime(); stateLock.unlock()
       let outcome = micTracker?.append(processed, journal: timestampLog!) ?? .backpressured
       handleAppendOutcome(outcome, tracker: micTracker, isAudio: true)
+    }
+  }
+
+  /// Journals capture timing anomalies so missing video can be attributed.
+  /// `delivery_gap`: the source delivered nothing for over 100 ms (upstream).
+  /// `slow_callback`: this callback held its capture queue for over 50 ms.
+  private func noteCaptureTiming(track: String, arrivedAt arrived: CFTimeInterval, previous: CFTimeInterval) {
+    let finished = CACurrentMediaTime()
+    let epochSeconds = CMTimeGetSeconds(sessionHostEpoch)
+    func sessionUs(_ hostSeconds: CFTimeInterval) -> Int64 {
+      Int64(clamping: config.sessionOffsetUs) + Int64((hostSeconds - epochSeconds) * 1_000_000)
+    }
+    if previous > 0, arrived - previous > 0.1 {
+      timestampLog?.appendMetadata("{\"type\":\"delivery_gap\",\"track\":\"\(track)\",\"at_us\":\(sessionUs(previous)),\"gap_ms\":\(Int((arrived - previous) * 1000))}\n")
+    }
+    if finished - arrived > 0.05 {
+      timestampLog?.appendMetadata("{\"type\":\"slow_callback\",\"track\":\"\(track)\",\"at_us\":\(sessionUs(arrived)),\"duration_ms\":\(Int((finished - arrived) * 1000))}\n")
     }
   }
 
@@ -2541,6 +2696,9 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
 
   func setPaused(_ value: Bool) {
     stateLock.lock(); paused = value; stateLock.unlock()
+    // A pause is not a delivery gap; restart arrival tracking on resume.
+    lastScreenCallbackAt = 0
+    lastCameraCallbackAt = 0
     mouseHook?.setPaused(value)
   }
 
@@ -2571,6 +2729,7 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   // MARK: Stop (Task 3 typed outcomes)
 
   func stop() -> AeroShootEncoderResult {
+    LivePreviewRenderer.shared.setRecording(false)
     // 1. Stop the SCStream (with a 10s timeout) and AVCaptureSession.
     rotationTimer?.cancel(); rotationTimer = nil
     rotationQueue.sync {}
@@ -3038,6 +3197,83 @@ enum RecordingWriterContracts {
       }
     }
     print("Capture writer passed: two committed segments each for screen, webcam, mic and system")
+
+    // Rotation must not stall capture: the next writer is swapped in first and
+    // the closed file finishes afterwards, so appends keep landing meanwhile.
+    func videoSample(_ frame: Int) -> CMSampleBuffer {
+      var pixel: CVPixelBuffer?
+      precondition(CVPixelBufferCreate(nil, 1280, 720, kCVPixelFormatType_32BGRA,
+        [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &pixel) == kCVReturnSuccess)
+      CVPixelBufferLockBaseAddress(pixel!, [])
+      memset(CVPixelBufferGetBaseAddress(pixel!)!, Int32(frame % 255), CVPixelBufferGetDataSize(pixel!))
+      CVPixelBufferUnlockBaseAddress(pixel!, [])
+      var format: CMVideoFormatDescription?
+      CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixel!, formatDescriptionOut: &format)
+      var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30),
+        presentationTimeStamp: CMTime(value: Int64(900 + frame), timescale: 30), decodeTimeStamp: .invalid)
+      var sample: CMSampleBuffer?
+      precondition(CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pixel!,
+        formatDescription: format!, sampleTiming: &timing, sampleBufferOut: &sample) == noErr)
+      return sample!
+    }
+    let rotationDirectory = root.appendingPathComponent("rotation")
+    try FileManager.default.createDirectory(at: rotationDirectory, withIntermediateDirectories: true)
+    let rotating = RotatingMediaWriter(trackId: "screen", kind: .video, directory: rotationDirectory.path,
+      videoWidth: 1280, videoHeight: 720, videoFps: 30, audioChannels: 0)
+    func timedAppend(_ frame: Int) -> TimeInterval {
+      let began = CACurrentMediaTime()
+      if case let .failed(_, reason) = rotating.append(videoSample(frame), hostUs: Int64(frame) * 33_333) {
+        fatalError("rotation append failed: \(reason)")
+      }
+      return CACurrentMediaTime() - began
+    }
+    for frame in 0..<60 {
+      _ = timedAppend(frame)
+      Thread.sleep(forTimeInterval: 0.002)
+    }
+    // Capture keeps appending on its own thread while this thread rotates.
+    let flags = NSLock()
+    var stopAppending = false
+    var rotating_ = false
+    var slowestAppend: TimeInterval = 0
+    var appendedDuringRotation = 0
+    var nextFrame = 60
+    let appenderDone = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+      while true {
+        flags.lock(); let stop = stopAppending; let frame = nextFrame; flags.unlock()
+        if stop { break }
+        let took = timedAppend(frame)
+        flags.lock()
+        slowestAppend = max(slowestAppend, took)
+        if rotating_ { appendedDuringRotation += 1 }
+        nextFrame += 1
+        flags.unlock()
+        Thread.sleep(forTimeInterval: 0.005)
+      }
+      appenderDone.signal()
+    }
+    Thread.sleep(forTimeInterval: 0.05)
+    flags.lock(); rotating_ = true; flags.unlock()
+    let rotationStatus = rotating.commitSegment().status
+    flags.lock(); rotating_ = false; flags.unlock()
+    Thread.sleep(forTimeInterval: 0.05)
+    flags.lock(); stopAppending = true; flags.unlock()
+    precondition(appenderDone.wait(timeout: .now() + 10) == .success, "appender thread did not stop")
+    precondition(rotationStatus == AEROSHOOT_ENCODER_OK(), "rotation commit failed")
+    precondition(appendedDuringRotation > 0, "no frames were appended while the rotation finished")
+    precondition(slowestAppend < 0.05, "an append waited \(Int(slowestAppend * 1000)) ms for the rotation")
+    let frame = nextFrame
+    for extra in frame..<(frame + 10) { _ = timedAppend(extra) }
+    precondition(rotating.commitSegment().status == AEROSHOOT_ENCODER_OK(), "second rotation commit failed")
+    precondition(rotating.finish(timeout: 5).success)
+    for number in 1...2 {
+      let file = rotationDirectory.appendingPathComponent(String(format: "%06d.mp4", number))
+      precondition(AVURLAsset(url: file).duration.seconds > 0.1, "rotation segment \(number) missing media")
+    }
+    let unused = rotationDirectory.appendingPathComponent("000003.mp4.tmp").path
+    precondition(!FileManager.default.fileExists(atPath: unused), "the writer opened after the last rotation must be discarded")
+    print("Rotation passed: \(appendedDuringRotation) appends landed while a segment finished (slowest \(Int(slowestAppend * 1000)) ms)")
 
     // Real recordings began with webcam PTS=0, followed by host uptime.
     // Discard that startup buffer; all tracks share the session's host epoch.

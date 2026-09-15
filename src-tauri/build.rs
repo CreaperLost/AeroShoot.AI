@@ -43,6 +43,9 @@ fn build_macos_capture_bridge() {
             "5",
             "-parse-as-library",
             "-O",
+            // Whole-module optimization: inline and specialize across the four
+            // Swift files, which are always built together as one module.
+            "-wmo",
             "-emit-library",
             "-static",
             "-module-name",
@@ -74,6 +77,8 @@ fn build_macos_capture_bridge() {
         "CoreVideo",
         "Foundation",
         "QuartzCore",
+        "Metal",
+        "IOSurface",
         "ScreenCaptureKit",
         "VideoToolbox",
         "AudioToolbox",

@@ -62,6 +62,9 @@ impl ProjectLock {
             .read(true)
             .write(true)
             .create(true)
+            // Never truncate on open: another process may hold the lock and own
+            // the file's contents until our flock below succeeds.
+            .truncate(false)
             .open(&lock_path);
 
         let mut file = match open_res {

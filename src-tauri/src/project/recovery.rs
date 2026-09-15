@@ -15,10 +15,12 @@ pub enum RecoveryError {
     Lock(#[from] LockError),
     #[error("Project directory does not exist: {0}")]
     MissingProjectDir(PathBuf),
+    #[error("Manifest JSON parse error: {0}")]
+    ManifestParse(#[from] serde_json::Error),
     #[error("Manifest error: {0}")]
-    Manifest(String),
+    Manifest(#[from] super::manifest::ManifestError),
     #[error("Journal error: {0}")]
-    Journal(String),
+    Journal(#[from] super::journal::JournalError),
     #[error("Invalid path in project: {0}")]
     InvalidPath(String),
 }
@@ -61,7 +63,7 @@ impl RecoveryEngine {
             return Err(RecoveryError::MissingProjectDir(dir.to_path_buf()));
         }
 
-        let canonical_dir = dir.canonicalize().map_err(|e| RecoveryError::Io(e))?;
+        let canonical_dir = dir.canonicalize().map_err(RecoveryError::Io)?;
 
         // Acquire exclusive project lock before scanning or rewriting snapshots
         let _lock = ProjectLock::acquire(&canonical_dir)?;
@@ -70,10 +72,8 @@ impl RecoveryEngine {
         let manifest_path = canonical_dir.join("manifest.json");
         let manifest: ProjectManifest = if manifest_path.exists() {
             let data = fs::read_to_string(&manifest_path)?;
-            let m: ProjectManifest = serde_json::from_str(&data)
-                .map_err(|e| RecoveryError::Manifest(format!("JSON parse error: {}", e)))?;
-            m.validate()
-                .map_err(|e| RecoveryError::Manifest(format!("Validation error: {}", e)))?;
+            let m: ProjectManifest = serde_json::from_str(&data)?;
+            m.validate()?;
             m
         } else {
             ProjectManifest::new(
@@ -94,8 +94,7 @@ impl RecoveryEngine {
 
         // Read journal records; propagate errors rather than silently swallowing corruption
         let journal_records = if journal_path.exists() {
-            ProjectJournal::read_records_from_path(&journal_path)
-                .map_err(|e| RecoveryError::Journal(e.to_string()))?
+            ProjectJournal::read_records_from_path(&journal_path)?
         } else {
             Vec::new()
         };
@@ -527,9 +526,7 @@ impl RecoveryEngine {
         }
 
         // Atomically save recovered manifest with backup
-        recovered_manifest
-            .save_with_backup(&manifest_path)
-            .map_err(|e| RecoveryError::Manifest(e.to_string()))?;
+        recovered_manifest.save_with_backup(&manifest_path)?;
 
         let total_journal_entries = journal_records.len() + recovered_unindexed_records.len();
 

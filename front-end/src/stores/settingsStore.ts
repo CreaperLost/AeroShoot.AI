@@ -6,44 +6,10 @@ import {
   CameraDevice,
   AudioDevice,
   EditLayout,
-  HudSnapshot,
-  HudCameraInfo,
   canvasFromLayout,
   cameraFromLayout,
 } from "../lib/types";
-import { api } from "../lib/ipc";
 import { loadRecordingQuality, Resolution, saveRecordingQuality } from "../lib/recordingQuality";
-
-// The studio and camera HUD share a revisioned native settings owner.
-let hudUpdateQueue: Promise<void> = Promise.resolve();
-let pendingHudPatches: Partial<CameraBubbleSettings>[] = [];
-
-function queueHudPatch(patch: Partial<CameraBubbleSettings>) {
-  pendingHudPatches.push(patch);
-  const removePending = () => {
-    const index = pendingHudPatches.indexOf(patch);
-    if (index >= 0) pendingHudPatches.splice(index, 1);
-  };
-  hudUpdateQueue = hudUpdateQueue.catch(() => undefined).then(async () => {
-    let snapshot;
-    try {
-      snapshot = await api.hudUpdate(useSettingsStore.getState().hudRevision, patch);
-    } catch {
-      const current = await api.hudSnapshot();
-      useSettingsStore.getState().applyHudSnapshot(current);
-      snapshot = await api.hudUpdate(current.revision, patch);
-    }
-    removePending();
-    useSettingsStore.getState().applyHudSnapshot(snapshot);
-  }).catch(async () => {
-    removePending();
-    try {
-      useSettingsStore.getState().applyHudSnapshot(await api.hudSnapshot());
-    } catch {
-      // Ignored outside desktop app
-    }
-  });
-}
 
 interface SettingsStore {
   selectedSourceId: string | null;
@@ -61,13 +27,9 @@ interface SettingsStore {
   projectName: string;
   projectDir: string | null;
   createdProjectPath: string | null;
-  hudRevision: number;
-  hudCameraAvailable: boolean;
-  hudDiagnostics: string[];
-  knownCameras: HudCameraInfo[];
   layoutOwnedByProject: boolean;
   /// Microphone gain in decibels applied to the mic track on the native
-  /// side AND shown live on the HUD waveform. Clamped to ±24 dB; 0 = unity.
+  /// side and shown on the live meters. Clamped to ±24 dB; 0 = unity.
   micGainDb: number;
   /** Log pointer motion and clicks during screen recordings. On by default. */
   captureMouse: boolean;
@@ -87,7 +49,6 @@ interface SettingsStore {
   updateCameraBubble: (settings: Partial<CameraBubbleSettings>) => void;
   updateCanvas: (settings: Partial<CanvasSettings>) => void;
   hydrateLayout: (layout: EditLayout) => void;
-  applyHudSnapshot: (snapshot: HudSnapshot) => void;
   reconcileSelections: (
     sources: CaptureSource[],
     cameras: CameraDevice[],
@@ -128,10 +89,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   projectName: "",
   projectDir: null,
   createdProjectPath: null,
-  hudRevision: 0,
-  hudCameraAvailable: true,
-  hudDiagnostics: [],
-  knownCameras: [],
   layoutOwnedByProject: false,
   micGainDb: 0,
   captureMouse: loadCaptureMouse(),
@@ -165,14 +122,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   setSelectedSourceId: (id) => set({ selectedSourceId: id }),
-  setSelectedCameraId: (id) => {
-    set({ selectedCameraId: id });
-    const cameras = get().knownCameras;
-    void api
-      .hudReconcileCameras(cameras, id)
-      .then((snapshot) => get().applyHudSnapshot(snapshot))
-      .catch(() => undefined);
-  },
+  setSelectedCameraId: (id) => set({ selectedCameraId: id }),
   setSelectedMicId: (id) => set({ selectedMicId: id }),
   setCaptureSystemAudio: (enabled) => set({ captureSystemAudio: enabled }),
   setFps: (fps) => {
@@ -195,10 +145,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ captureMouse });
     saveCaptureMouse(captureMouse);
   },
-  updateCameraBubble: (settings) => {
-    set((state) => ({ cameraBubble: { ...state.cameraBubble, ...settings } }));
-    queueHudPatch(settings);
-  },
+  updateCameraBubble: (settings) =>
+    set((state) => ({ cameraBubble: { ...state.cameraBubble, ...settings } })),
   updateCanvas: (settings) =>
     set((state) => ({ canvas: { ...state.canvas, ...settings } })),
   hydrateLayout: (layout) =>
@@ -206,34 +154,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       canvas: canvasFromLayout(layout),
       cameraBubble: cameraFromLayout(layout),
       layoutOwnedByProject: true,
-    }),
-  applyHudSnapshot: (snapshot) =>
-    set((state) => {
-      const next: Partial<SettingsStore> = {
-        hudRevision: snapshot.revision,
-        hudCameraAvailable: snapshot.cameraAvailable,
-        hudDiagnostics: snapshot.diagnostics,
-      };
-      if (snapshot.cameraId) {
-        next.selectedCameraId = snapshot.cameraId;
-      }
-      if (!state.layoutOwnedByProject) {
-        let cameraBubble: CameraBubbleSettings = {
-          ...state.cameraBubble,
-          enabled: snapshot.settings.enabled,
-          shape: snapshot.settings.shape,
-          size: snapshot.settings.size,
-          mirror: snapshot.settings.mirror,
-          borderColor: snapshot.settings.borderColor,
-          borderWidth: snapshot.settings.borderWidth,
-          shadow: snapshot.settings.shadow,
-        };
-        for (const patch of pendingHudPatches) {
-          cameraBubble = { ...cameraBubble, ...patch };
-        }
-        next.cameraBubble = cameraBubble;
-      }
-      return next;
     }),
 
   reconcileSelections: (sources, cameras, mics) => {
@@ -276,7 +196,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       availableSourceFallbackId: safeSources.find((s) => s.sourceType === "display")?.id ?? safeSources[0]?.id ?? null,
       selectedCameraId: nextCameraId,
       selectedMicId: nextMicId,
-      knownCameras: safeCameras.map((camera) => ({ id: camera.id, name: camera.name })),
       cameraBubble: {
         ...state.cameraBubble,
         enabled: safeCameras.length === 0 ? false : state.cameraBubble.enabled,

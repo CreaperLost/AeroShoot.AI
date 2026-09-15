@@ -8,7 +8,9 @@ xcrun swiftc -swift-version 5 -D PREVIEW_CONTRACT_TESTS \
   -target "$(uname -m)-apple-macosx13.0" \
   -module-cache-path "$test_dir/modules" \
   -framework AppKit -framework AVFoundation -framework QuartzCore -framework CoreVideo \
+  -framework CoreImage -framework CoreMedia -framework ScreenCaptureKit -framework AudioToolbox -framework Metal \
   "$repo_dir/src-tauri/native/macos/AeroShootPreview.swift" \
+  "$repo_dir/src-tauri/native/macos/AeroShootLivePreview.swift" \
   "$repo_dir/src-tauri/native/macos/tests/PreviewContractTests.swift" \
   -o "$test_dir/preview-contract-tests"
 "$test_dir/preview-contract-tests"

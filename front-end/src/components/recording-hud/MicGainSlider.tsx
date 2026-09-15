@@ -8,7 +8,7 @@ const MIC_GAIN_RANGE = { min: -24, max: 24 } as const;
  * Range matches the native preview and recording clamps on the Swift side.
  *
  * The slider is intentionally a controlled component: the owning settings
- * store owns the value so the gain is shared across the HUD, the recording
+ * store owns the value so the gain is shared across the live meters, the recording
  * command, and any other UI that wants to show it.
  */
 export interface MicGainSliderProps {

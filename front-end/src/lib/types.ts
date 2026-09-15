@@ -441,59 +441,6 @@ export type PreviewHitMode =
   | "circle_pass_through"
   | "squircle_pass_through";
 
-export type UiRootKind = "studio" | "hud";
-
-export interface WindowIdentity {
-  label: string;
-  uiRoot: UiRootKind | null;
-  rejected: boolean;
-}
-
-export type HudShape = "rect" | "circle" | "squircle" | "rect_16_9";
-export type HudSize = "sm" | "md" | "lg" | "xl";
-
-export interface HudSettings {
-  enabled: boolean;
-  shape: HudShape;
-  size: HudSize;
-  mirror: boolean;
-  borderColor: string;
-  borderWidth: number;
-  shadow: boolean;
-}
-
-export interface HudSettingsPatch {
-  enabled?: boolean;
-  shape?: HudShape;
-  size?: HudSize;
-  mirror?: boolean;
-  borderColor?: string;
-  borderWidth?: number;
-  shadow?: boolean;
-}
-
-export interface HudCameraInfo {
-  id: string;
-  name: string;
-}
-
-export interface HudSnapshot {
-  revision: number;
-  settings: HudSettings;
-  cameraId: string | null;
-  cameraName: string | null;
-  cameraAvailable: boolean;
-  hudAttached: boolean;
-  hudVisible: boolean;
-  exclusionEstablished: boolean;
-  hideDuringRecord: boolean;
-  sessionRecording: boolean;
-  captureSessionAlive: boolean;
-  startedIndependentCapture: boolean;
-  hitMode: PreviewHitMode;
-  diagnostics: string[];
-}
-
 export interface PreviewViewport {
   generation: number;
   clip?: [number, number, number, number];

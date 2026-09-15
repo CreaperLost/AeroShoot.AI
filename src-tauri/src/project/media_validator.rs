@@ -159,7 +159,7 @@ impl MediaValidator {
         while offset < len {
             if offset + 8 > len {
                 return Err(MediaValidationError::InvalidMp4BoxSize(
-                    (len - offset) as u64,
+                    len - offset,
                     offset,
                     len,
                 ));
@@ -175,7 +175,7 @@ impl MediaValidator {
             let box_size_raw = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
             let box_type = [header[4], header[5], header[6], header[7]];
 
-            if !VALID_BOXES.iter().any(|&b| b == &box_type) {
+            if !VALID_BOXES.contains(&&box_type) {
                 return Err(MediaValidationError::InvalidMp4Box(
                     String::from_utf8_lossy(&box_type).into_owned(),
                 ));

@@ -22,7 +22,7 @@ export function CapturePreview({ sourceId, cameraId, micId, micGainDb = 0, captu
   }, [sourceId, cameraId, micId, micGainDb, captureScreen, captureSystemAudio, enabled]);
   if (!isTauriEnvironment()) return <p>Open the AeroShoot desktop app to preview and record devices.</p>;
   return <div className="w-full h-full min-h-0 flex flex-col items-center gap-2">
-    <NativePreviewHost live surfaceVisible={surfaceVisible} />
+    <NativePreviewHost surfaceVisible={surfaceVisible} />
     {error && <p role="alert" className="text-sm text-rose-300">{error}</p>}
     {!enabled && <p className="text-xs text-studio-400">Preview waits for Screen Recording permission.</p>}
   </div>;

@@ -6,8 +6,10 @@ trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
 xcrun swiftc -swift-version 5 -D RECORDING_WRITER_TESTS \
   -target "$(uname -m)-apple-macosx13.0" -module-cache-path "$test_dir/modules" \
   -framework AppKit -framework AVFoundation -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreImage \
+  -framework QuartzCore -framework Metal \
   "$repo_dir/src-tauri/native/macos/AeroShootCapture.swift" \
   "$repo_dir/src-tauri/native/macos/AeroShootLivePreview.swift" \
+  "$repo_dir/src-tauri/native/macos/AeroShootPreview.swift" \
   "$repo_dir/src-tauri/native/macos/MouseHookMac.swift" \
   "$repo_dir/src-tauri/native/macos/tests/RecordingWriterTests.swift" -o "$test_dir/tests"
 "$test_dir/tests" "$test_dir/media"

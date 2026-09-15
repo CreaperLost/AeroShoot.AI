@@ -1,8 +1,10 @@
 import AVFoundation
 import ScreenCaptureKit
 import CoreImage
+import CoreVideo
 import AppKit
 import AudioToolbox
+import Metal
 
 // Capture callbacks retain only the newest pixel buffer per video source.
 // Recording and idle monitoring use the same mailbox; no frames go through JS.
@@ -11,12 +13,15 @@ enum LivePreviewFrames {
   static var screen: CVPixelBuffer?
   static var camera: CVPixelBuffer?
   static var showScreen = true
+  /// Bumped on every change so the renderer can skip unchanged frames.
+  static var sequence: UInt64 = 0
   static func offer(_ sample: CMSampleBuffer, camera isCamera: Bool) {
     guard let pixel = CMSampleBufferGetImageBuffer(sample) else { return }
     lock.lock(); defer { lock.unlock() }
     if isCamera { camera = pixel } else { screen = pixel }
+    sequence &+= 1
   }
-  static func clear() { lock.lock(); screen = nil; camera = nil; showScreen = true; lock.unlock() }
+  static func clear() { lock.lock(); screen = nil; camera = nil; showScreen = true; sequence &+= 1; lock.unlock() }
 }
 
 private enum LivePreviewLevels {
@@ -221,23 +226,127 @@ private func livePreviewPlaced(_ pixel: CVPixelBuffer, _ rect: CGRect, cover: Bo
   return cover ? image.cropped(to: rect) : image
 }
 
+private let livePreviewBounds = CGRect(x: 0, y: 0, width: 1280, height: 720)
+
+/// Screen letterboxed into the 1280x720 preview canvas with the webcam bubble
+/// in the corner. Returns nil when there is nothing to show.
+private func livePreviewComposite(screen: CVPixelBuffer?, camera: CVPixelBuffer?) -> CIImage? {
+  guard screen != nil || camera != nil else { return nil }
+  var image = CIImage(color: CIColor(red: 0.02, green: 0.02, blue: 0.03)).cropped(to: livePreviewBounds)
+  if let screen { image = livePreviewPlaced(screen, livePreviewBounds, cover: false).composited(over: image) }
+  if let camera { image = livePreviewPlaced(camera, CGRect(x: 980, y: 20, width: 280, height: 158), cover: false).composited(over: image) }
+  return image
+}
+
+/// Receives rendered preview frames on the main thread.
+protocol LivePreviewTarget: AnyObject {
+  func presentLivePreview(_ buffer: CVPixelBuffer)
+}
+
+/// Draws the newest mailbox frames into the on-screen preview entirely on the
+/// GPU. Core Image composites into preview-owned IOSurface buffers, so capture
+/// buffers are released immediately, and the main thread only swaps the view
+/// layer's contents. Nothing is copied through the CPU or Rust.
+final class LivePreviewRenderer {
+  static let shared = LivePreviewRenderer()
+
+  private let queue = DispatchQueue(label: "ai.aeroshoot.preview-render", autoreleaseFrequency: .workItem)
+  private let context: CIContext
+  private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+  private var pool: CVPixelBufferPool?
+  private var timer: DispatchSourceTimer?
+  private weak var target: LivePreviewTarget?
+  private var lastSequence: UInt64?
+  /// 30 fps normally; 15 fps while recording, when the preview is only a
+  /// monitor and the capture pipeline should get the spare CPU/GPU time.
+  private var intervalMs = 33
+
+  private init() {
+    // Preview only: skip Core Image color management, which adds conversion
+    // passes to every frame. Recorded media never goes through this context.
+    let options: [CIContextOption: Any] = [
+      .cacheIntermediates: false, .workingColorSpace: NSNull(), .outputColorSpace: NSNull(),
+    ]
+    if let device = MTLCreateSystemDefaultDevice() {
+      context = CIContext(mtlDevice: device, options: options)
+    } else {
+      context = CIContext(options: options)
+    }
+    let bufferAttributes: [String: Any] = [
+      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+      kCVPixelBufferWidthKey as String: Int(livePreviewBounds.width),
+      kCVPixelBufferHeightKey as String: Int(livePreviewBounds.height),
+      kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+      kCVPixelBufferMetalCompatibilityKey as String: true,
+    ]
+    let poolAttributes: [String: Any] = [kCVPixelBufferPoolMinimumBufferCountKey as String: 3]
+    CVPixelBufferPoolCreate(nil, poolAttributes as CFDictionary, bufferAttributes as CFDictionary, &pool)
+  }
+
+  /// Render into `next` at ~30 fps while it is set; nil stops rendering.
+  func setTarget(_ next: LivePreviewTarget?) {
+    queue.async { [self] in
+      target = next
+      lastSequence = nil
+      guard next != nil else {
+        timer?.cancel()
+        timer = nil
+        return
+      }
+      guard timer == nil else { return }
+      let source = DispatchSource.makeTimerSource(queue: queue)
+      source.schedule(deadline: .now(), repeating: .milliseconds(intervalMs), leeway: .milliseconds(5))
+      source.setEventHandler { [weak self] in self?.renderIfChanged() }
+      timer = source
+      source.resume()
+    }
+  }
+
+  /// Lowers the preview rate while a recording is running.
+  func setRecording(_ recording: Bool) {
+    queue.async { [self] in
+      intervalMs = recording ? 66 : 33
+      timer?.schedule(deadline: .now(), repeating: .milliseconds(intervalMs), leeway: .milliseconds(5))
+    }
+  }
+
+  /// Render immediately, on the render queue. Used by contract tests.
+  func renderNow() {
+    queue.sync { renderIfChanged() }
+  }
+
+  private func renderIfChanged() {
+    guard let target, let pool else { return }
+    LivePreviewFrames.lock.lock()
+    let sequence = LivePreviewFrames.sequence
+    let screen = LivePreviewFrames.showScreen ? LivePreviewFrames.screen : nil
+    let camera = LivePreviewFrames.camera
+    LivePreviewFrames.lock.unlock()
+    guard sequence != lastSequence, let image = livePreviewComposite(screen: screen, camera: camera) else { return }
+    var rendered: CVPixelBuffer?
+    guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &rendered) == kCVReturnSuccess, let output = rendered else { return }
+    CVBufferSetAttachment(output, kCVImageBufferCGColorSpaceKey, colorSpace, .shouldPropagate)
+    context.render(image, to: output, bounds: livePreviewBounds, colorSpace: nil)
+    lastSequence = sequence
+    DispatchQueue.main.async { [weak target] in
+      target?.presentLivePreview(output)
+    }
+  }
+}
+
 @_cdecl("aeroshoot_live_preview_read")
 func livePreviewRead(_ bytes: UnsafeMutableRawPointer?, _ length: Int32) -> Int32 {
-  // Called repeatedly by a Rust std::thread, which has no AppKit run loop
-  // autorelease pool. CIImage's autoreleased render graph retains IOSurfaces;
-  // without a per-call pool it exhausts SCStream's queue after a few frames.
+  // Called repeatedly by a thread without an AppKit run loop autorelease
+  // pool. CIImage's autoreleased render graph retains IOSurfaces; without a
+  // per-call pool it exhausts SCStream's queue after a few frames.
   return autoreleasepool {
   guard let bytes, length >= 1280 * 720 * 4 else { return 0 }
   LivePreviewFrames.lock.lock()
   let screen = LivePreviewFrames.showScreen ? LivePreviewFrames.screen : nil
   let camera = LivePreviewFrames.camera
   LivePreviewFrames.lock.unlock()
-  guard screen != nil || camera != nil else { return 0 }
-  let bounds = CGRect(x: 0, y: 0, width: 1280, height: 720)
-  var image = CIImage(color: CIColor(red: 0.02, green: 0.02, blue: 0.03)).cropped(to: bounds)
-  if let screen { image = livePreviewPlaced(screen, bounds, cover: false).composited(over: image) }
-  if let camera { image = livePreviewPlaced(camera, CGRect(x: 980, y: 20, width: 280, height: 158), cover: false).composited(over: image) }
-  liveContext.render(image, toBitmap: bytes, rowBytes: 1280 * 4, bounds: bounds, format: .BGRA8, colorSpace: CGColorSpace(name: CGColorSpace.itur_709)!)
+  guard let image = livePreviewComposite(screen: screen, camera: camera) else { return 0 }
+  liveContext.render(image, toBitmap: bytes, rowBytes: 1280 * 4, bounds: livePreviewBounds, format: .BGRA8, colorSpace: CGColorSpace(name: CGColorSpace.itur_709)!)
   return (screen == nil ? 0 : 1) | (camera == nil ? 0 : 2)
   }
 }
@@ -250,10 +359,9 @@ func livePreviewReadCamera(_ bytes: UnsafeMutableRawPointer?, _ length: Int32) -
   let camera = LivePreviewFrames.camera
   LivePreviewFrames.lock.unlock()
   guard let camera else { return 0 }
-  let bounds = CGRect(x: 0, y: 0, width: 1280, height: 720)
-  let image = livePreviewPlaced(camera, bounds, cover: true)
-    .composited(over: CIImage(color: CIColor(red: 0.02, green: 0.02, blue: 0.03)).cropped(to: bounds))
-  liveContext.render(image, toBitmap: bytes, rowBytes: 1280 * 4, bounds: bounds, format: .BGRA8, colorSpace: CGColorSpace(name: CGColorSpace.itur_709)!)
+  let image = livePreviewPlaced(camera, livePreviewBounds, cover: true)
+    .composited(over: CIImage(color: CIColor(red: 0.02, green: 0.02, blue: 0.03)).cropped(to: livePreviewBounds))
+  liveContext.render(image, toBitmap: bytes, rowBytes: 1280 * 4, bounds: livePreviewBounds, format: .BGRA8, colorSpace: CGColorSpace(name: CGColorSpace.itur_709)!)
   return 1
   }
 }

@@ -9,35 +9,7 @@ pub mod telemetry;
 #[cfg(feature = "tauri-app")]
 use commands::*;
 #[cfg(feature = "tauri-app")]
-use tauri::{Emitter, Manager, State};
-
-#[cfg(feature = "tauri-app")]
-fn emit_hud(app: &tauri::AppHandle, snapshot: &hud::HudSnapshot) {
-    let _ = app.emit(hud::HUD_SETTINGS_EVENT, snapshot);
-}
-
-#[cfg(feature = "tauri-app")]
-fn sync_hud_window(app: &tauri::AppHandle, snapshot: &hud::HudSnapshot) {
-    if let Some(window) = app.get_webview_window(hud::HUD_WINDOW_LABEL) {
-        if snapshot.hud_visible {
-            let (width, height) = snapshot.settings.window_size_css_px();
-            let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-                f64::from(width),
-                f64::from(height),
-            )));
-            let _ = window.show();
-        } else {
-            let _ = window.hide();
-        }
-    }
-    emit_hud(app, snapshot);
-}
-
-#[cfg(feature = "tauri-app")]
-fn sync_hud_after_session(app: &tauri::AppHandle) {
-    let snapshot = commands::hud_snapshot_impl(&app.state::<AppState>());
-    sync_hud_window(app, &snapshot);
-}
+use tauri::{Manager, State};
 
 #[cfg(feature = "tauri-app")]
 fn preview_ns_window(
@@ -75,36 +47,22 @@ async fn capture_preview_configure(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let _guard = state.command_lock.lock();
-        if !enabled {
-            if state.active_session.read().is_some() {
-                return Ok(());
-            }
-            state
-                .live_preview
-                .store(false, std::sync::atomic::Ordering::Release);
-            capture::preview::stop();
-            return Ok(());
-        }
-        state
-            .live_preview
-            .store(true, std::sync::atomic::Ordering::Release);
+        // An active recording owns capture and feeds the same preview mailbox.
         if state.active_session.read().is_some() {
             return Ok(());
         }
-        let started = capture::preview::start(
+        if !enabled {
+            capture::preview::stop();
+            return Ok(());
+        }
+        capture::preview::start(
             source_id.as_deref().ok_or("Select a screen source")?,
             capture_screen.unwrap_or(true),
             capture_system_audio.unwrap_or(false),
             camera_id.as_deref(),
             mic_id.as_deref(),
             mic_gain_db.unwrap_or(0.0),
-        );
-        if started.is_err() {
-            state
-                .live_preview
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
-        started
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -134,36 +92,19 @@ async fn start_recording(
     app: tauri::AppHandle,
     options: commands::StartRecordingOptions,
 ) -> Result<commands::StartRecordingResult, String> {
-    if let Some(window) = app.get_webview_window(hud::HUD_WINDOW_LABEL) {
-        let _ = window.hide();
-    }
     let app_handle = app.clone();
-    let res = tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         commands::start_recording_impl(&app_handle.state::<AppState>(), options)
     })
     .await
-    .map_err(|e| e.to_string());
-    let res = match res {
-        Ok(inner) => inner,
-        Err(error) => {
-            sync_hud_after_session(&app);
-            return Err(error);
-        }
-    };
+    .map_err(|e| e.to_string())??;
     if let Some(session) = app.state::<AppState>().active_session.read().as_ref() {
         if let Some(window) = app.get_webview_window("main") {
             let title = commands::window_title_for_recording(Some(&session.project_name));
             let _ = window.set_title(&title);
         }
     }
-    // The webcam capture overlay popup was removed. The webcam file is still
-    // written into the recording bundle, but the floating HUD window must never
-    // pop up after Record is pressed. Always force `requested_visible = false`.
-    if res.is_ok() {
-        let _ = commands::hud_set_visible_impl(&app.state::<AppState>(), false);
-    }
-    sync_hud_after_session(&app);
-    res
+    Ok(result)
 }
 
 #[cfg(feature = "tauri-app")]
@@ -191,14 +132,11 @@ async fn resume_recording(app: tauri::AppHandle) -> Result<commands::SessionStat
 #[cfg(feature = "tauri-app")]
 #[tauri::command]
 async fn stop_recording(app: tauri::AppHandle) -> Result<commands::StopRecordingResult, String> {
-    let app_handle = app.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        commands::stop_recording_impl(&app_handle.state::<AppState>())
+    tauri::async_runtime::spawn_blocking(move || {
+        commands::stop_recording_impl(&app.state::<AppState>())
     })
     .await
-    .map_err(|e| e.to_string())?;
-    sync_hud_after_session(&app);
-    result
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(feature = "tauri-app")]
@@ -289,79 +227,6 @@ fn compute_source_geometry(
 
 #[cfg(feature = "tauri-app")]
 #[tauri::command]
-fn window_identity(window: tauri::Window) -> hud::WindowIdentity {
-    hud::window_identity_from_label(window.label())
-}
-
-#[cfg(feature = "tauri-app")]
-#[tauri::command]
-fn hud_snapshot(state: State<'_, AppState>) -> hud::HudSnapshot {
-    commands::hud_snapshot_impl(&state)
-}
-
-#[cfg(feature = "tauri-app")]
-#[tauri::command]
-fn hud_update(
-    app: tauri::AppHandle,
-    expected_revision: u64,
-    patch: hud::HudSettingsPatch,
-) -> Result<hud::HudSnapshot, String> {
-    let snapshot = commands::hud_update_impl(&app.state::<AppState>(), expected_revision, patch)?;
-    sync_hud_window(&app, &snapshot);
-    Ok(snapshot)
-}
-
-#[cfg(feature = "tauri-app")]
-#[tauri::command]
-fn hud_reconcile_cameras(
-    app: tauri::AppHandle,
-    cameras: Vec<hud::HudCameraInfo>,
-    selected_camera_id: Option<String>,
-) -> Result<hud::HudSnapshot, String> {
-    let snapshot = commands::hud_reconcile_cameras_impl(
-        &app.state::<AppState>(),
-        cameras,
-        selected_camera_id,
-    )?;
-    emit_hud(&app, &snapshot);
-    Ok(snapshot)
-}
-
-#[cfg(feature = "tauri-app")]
-#[tauri::command]
-fn hud_preview_attach(
-    app: tauri::AppHandle,
-    window_label: String,
-    hit_mode: hud::PreviewHitMode,
-) -> Result<hud::HudSnapshot, String> {
-    let ns_window = Some(preview_ns_window(&app, &window_label)?);
-    let snapshot = commands::hud_preview_attach_impl(
-        &app.state::<AppState>(),
-        window_label,
-        hit_mode,
-        ns_window,
-    )?;
-    emit_hud(&app, &snapshot);
-    Ok(snapshot)
-}
-
-#[cfg(feature = "tauri-app")]
-#[tauri::command]
-fn hud_preview_layout(
-    state: State<'_, AppState>,
-    viewport: hud::PreviewViewport,
-) -> Result<hud::PreviewStatus, String> {
-    commands::hud_preview_layout_impl(&state, viewport)
-}
-
-#[cfg(feature = "tauri-app")]
-#[tauri::command]
-fn hud_preview_status(state: State<'_, AppState>) -> hud::PreviewStatus {
-    commands::hud_preview_status_impl(&state)
-}
-
-#[cfg(feature = "tauri-app")]
-#[tauri::command]
 fn studio_preview_attach(
     app: tauri::AppHandle,
     window_label: String,
@@ -395,22 +260,6 @@ fn studio_preview_status(state: State<'_, AppState>) -> hud::PreviewStatus {
 #[tauri::command]
 fn studio_preview_detach(state: State<'_, AppState>) -> Result<hud::PreviewStatus, String> {
     commands::studio_preview_detach_impl(&state)
-}
-
-#[cfg(feature = "tauri-app")]
-#[tauri::command]
-fn hud_close(app: tauri::AppHandle) -> Result<hud::HudSnapshot, String> {
-    let snapshot = commands::hud_close_impl(&app.state::<AppState>())?;
-    sync_hud_window(&app, &snapshot);
-    Ok(snapshot)
-}
-
-#[cfg(feature = "tauri-app")]
-#[tauri::command]
-fn hud_set_visible(app: tauri::AppHandle, visible: bool) -> Result<hud::HudSnapshot, String> {
-    let snapshot = commands::hud_set_visible_impl(&app.state::<AppState>(), visible)?;
-    sync_hud_window(&app, &snapshot);
-    Ok(snapshot)
 }
 
 #[cfg(feature = "tauri-app")]
@@ -465,44 +314,33 @@ fn show_in_finder(path: String) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(commands::AppState::default())
-        .setup(|app| {
-            // Bridge the Swift capture mailbox into the studio / HUD preview
-            // surfaces. Runs for the lifetime of the app; gates itself on
-            // `state.live_preview` so it is a no-op outside recording / preview.
-            capture::preview_pump::spawn(app.handle().clone());
-            Ok(())
-        })
-        .on_window_event(|window, event| match event {
-            tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
-                // Closing the recorder quits the app. Otherwise the hidden HUD
-                // window keeps the process alive with nothing to reopen.
-                // Finalize an active recording first so its project is complete.
-                api.prevent_close();
-                let app = window.app_handle().clone();
-                std::thread::spawn(move || {
-                    let state = app.state::<AppState>();
-                    if state.active_session.read().is_some() {
-                        if let Err(error) = commands::stop_recording_impl(&state) {
-                            eprintln!("[AeroShoot] Stopping the recording before quit failed: {error}");
-                        }
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == hud::STUDIO_WINDOW_LABEL {
+                    // Closing the recorder quits the app. Finalize an active
+                    // recording first so its project is complete.
+                    api.prevent_close();
+                    // Ignore further close requests while the first one is
+                    // still stopping the recording.
+                    static QUIT_IN_PROGRESS: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if QUIT_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        return;
                     }
-                    app.exit(0);
-                });
-            }
-            tauri::WindowEvent::CloseRequested { api, .. }
-                if window.label() == hud::HUD_WINDOW_LABEL =>
-            {
-                api.prevent_close();
-                let snapshot = commands::hud_set_visible_impl(&window.state::<AppState>(), false);
-                if let Ok(snapshot) = snapshot {
-                    let _ = window.hide();
-                    emit_hud(window.app_handle(), &snapshot);
+                    let app = window.app_handle().clone();
+                    std::thread::spawn(move || {
+                        let state = app.state::<AppState>();
+                        if state.active_session.read().is_some() {
+                            if let Err(error) = commands::stop_recording_impl(&state) {
+                                eprintln!(
+                                    "[AeroShoot] Stopping the recording before quit failed: {error}"
+                                );
+                            }
+                        }
+                        app.exit(0);
+                    });
                 }
             }
-            tauri::WindowEvent::Destroyed if window.label() == hud::HUD_WINDOW_LABEL => {
-                let _ = commands::hud_close_impl(&window.state::<AppState>());
-            }
-            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             list_capture_sources,
@@ -520,19 +358,10 @@ pub fn run() {
             mouse_telemetry_permission,
             open_system_privacy_settings,
             restart_app,
-            window_identity,
-            hud_snapshot,
-            hud_update,
-            hud_reconcile_cameras,
-            hud_preview_attach,
-            hud_preview_layout,
-            hud_preview_status,
             studio_preview_attach,
             studio_preview_layout,
             studio_preview_status,
             studio_preview_detach,
-            hud_close,
-            hud_set_visible,
             get_default_projects_dir,
             pick_save_directory,
             set_window_title,
@@ -548,7 +377,7 @@ pub fn run() {
                 ..
             } = event
             {
-                if let Some(window) = app.get_webview_window("main") {
+                if let Some(window) = app.get_webview_window(hud::STUDIO_WINDOW_LABEL) {
                     let _ = window.show();
                     let _ = window.set_focus();
                 }

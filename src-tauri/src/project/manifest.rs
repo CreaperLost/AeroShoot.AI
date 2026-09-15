@@ -204,7 +204,7 @@ impl ProjectManifest {
 
         // Safely prepare tmp path: remove any pre-existing tmp file/symlink safely
         let tmp_path = path.with_extension("tmp");
-        if let Ok(_) = fs::symlink_metadata(&tmp_path) {
+        if fs::symlink_metadata(&tmp_path).is_ok() {
             fs::remove_file(&tmp_path).map_err(|e| ManifestError::Io(e.to_string()))?;
         }
 

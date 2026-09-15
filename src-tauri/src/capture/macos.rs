@@ -12,7 +12,7 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::sync::{Condvar, OnceLock};
 use std::time::Duration;
 
@@ -379,7 +379,7 @@ static PERMISSION_WAIT: OnceLock<(Mutex<Option<AeroShootPermissionBundle>>, Cond
 
 unsafe extern "C" fn permission_completion(screen: i32, camera: i32, microphone: i32) {
     let (slot, ready) = PERMISSION_WAIT.get_or_init(|| (Mutex::new(None), Condvar::new()));
-    *slot.lock().unwrap() = Some(AeroShootPermissionBundle {
+    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(AeroShootPermissionBundle {
         screen_recording: screen,
         camera,
         microphone,
@@ -389,7 +389,7 @@ unsafe extern "C" fn permission_completion(screen: i32, camera: i32, microphone:
 
 pub fn request_permissions(screen: bool, camera: bool, microphone: bool) -> PermissionStatus {
     let (slot, ready) = PERMISSION_WAIT.get_or_init(|| (Mutex::new(None), Condvar::new()));
-    let mut guard = slot.lock().unwrap();
+    let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
     *guard = None;
     unsafe {
         aeroshoot_request_permissions(screen, camera, microphone, Some(permission_completion))
@@ -419,13 +419,24 @@ pub fn request_permissions(screen: bool, camera: bool, microphone: bool) -> Perm
 //      never block the foreign thread longer than necessary.
 // ---------------------------------------------------------------------------
 
+/// Reports a panic caught at the Swift boundary. The callback still returns an
+/// error code to Swift; this keeps the panic message for diagnosis.
+fn log_ffi_panic(callback: &str, payload: &(dyn std::any::Any + Send)) {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|message| message.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".into());
+    eprintln!("[AeroShoot] panic in {callback}: {message}");
+}
+
 static MOUSE_LOGGER: Mutex<Option<crate::telemetry::native::NativeMouseLogger>> = Mutex::new(None);
 
 unsafe extern "C" fn mouse_sink(json: *const c_char) -> c_int {
     std::panic::catch_unwind(|| {
         if json.is_null() { return -700; }
         let Ok(json) = CStr::from_ptr(json).to_str() else { return -700; };
-        let mut logger = MOUSE_LOGGER.lock().unwrap();
+        let mut logger = MOUSE_LOGGER.lock().unwrap_or_else(PoisonError::into_inner);
         match logger.as_mut().map(|logger| logger.append(json)) {
             Some(Ok(())) => {
                 // Only gap records carry a reason; avoid re-parsing every move and click.
@@ -438,7 +449,7 @@ unsafe extern "C" fn mouse_sink(json: *const c_char) -> c_int {
                         // mouse-tracking control before recording, so only mid-session
                         // failures are surfaced as runtime errors. The gap stays in the log.
                         if matches!(reason, "input_monitoring_revoked" | "event_tap_unavailable" | "unsupported_source_geometry") {
-                            if let Some(target) = RUNTIME_ERROR_TARGET.lock().unwrap().as_ref() {
+                            if let Some(target) = RUNTIME_ERROR_TARGET.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
                                 target.diagnostics.apply(&SessionEvent::RuntimeError {
                                     track_id: "telemetry".into(), error_code: 700,
                                     message: format!("Mouse telemetry unavailable ({reason}); recording continues with the baked cursor."),
@@ -452,7 +463,11 @@ unsafe extern "C" fn mouse_sink(json: *const c_char) -> c_int {
             },
             _ => -700,
         }
-    }).unwrap_or(-700)
+    })
+    .unwrap_or_else(|panic| {
+        log_ffi_panic("mouse telemetry sink", panic.as_ref());
+        -700
+    })
 }
 
 static RUNTIME_ERROR_TARGET: Mutex<Option<RuntimeErrorTarget>> = Mutex::new(None);
@@ -492,12 +507,12 @@ pub(crate) fn install_callback_targets(
     journal: Option<std::sync::Arc<crate::project::journal::ProjectJournal>>,
     project_root: Option<std::path::PathBuf>,
 ) {
-    *RUNTIME_ERROR_TARGET.lock().unwrap() = Some(RuntimeErrorTarget {
+    *RUNTIME_ERROR_TARGET.lock().unwrap_or_else(PoisonError::into_inner) = Some(RuntimeErrorTarget {
         diagnostics: diagnostics.clone(),
         state_machine: state_machine.clone(),
         epoch: epoch.clone(),
     });
-    *SEGMENT_TARGET.lock().unwrap() = Some(SegmentTarget {
+    *SEGMENT_TARGET.lock().unwrap_or_else(PoisonError::into_inner) = Some(SegmentTarget {
         diagnostics,
         epoch,
         journal,
@@ -510,20 +525,20 @@ pub(crate) fn install_callback_targets(
 /// Drain native publication writers before clearing callback targets.
 /// Sets `closed` first so a racing callback cannot recreate a throwaway writer.
 pub(crate) fn take_native_segment_writers() -> Vec<TrackSegmentWriter> {
-    let guard = SEGMENT_TARGET.lock().unwrap();
+    let guard = SEGMENT_TARGET.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(target) = guard.as_ref() else {
         return Vec::new();
     };
     target.closed.store(true, Ordering::SeqCst);
-    let mut writers = target.writers.lock().unwrap();
+    let mut writers = target.writers.lock().unwrap_or_else(PoisonError::into_inner);
     writers.drain().map(|(_, writer)| writer).collect()
 }
 
 /// Clear the global callback targets. Safe to call from any thread.
 pub(crate) fn clear_callback_targets() {
-    *RUNTIME_ERROR_TARGET.lock().unwrap() = None;
-    *SEGMENT_TARGET.lock().unwrap() = None;
-    *MOUSE_LOGGER.lock().unwrap() = None;
+    *RUNTIME_ERROR_TARGET.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    *SEGMENT_TARGET.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    *MOUSE_LOGGER.lock().unwrap_or_else(PoisonError::into_inner) = None;
     unsafe {
         aeroshoot_macos_register_mouse_sink(None);
     }
@@ -551,7 +566,7 @@ unsafe extern "C" fn c_segment_callback(
         }
         let id = CStr::from_ptr(track_id).to_string_lossy();
         let path = CStr::from_ptr(file_path).to_string_lossy();
-        let target = SEGMENT_TARGET.lock().unwrap().clone();
+        let target = SEGMENT_TARGET.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let Some(target) = target else {
             return -600;
         };
@@ -568,7 +583,7 @@ unsafe extern "C" fn c_segment_callback(
             "mic" => TrackType::MicAudio,
             _ => return -600,
         };
-        let mut writers = target.writers.lock().unwrap();
+        let mut writers = target.writers.lock().unwrap_or_else(PoisonError::into_inner);
         if target.closed.load(Ordering::SeqCst) {
             return -600;
         }
@@ -608,7 +623,10 @@ unsafe extern "C" fn c_segment_callback(
             }
         }
     })
-    .unwrap_or(-600)
+    .unwrap_or_else(|panic| {
+        log_ffi_panic("segment callback", panic.as_ref());
+        -600
+    })
 }
 
 unsafe extern "C" fn c_runtime_error_callback(
@@ -628,13 +646,13 @@ unsafe extern "C" fn c_runtime_error_callback(
     };
 
     // Record the raw code for tests that want to assert the FFI fired.
-    LAST_RUNTIME_ERROR_CODE.store(error_code as i32, Ordering::SeqCst);
+    LAST_RUNTIME_ERROR_CODE.store(error_code, Ordering::SeqCst);
 
-    let target = RUNTIME_ERROR_TARGET.lock().unwrap().clone();
+    let target = RUNTIME_ERROR_TARGET.lock().unwrap_or_else(PoisonError::into_inner).clone();
     if let Some(target) = target {
         let event = SessionEvent::RuntimeError {
             track_id: track_id_str,
-            error_code: error_code as i32,
+            error_code,
             message: message_str,
             t_us: target.epoch.current_elapsed_us(),
             // Native runtime errors are recoverable by default; the
@@ -706,6 +724,8 @@ pub struct NativeRecordingConfig<'a> {
     pub video_bitrate_bps: Option<u32>,
     /// Start the pointer hook and telemetry log (screen recordings only).
     pub capture_mouse: bool,
+    /// Hide the OS cursor from screen capture; the editor redraws it from telemetry.
+    pub hide_cursor: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -732,21 +752,25 @@ pub struct MacCaptureSession {
     handle: Option<NonNull<c_void>>,
 }
 
-// The Swift recorder synchronizes its state and owns all callback queues.
+// SAFETY: `MacCaptureSession` only holds an opaque handle to the Swift
+// recorder. Every call through it enters Swift, which serializes access to the
+// recorder on its own queues and locks, and the handle is released exactly once
+// (taken in stop/Drop). Moving or sharing it between threads therefore cannot
+// create unsynchronized access to Swift state.
 unsafe impl Send for MacCaptureSession {}
 unsafe impl Sync for MacCaptureSession {}
 
 impl MacCaptureSession {
     pub fn start(config: NativeRecordingConfig<'_>) -> Result<Self, String> {
         if config.capture_screen && config.capture_mouse {
-            *MOUSE_LOGGER.lock().unwrap() = Some(
+            *MOUSE_LOGGER.lock().unwrap_or_else(PoisonError::into_inner) = Some(
                 crate::telemetry::native::NativeMouseLogger::create(config.project_path)?,
             );
             unsafe {
                 aeroshoot_macos_register_mouse_sink(Some(mouse_sink));
             }
         } else {
-            *MOUSE_LOGGER.lock().unwrap() = None;
+            *MOUSE_LOGGER.lock().unwrap_or_else(PoisonError::into_inner) = None;
             unsafe {
                 aeroshoot_macos_register_mouse_sink(None);
             }
@@ -1014,6 +1038,7 @@ mod tests {
             mic_gain_db: Some(6.0),
             video_bitrate_bps: None,
             capture_mouse: true,
+            hide_cursor: false,
         };
         let json = serde_json::to_string(&cfg).expect("serialize config");
         // camelCase field that the Swift side decodes.
@@ -1024,14 +1049,23 @@ mod tests {
             mic_gain_db: None,
             video_bitrate_bps: None,
             capture_mouse: true,
+            hide_cursor: false,
             ..cfg
         };
         let json_none = serde_json::to_string(&cfg_none).expect("serialize config");
         assert!(!json_none.contains("micGainDb"), "json was: {json_none}");
     }
 
+    /// The callback targets are process-wide statics. Tests that install them
+    /// must not run concurrently, or one test's `clear_callback_targets` erases
+    /// the other's diagnostics target mid-assertion.
+    static CALLBACK_TARGETS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn runtime_error_callback_routes_into_diagnostics() {
+        let _targets = CALLBACK_TARGETS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Reset the test-friendly counter and install a fresh diagnostics.
         LAST_RUNTIME_ERROR_CODE.store(0, Ordering::SeqCst);
         let diagnostics = Arc::new(SessionDiagnostics::new());
@@ -1064,6 +1098,9 @@ mod tests {
 
     #[test]
     fn native_callback_keeps_pending_publication_after_journal_failure() {
+        let _targets = CALLBACK_TARGETS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let journal = crate::project::ProjectJournal::open_or_create(dir.path()).unwrap();
         let journal = Arc::new(journal);

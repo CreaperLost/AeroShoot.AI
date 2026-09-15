@@ -72,6 +72,16 @@ pub enum CanonicalKind {
         end_us: u64,
         dropped_events: u64,
     },
+    /// The system cursor shape changed. Its image, when captured, is
+    /// `telemetry/cursors/<cursor_id>.png`; sizes and hotspot are in points.
+    CursorChanged {
+        cursor_id: String,
+        name: Option<String>,
+        hotspot_x: f64,
+        hotspot_y: f64,
+        width: f64,
+        height: f64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,13 +256,10 @@ fn parse_geometry_line(
         || peek.coordinate_space.is_some()
         || peek.record.as_deref() == Some("geometry")
     {
-        if peek.version.is_some() && peek.version != Some(2) {
+        if let Some(version) = peek.version.filter(|&version| version != 2) {
             push_diag(
                 stream,
-                format!(
-                    "Unknown geometry version {} at line {line_number}",
-                    peek.version.unwrap()
-                ),
+                format!("Unknown geometry version {version} at line {line_number}"),
             );
             return Ok(());
         }
@@ -514,6 +521,21 @@ fn event_from_v2(event: MouseEvent) -> Result<CanonicalEvent, String> {
                 dropped_events,
             }
         }
+        MousePayload::CursorChanged {
+            cursor_id,
+            name,
+            hotspot_x,
+            hotspot_y,
+            width,
+            height,
+        } => CanonicalKind::CursorChanged {
+            cursor_id,
+            name,
+            hotspot_x,
+            hotspot_y,
+            width,
+            height,
+        },
     };
     Ok(CanonicalEvent {
         version: 2,
@@ -534,6 +556,33 @@ mod tests {
         fs::create_dir_all(root.join("telemetry")).unwrap();
         fs::write(root.join("telemetry/geometry.jsonl"), geometry).unwrap();
         fs::write(root.join("telemetry/events.jsonl"), events).unwrap();
+    }
+
+    #[test]
+    fn reads_cursor_shape_changes_without_coordinates() {
+        let dir = tempdir().unwrap();
+        write_pair(
+            dir.path(),
+            r#"{"version":2,"geometry_id":"g2","t_us":10,"coordinate_space":"quartz_global","source_id":"display:1","bounds":{"x":0,"y":0,"width":1920,"height":1080},"output_width":1920,"output_height":1080,"sampling_interval_us":100000,"cursor_mode":"replace","physical_width":1920,"physical_height":1080}
+"#,
+            r#"{"version":2,"seq":0,"t_us":20,"geometry_id":"g2","payload":{"kind":"cursor_changed","cursor_id":"0123456789abcdef","name":"i_beam","hotspot_x":4.0,"hotspot_y":9.0,"width":9.0,"height":18.0}}
+"#,
+        );
+        let stream = read_telemetry(dir.path()).unwrap();
+        assert!(stream.diagnostics.is_empty(), "{:?}", stream.diagnostics);
+        match &stream.events[0].kind {
+            CanonicalKind::CursorChanged {
+                cursor_id,
+                name,
+                hotspot_y,
+                ..
+            } => {
+                assert_eq!(cursor_id, "0123456789abcdef");
+                assert_eq!(name.as_deref(), Some("i_beam"));
+                assert_eq!(*hotspot_y, 9.0);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
     }
 
     #[test]

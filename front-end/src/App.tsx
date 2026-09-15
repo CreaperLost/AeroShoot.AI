@@ -4,7 +4,6 @@ import { RecordingCompletedModal } from "./components/recording-hud/RecordingCom
 import { SceneErrorBoundary } from "./components/SceneErrorBoundary";
 import { useSettingsStore } from "./stores/settingsStore";
 import { useWindowTitle } from "./hooks/useWindowTitle";
-import { useHudSettings } from "./hooks/useHudSettings";
 import { useRecording } from "./hooks/useRecording";
 import { api } from "./lib/ipc";
 import {
@@ -24,7 +23,6 @@ let didAutoRequestScreen = false;
 
 export const App: React.FC = () => {
   useWindowTitle();
-  useHudSettings();
   const recording = useRecording();
   const { reconcileSelections } = useSettingsStore();
 
@@ -84,13 +82,6 @@ export const App: React.FC = () => {
         loadedDevices.cameras,
         loadedDevices.mics,
       );
-      void api
-        .hudReconcileCameras(
-          loadedDevices.cameras.map((camera) => ({ id: camera.id, name: camera.name })),
-          useSettingsStore.getState().selectedCameraId,
-        )
-        .then((snapshot) => useSettingsStore.getState().applyHudSnapshot(snapshot))
-        .catch(() => undefined);
     } catch (err) {
       console.error("[App] Error loading sources and devices:", err);
     }
@@ -131,14 +122,6 @@ export const App: React.FC = () => {
       }
     };
   }, [loadDevicesAndSources, refreshPermissions]);
-
-  useEffect(() => {
-    // The webcam capture overlay popup was removed. The studio no longer asks
-    // the HUD window to become visible when the camera bubble setting is
-    // toggled — the popup must never appear. Webcam capture into the recording
-    // file is unaffected.
-    void api.hudSetVisible(false).catch(() => undefined);
-  }, []);
 
   return (
     <div data-ui-root="studio" className="flex flex-col h-screen w-screen overflow-hidden bg-studio-950 text-studio-100 select-none">

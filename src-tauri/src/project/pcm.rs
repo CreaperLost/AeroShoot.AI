@@ -193,7 +193,7 @@ pub fn parse_wav(path: &Path) -> Result<WavInfo, String> {
     if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
         return Err("Unsupported WAV sample rate".into());
     }
-    let expected_align = channels * ((bits_per_sample + 7) / 8);
+    let expected_align = channels * bits_per_sample.div_ceil(8);
     if block_align == 0 || block_align != expected_align {
         return Err("WAV block align does not match sample format".into());
     }

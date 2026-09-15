@@ -1,4 +1,4 @@
-//! Platform adapter for recorder HUD preview overlay.
+//! Platform adapter for the record-scene native preview view.
 use super::preview::{PreviewHitMode, PreviewViewport};
 #[allow(unused_imports)]
 use std::os::raw::{c_char, c_int, c_void};
@@ -38,15 +38,6 @@ extern "C" {
         b: f32,
         generation: u64,
     ) -> c_int;
-    fn aeroshoot_preview_present_bgra(
-        handle: *mut c_void,
-        width: i32,
-        height: i32,
-        stride: i32,
-        pixels: *const u8,
-        len: i32,
-        generation: u64,
-    ) -> c_int;
     fn aeroshoot_preview_decode_present(
         handle: *mut c_void,
         path: *const c_char,
@@ -60,6 +51,9 @@ extern "C" {
     fn aeroshoot_macos_free_string(value: *mut c_char);
 }
 
+// The NSWindow pointer comes straight from Tauri's `ns_window()` and is only
+// forwarded to the Swift adapter, which uses it on the AppKit main thread.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn attach(ns_window: *mut c_void, generation: u64) -> Result<NonNull<c_void>, String> {
     #[cfg(all(target_os = "macos", not(stub_swift_ffi)))]
     unsafe {
@@ -158,36 +152,6 @@ pub fn present_fixed(
     }
 }
 
-/// Push a BGRA8 frame into the preview NSView. The pixel buffer must remain
-/// valid for the duration of the call (Swift copies the bytes synchronously
-/// inside `previewPresentBgra`).
-pub fn present_frame(
-    handle: NonNull<c_void>,
-    width: u32,
-    height: u32,
-    stride: u32,
-    pixels: &[u8],
-    generation: u64,
-) -> Result<(), String> {
-    #[cfg(all(target_os = "macos", not(stub_swift_ffi)))]
-    unsafe {
-        map_status(aeroshoot_preview_present_bgra(
-            handle.as_ptr(),
-            width as i32,
-            height as i32,
-            stride as i32,
-            pixels.as_ptr(),
-            pixels.len() as i32,
-            generation,
-        ))
-    }
-    #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
-    {
-        let _ = (handle, width, height, stride, pixels, generation);
-        Ok(())
-    }
-}
-
 pub fn decode_present(handle: NonNull<c_void>, path: &str, generation: u64) -> Result<(), String> {
     #[cfg(all(target_os = "macos", not(stub_swift_ffi)))]
     unsafe {
@@ -275,18 +239,6 @@ mod stub_preview_ffi {
         _r: f32,
         _g: f32,
         _b: f32,
-        _generation: u64,
-    ) -> c_int {
-        0
-    }
-    #[no_mangle]
-    pub extern "C" fn aeroshoot_preview_present_bgra(
-        _handle: *mut c_void,
-        _width: i32,
-        _height: i32,
-        _stride: i32,
-        _pixels: *const u8,
-        _len: i32,
         _generation: u64,
     ) -> c_int {
         0

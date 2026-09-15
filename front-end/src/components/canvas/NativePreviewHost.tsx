@@ -1,41 +1,28 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../../lib/ipc";
-import { PreviewHitMode, PreviewStatus } from "../../lib/types";
+import { PreviewStatus } from "../../lib/types";
+
+const WINDOW_LABEL = "main";
 
 interface NativePreviewHostProps {
-  live?: boolean;
-  windowLabel?: string;
-  hitMode?: PreviewHitMode;
-  className?: string;
-  surface?: "studio" | "hud";
   showStatus?: boolean;
   surfaceVisible?: boolean;
 }
 
-export function NativePreviewHost({
-  live = true,
-  windowLabel = "main",
-  hitMode = "consume",
-  className = "w-full max-w-4xl aspect-video",
-  surface = "studio",
-  showStatus = true,
-  surfaceVisible = true,
-}: NativePreviewHostProps) {
+/**
+ * Hosts the record-scene preview: an AppKit child view that mirrors this
+ * element's rectangle above the WebView. Pixels never cross IPC here; this
+ * component only reports geometry and visibility.
+ */
+export function NativePreviewHost({ showStatus = true, surfaceVisible = true }: NativePreviewHostProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const surfaceVisibleRef = useRef(surfaceVisible);
   const [status, setStatus] = useState<PreviewStatus | null>(null);
   const [error, setError] = useState<string>();
 
-  // The studio (`main` window) and HUD (`camera_overlay` window) surfaces are
-  // owned by independent `PreviewOwner` instances on the Rust side and exposed
-  // through separate Tauri command sets. Route attach / layout / status /
-  // detach calls accordingly so the host works in both windows without
-  // window-label-rejection errors.
-  const isHud = windowLabel === "camera_overlay";
-
   // Visibility is layout state, not ownership state. Keep the native child
-  // attached while menus open so asynchronous detach/attach calls cannot race
-  // and resurrect an AppKit surface above the WebView dropdown.
+  // attached while it is hidden so asynchronous detach/attach calls cannot race
+  // and resurrect an AppKit surface above web content.
   const scheduleLayoutRef = useRef<() => void>(() => undefined);
   useLayoutEffect(() => {
     surfaceVisibleRef.current = surfaceVisible;
@@ -80,13 +67,12 @@ export function NativePreviewHost({
       }
       const clip: [number, number, number, number] = [left - rect.left, top - rect.top, Math.max(0, right - left), Math.max(0, bottom - top)];
       const visible = surfaceVisibleRef.current && !document.hidden && clip[2] > 0 && clip[3] > 0;
-      const viewport = { windowLabel, x: rect.left, y: rect.top, width: rect.width, height: rect.height,
+      const viewport = { windowLabel: WINDOW_LABEL, x: rect.left, y: rect.top, width: rect.width, height: rect.height,
         backingScale: window.devicePixelRatio || 1, visible, occluded: !visible, generation, clip };
       const key = JSON.stringify(viewport);
       if (key === lastGeometry) return;
       sending = true;
-      const layout = isHud ? api.hudPreviewLayout : api.studioPreviewLayout;
-      void layout({ ...viewport, revision: ++revision })
+      void api.studioPreviewLayout({ ...viewport, revision: ++revision })
         .then(next => { if (!cancelled) { lastGeometry = key; setStatus(next); setError(undefined); } })
         .catch(err => { if (!cancelled) setError(String(err)); })
         .finally(() => {
@@ -106,13 +92,10 @@ export function NativePreviewHost({
     document.addEventListener("visibilitychange", schedule);
     // Catches moves that change neither size nor scroll, e.g. a banner above the host.
     const fallback = window.setInterval(schedule, 500);
-    const attach = isHud
-      ? api.hudPreviewAttach(windowLabel, hitMode).then(() => api.hudPreviewStatus())
-      : api.studioPreviewAttach(windowLabel, hitMode).then(() => api.studioPreviewStatus());
-    void attach.then(attached => {
+    void api.studioPreviewAttach(WINDOW_LABEL, "consume").then(() => api.studioPreviewStatus()).then(attached => {
       generation = attached.generation;
       if (cancelled) {
-        void (isHud ? api.hudClose() : api.studioPreviewDetach()).catch(() => undefined);
+        void api.studioPreviewDetach().catch(() => undefined);
         return;
       }
       setStatus(attached); setError(undefined);
@@ -128,43 +111,25 @@ export function NativePreviewHost({
       window.clearInterval(fallback);
       scheduleLayoutRef.current = () => undefined;
       if (generation !== undefined) {
-        void (isHud ? api.hudClose() : api.studioPreviewDetach()).catch(() => undefined);
+        void api.studioPreviewDetach().catch(() => undefined);
       }
     };
-  }, [windowLabel, hitMode, surface, isHud]);
+  }, []);
 
   return (
     <div className="w-full flex-1 h-full min-h-0 flex flex-col items-center gap-2">
-      <div
-        className={
-          surface === "hud"
-            ? "w-full flex-1 min-h-0 flex items-center justify-center overflow-hidden"
-            : "preview-stage w-full flex-1 min-h-0 flex items-center justify-center overflow-hidden"
-        }
-      >
+      <div className="preview-stage w-full flex-1 min-h-0 flex items-center justify-center overflow-hidden">
         {/* The AppKit view mirrors this box and draws above all web content,
-            so the studio host must always fit inside its stage; a fixed-size
-            box that overflows would paint over the rows above it. */}
+            so the host must always fit inside its stage; a fixed-size box that
+            overflows would paint over the rows above it. */}
         <div
           ref={hostRef}
           data-native-preview-host
-          className={
-            surface === "hud"
-              ? `pointer-events-none shrink-0 w-full h-full ${className}`
-              : "pointer-events-none preview-fit rounded-xl border border-studio-800 bg-black/50"
-          }
+          className="pointer-events-none preview-fit rounded-xl border border-studio-800 bg-black/50"
         />
       </div>
       {showStatus && <p className="text-xs text-studio-400 max-w-md text-center shrink-0">
-        {error
-          ? error
-          : status?.attached
-            ? live
-              ? surface === "hud"
-                ? "Live camera from the capture session"
-                : "Live screen and selected webcam"
-              : ""
-            : "Native preview surface is not attached."}
+        {error ? error : status?.attached ? "Live screen and selected webcam" : "Native preview surface is not attached."}
       </p>}
     </div>
   );

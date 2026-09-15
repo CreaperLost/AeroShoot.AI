@@ -104,7 +104,7 @@ pub fn validate_viewport(viewport: &PreviewViewport) -> Result<(), String> {
     Ok(())
 }
 
-/// Circle hit region used by the HUD spike: corners pass through to whatever is below.
+/// Circle hit region: corners pass through to whatever is below.
 pub fn circle_consumes(width: f64, height: f64, x: f64, y: f64) -> bool {
     let rx = width / 2.0;
     let ry = height / 2.0;
@@ -250,37 +250,6 @@ impl PreviewOwner {
         Ok(self.status())
     }
 
-    /// Push a BGRA8 frame into the preview NSView. Used by the live preview
-    /// pump to forward mailbox frames captured from SCStream / AVCaptureSession
-    /// into either the studio or the HUD overlay surface.
-    ///
-    /// `frame` is a borrowed slice; the caller must keep it alive until this
-    /// call returns. Returns `Ok(())` even when no native handle is attached
-    /// (the studio window during unmount, for instance) — the bookkeeping
-    /// still advances so a future attach picks up correct `presented_kind`.
-    pub fn present_frame(
-        &mut self,
-        frame: &crate::capture::preview::LiveFrame,
-        generation: u64,
-    ) -> Result<(), String> {
-        self.ensure_open()?;
-        self.ensure_generation(generation)?;
-        if let Some(handle) = self.native {
-            super::native::present_frame(
-                handle,
-                frame.width as u32,
-                frame.height as u32,
-                frame.stride as u32,
-                &frame.data,
-                self.generation,
-            )?;
-        }
-        self.presented_kind = "live".into();
-        self.copies = self.copies.saturating_add(1);
-        self.presented_bytes = frame.data.len() as u64;
-        Ok(())
-    }
-
     pub fn hit_test(&self, x: f64, y: f64) -> bool {
         let Some(viewport) = &self.viewport else {
             return false;
@@ -411,40 +380,14 @@ mod tests {
     }
 
     #[test]
-    fn present_frame_records_kind_and_bytes_without_native_handle() {
-        let mut owner = PreviewOwner::new();
-        owner
-            .attach("studio".into(), PreviewHitMode::Consume, None)
-            .unwrap();
-        let generation = owner.status().generation;
-        let frame = crate::capture::preview::LiveFrame::new(
-            crate::capture::preview::LivePreviewFlags::BOTH,
-            vec![0u8; crate::capture::preview::PREVIEW_BYTES],
-        );
-        owner.present_frame(&frame, generation).unwrap();
-        let status = owner.status();
-        assert_eq!(status.presented_kind, "live");
-        assert_eq!(
-            status.presented_bytes as usize,
-            crate::capture::preview::PREVIEW_BYTES
-        );
-        assert_eq!(status.copies, 1);
-        // Stale generation is rejected.
-        assert!(owner
-            .present_frame(&frame, generation + 9)
-            .unwrap_err()
-            .contains("Stale"));
-    }
-
-    #[test]
     fn circle_hit_mode_passes_transparent_corners() {
         let mut owner = PreviewOwner::new();
         owner
-            .attach("camera_overlay".into(), PreviewHitMode::Circle, None)
+            .attach("main".into(), PreviewHitMode::Circle, None)
             .unwrap();
         owner
             .layout(PreviewViewport {
-                window_label: "camera_overlay".into(),
+                window_label: "main".into(),
                 x: 0.0,
                 y: 0.0,
                 width: 120.0,
@@ -461,7 +404,7 @@ mod tests {
         assert!(!owner.hit_test(1.0, 1.0));
         owner.detach();
         owner
-            .attach("camera_overlay".into(), PreviewHitMode::Circle, None)
+            .attach("main".into(), PreviewHitMode::Circle, None)
             .unwrap();
         owner.detach();
         assert!(!owner.status().attached);

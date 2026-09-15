@@ -345,7 +345,7 @@ pub fn generate_valid_wav_segment(duration_us: u64, sample_rate: u32, channels: 
     out.extend_from_slice(&data_bytes.to_le_bytes());
     // Fill with audio samples (alternating values to avoid all-zeros)
     for i in 0..total_samples {
-        let sample_val = ((i % 100) as i16 * 100) as i16;
+        let sample_val = (i % 100) as i16 * 100;
         for _ in 0..channels {
             out.extend_from_slice(&sample_val.to_le_bytes());
         }

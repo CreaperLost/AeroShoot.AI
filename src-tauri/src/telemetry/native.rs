@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// Live geometry poll / uncertainty interval. H2 does not tighten this without
 /// a measured adapter.
@@ -13,11 +14,31 @@ pub const GAP_INPUT_MONITORING_UNAVAILABLE: &str = "input_monitoring_unavailable
 pub const GAP_INPUT_MONITORING_REVOKED: &str = "input_monitoring_revoked";
 pub const GAP_EVENT_TAP_UNAVAILABLE: &str = "event_tap_unavailable";
 pub const GAP_EVENT_TAP_DISABLED: &str = "event_tap_disabled";
+/// The event tap timed out under load and is re-enabled within 100 ms; pointer
+/// data resumes, so this does not end cursor replacement.
+pub const GAP_EVENT_TAP_TIMEOUT: &str = "event_tap_timeout";
 pub const GAP_QUEUE_OVERFLOW: &str = "queue_overflow";
 pub const GAP_UNSUPPORTED_SOURCE_GEOMETRY: &str = "unsupported_source_geometry";
 pub const GAP_GEOMETRY_CHANGED: &str = "geometry_changed";
 pub const GAP_RECORDING_PAUSED: &str = "recording_paused";
 pub const GAP_INITIAL_BUTTON_STATE_UNKNOWN: &str = "initial_button_state_unknown";
+/// In `replace` mode, tracking stopped and the cursor is baked into the video
+/// again from this gap on; the editor must stop drawing its own cursor here.
+pub const GAP_CURSOR_SHOWN_IN_VIDEO: &str = "cursor_shown_in_video";
+
+/// The OS cursor is part of the screen video; the editor must not draw one.
+pub const CURSOR_MODE_BAKED: &str = "baked";
+/// The OS cursor is hidden from the screen video; the editor draws it from telemetry.
+pub const CURSOR_MODE_REPLACE: &str = "replace";
+
+/// At most this many distinct cursor images are stored per recording.
+pub const MAX_CURSOR_ASSETS: usize = 64;
+/// Decoded PNG size limit for one cursor image.
+pub const MAX_CURSOR_ASSET_BYTES: usize = 64_000;
+/// Event and geometry records stay small; only cursor image records carry a PNG.
+const MAX_RECORD_BYTES: usize = 16_384;
+const MAX_CURSOR_ASSET_RECORD_BYTES: usize = 131_072;
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 /// Honest boolean pair for Input Monitoring. This is not a capture
 /// `PermissionStatus` bundle (screen/camera/microphone string states).
@@ -66,6 +87,18 @@ pub enum MousePayload {
         start_us: u64,
         end_us: u64,
         dropped_events: u64,
+    },
+    /// The system cursor shape changed. Sizes and the hotspot are in points
+    /// with a top-left origin; the image is `telemetry/cursors/<cursor_id>.png`
+    /// when it was captured.
+    CursorChanged {
+        cursor_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        hotspot_x: f64,
+        hotspot_y: f64,
+        width: f64,
+        height: f64,
     },
 }
 #[derive(Debug, Deserialize, Serialize)]
@@ -126,7 +159,18 @@ pub struct MouseGeometry {
 enum NativeRecord {
     Event(MouseEvent),
     Geometry(MouseGeometry),
+    CursorAsset(CursorAsset),
     Flush,
+}
+
+/// One cursor image, sent once per distinct `cursor_id`.
+#[derive(Deserialize)]
+struct CursorAsset {
+    version: u32,
+    cursor_id: String,
+    png_base64: String,
+    width: f64,
+    height: f64,
 }
 
 pub struct NativeMouseLogger {
@@ -134,6 +178,8 @@ pub struct NativeMouseLogger {
     geometry: BufWriter<File>,
     current_geometry: Option<String>,
     next_seq: u64,
+    cursors_dir: PathBuf,
+    cursor_assets: HashSet<String>,
 }
 impl NativeMouseLogger {
     /// Native sessions own fresh project bundles. Never append a new sequence
@@ -161,14 +207,44 @@ impl NativeMouseLogger {
             geometry: open("geometry.jsonl")?,
             current_geometry: None,
             next_seq: 0,
+            cursors_dir: dir.join("cursors"),
+            cursor_assets: HashSet::new(),
         })
     }
     pub fn append(&mut self, json: &str) -> Result<(), String> {
-        if json.len() > 16_384 {
+        if json.len() > MAX_CURSOR_ASSET_RECORD_BYTES {
             return Err("Oversized mouse record".into());
         }
         let record: NativeRecord = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        if json.len() > MAX_RECORD_BYTES && !matches!(record, NativeRecord::CursorAsset(_)) {
+            return Err("Oversized mouse record".into());
+        }
         match record {
+            NativeRecord::CursorAsset(asset) => {
+                if asset.version != 2
+                    || !valid_cursor_id(&asset.cursor_id)
+                    || !(asset.width > 0.0 && asset.width <= 256.0)
+                    || !(asset.height > 0.0 && asset.height <= 256.0)
+                {
+                    return Err("Invalid cursor asset".into());
+                }
+                if self.cursor_assets.contains(&asset.cursor_id)
+                    || self.cursor_assets.len() >= MAX_CURSOR_ASSETS
+                {
+                    return Ok(());
+                }
+                let png = decode_base64(&asset.png_base64)
+                    .filter(|png| png.len() <= MAX_CURSOR_ASSET_BYTES && png.starts_with(PNG_SIGNATURE))
+                    .ok_or_else(|| "Invalid cursor asset image".to_string())?;
+                std::fs::create_dir_all(&self.cursors_dir).map_err(|e| e.to_string())?;
+                let path = self.cursors_dir.join(format!("{}.png", asset.cursor_id));
+                match OpenOptions::new().create_new(true).write(true).open(path) {
+                    Ok(mut file) => file.write_all(&png).map_err(|e| e.to_string())?,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+                self.cursor_assets.insert(asset.cursor_id);
+            }
             NativeRecord::Flush => {
                 self.events.flush().map_err(|e| e.to_string())?;
             }
@@ -177,7 +253,7 @@ impl NativeMouseLogger {
                     || record.geometry_id.is_empty()
                     || record.geometry_id.len() > 128
                     || record.coordinate_space != "quartz_global"
-                    || record.cursor_mode != "baked"
+                    || ![CURSOR_MODE_BAKED, CURSOR_MODE_REPLACE].contains(&record.cursor_mode.as_str())
                     || record.sampling_interval_us != GEOMETRY_SAMPLING_INTERVAL_US
                     || record.bounds.width <= 0.0
                     || record.bounds.height <= 0.0
@@ -204,6 +280,29 @@ impl NativeMouseLogger {
                     } => {
                         if start_us > end_us || *end_us != record.t_us || reason.len() > 256 {
                             return Err("Invalid mouse gap".into());
+                        }
+                    }
+                    MousePayload::CursorChanged {
+                        cursor_id,
+                        name,
+                        hotspot_x,
+                        hotspot_y,
+                        width,
+                        height,
+                    } => {
+                        let size_ok = [*width, *height]
+                            .iter()
+                            .all(|v| v.is_finite() && *v > 0.0 && *v <= 256.0);
+                        let hotspot_ok = hotspot_x.is_finite()
+                            && hotspot_y.is_finite()
+                            && (0.0..=*width).contains(hotspot_x)
+                            && (0.0..=*height).contains(hotspot_y);
+                        if !valid_cursor_id(cursor_id)
+                            || name.as_ref().is_some_and(|n| n.is_empty() || n.len() > 64)
+                            || !size_ok
+                            || !hotspot_ok
+                        {
+                            return Err("Invalid cursor change".into());
                         }
                     }
                     _ => {
@@ -244,10 +343,97 @@ impl NativeMouseLogger {
     }
 }
 
+/// Cursor ids are 16 lowercase hex digits, safe to use as file names.
+fn valid_cursor_id(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Standard base64 with padding. Returns None for any malformed input.
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let bytes = input.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let value = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let chunks = bytes.len() / 4;
+    let mut out = Vec::with_capacity(chunks * 3);
+    for (index, chunk) in bytes.chunks(4).enumerate() {
+        let padding = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        if padding > 2 || (padding > 0 && index + 1 != chunks) {
+            return None;
+        }
+        let mut n = 0u32;
+        for (position, &c) in chunk.iter().enumerate() {
+            let digit = if position >= 4 - padding { 0 } else { value(c)? };
+            n = (n << 6) | digit;
+        }
+        out.push((n >> 16) as u8);
+        if padding < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if padding < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stores_cursor_images_once_and_records_shape_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut logger = NativeMouseLogger::create(dir.path()).unwrap();
+        logger.append(&geometry().to_string()).unwrap();
+        let asset = json!({"record":"cursor_asset","version":2,"cursor_id":"0123456789abcdef",
+            "png_base64":"iVBORw0KGgo=","width":17.0,"height":23.0});
+        logger.append(&asset.to_string()).unwrap();
+        logger.append(&asset.to_string()).unwrap();
+        let png = std::fs::read(dir.path().join("telemetry/cursors/0123456789abcdef.png")).unwrap();
+        assert_eq!(png, PNG_SIGNATURE);
+        let changed = json!({"record":"event","version":2,"seq":0,"t_us":5000,"geometry_id":"g1",
+            "payload":{"kind":"cursor_changed","cursor_id":"0123456789abcdef","name":"arrow",
+                "hotspot_x":4.0,"hotspot_y":4.0,"width":17.0,"height":23.0}});
+        logger.append(&changed.to_string()).unwrap();
+        logger.finish().unwrap();
+        let events = std::fs::read_to_string(dir.path().join("telemetry/events.jsonl")).unwrap();
+        assert!(events.contains("\"kind\":\"cursor_changed\""));
+        assert!(events.contains("\"name\":\"arrow\""));
+
+        let mut escaping_id = asset.clone();
+        escaping_id["cursor_id"] = json!("../../escape.png");
+        assert!(logger.append(&escaping_id.to_string()).is_err());
+        let mut not_png = asset.clone();
+        not_png["cursor_id"] = json!("fedcba9876543210");
+        not_png["png_base64"] = json!("QUJD");
+        assert!(logger.append(&not_png.to_string()).is_err());
+        let mut hotspot_outside = changed.clone();
+        hotspot_outside["seq"] = json!(1);
+        hotspot_outside["payload"]["hotspot_x"] = json!(40.0);
+        assert!(logger.append(&hotspot_outside.to_string()).is_err());
+    }
+
+    #[test]
+    fn decodes_standard_base64_and_rejects_malformed_input() {
+        assert_eq!(decode_base64("aGVsbG8="), Some(b"hello".to_vec()));
+        assert_eq!(decode_base64("aGVsbA=="), Some(b"hell".to_vec()));
+        assert_eq!(decode_base64(""), Some(Vec::new()));
+        assert_eq!(decode_base64("aGV"), None);
+        assert_eq!(decode_base64("a=GV"), None);
+        assert_eq!(decode_base64("aGV=bG8="), None);
+    }
     fn geometry() -> serde_json::Value {
         json!({"record":"geometry","version":2,"geometry_id":"g1","t_us":0,
             "coordinate_space":"quartz_global","source_id":"display:1",
@@ -348,6 +534,7 @@ mod tests {
             GAP_INPUT_MONITORING_REVOKED,
             GAP_EVENT_TAP_UNAVAILABLE,
             GAP_EVENT_TAP_DISABLED,
+            GAP_EVENT_TAP_TIMEOUT,
             GAP_UNSUPPORTED_SOURCE_GEOMETRY,
             GAP_QUEUE_OVERFLOW,
             GAP_GEOMETRY_CHANGED,
@@ -376,19 +563,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tighter_geometry_sampling_and_replace_cursor_mode() {
+    fn rejects_tighter_geometry_sampling_and_unknown_cursor_mode() {
         let dir = tempfile::tempdir().unwrap();
         let mut logger = NativeMouseLogger::create(dir.path()).unwrap();
         let mut tight = geometry();
         tight["sampling_interval_us"] = json!(1_000);
         assert!(logger.append(&tight.to_string()).is_err());
+        let mut unknown = geometry();
+        unknown["cursor_mode"] = json!("hidden");
+        assert!(logger.append(&unknown.to_string()).is_err());
         let mut replace = geometry();
-        replace["cursor_mode"] = json!("replace");
-        assert!(logger.append(&replace.to_string()).is_err());
+        replace["cursor_mode"] = json!(CURSOR_MODE_REPLACE);
+        logger.append(&replace.to_string()).unwrap();
         logger.append(&geometry().to_string()).unwrap();
         let geo_text =
             std::fs::read_to_string(dir.path().join("telemetry/geometry.jsonl")).unwrap();
         assert!(geo_text.contains("\"sampling_interval_us\":100000"));
+        assert!(geo_text.contains("\"cursor_mode\":\"replace\""));
         assert!(geo_text.contains("\"cursor_mode\":\"baked\""));
     }
 }

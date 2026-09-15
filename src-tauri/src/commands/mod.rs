@@ -3,10 +3,7 @@ use crate::capture::{
     PermissionStatus, SourceGeometry,
 };
 use crate::fixtures::{generate_valid_fmp4_segment, generate_valid_wav_segment};
-use crate::hud::{
-    HudCameraInfo, HudOwner, HudSettingsPatch, HudSnapshot, PreviewHitMode, PreviewOwner,
-    PreviewStatus, PreviewViewport, HUD_WINDOW_LABEL,
-};
+use crate::hud::{PreviewHitMode, PreviewOwner, PreviewStatus, PreviewViewport};
 use crate::project::manifest::{PauseInterval, TrackDescriptor, TrackType};
 use crate::project::{
     display_name_from_input, EditDocument, EditLayout, JournalRecord, ProjectBundle,
@@ -20,7 +17,6 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 pub struct ActiveSession {
@@ -63,13 +59,8 @@ pub struct AppState {
     pub active_session: RwLock<Option<ActiveSession>>,
     pub last_stop_result: RwLock<Option<StopRecordingResult>>,
     pub project_base_dir: PathBuf,
-    pub live_preview: std::sync::atomic::AtomicBool,
-    /// Studio (record scene / Edit) preview surface — separate from the HUD
-    /// because the two windows have different hit modes and lifetimes.
+    /// Record-scene preview surface in the main window.
     pub studio_preview: Mutex<PreviewOwner>,
-    /// Camera overlay (`camera_overlay` window) preview surface.
-    pub hud_preview: Mutex<PreviewOwner>,
-    pub hud: Mutex<HudOwner>,
     pub permission_override: RwLock<Option<PermissionStatus>>,
     pub native_capture_enabled: bool,
     /// Diagnostics bag for the active session: most-recent runtime error
@@ -86,10 +77,7 @@ impl AppState {
             active_session: RwLock::new(None),
             last_stop_result: RwLock::new(None),
             project_base_dir,
-            live_preview: std::sync::atomic::AtomicBool::new(false),
             studio_preview: Mutex::new(PreviewOwner::new()),
-            hud_preview: Mutex::new(PreviewOwner::new()),
-            hud: Mutex::new(HudOwner::new()),
             permission_override: RwLock::new(None),
             native_capture_enabled: cfg!(target_os = "macos"),
             diagnostics: Arc::new(SessionDiagnostics::new()),
@@ -103,10 +91,7 @@ impl AppState {
             active_session: RwLock::new(None),
             last_stop_result: RwLock::new(None),
             project_base_dir,
-            live_preview: std::sync::atomic::AtomicBool::new(false),
             studio_preview: Mutex::new(PreviewOwner::new()),
-            hud_preview: Mutex::new(PreviewOwner::new()),
-            hud: Mutex::new(HudOwner::new()),
             permission_override: RwLock::new(Some(PermissionStatus {
                 screen_recording: PermissionState::Authorized,
                 camera: PermissionState::Authorized,
@@ -226,6 +211,21 @@ fn default_true() -> bool {
 /// 30 Mbps; anything outside that range is clamped.
 const MIN_VIDEO_BITRATE_BPS: u32 = 10_000_000;
 const MAX_VIDEO_BITRATE_BPS: u32 = 30_000_000;
+
+/// Pointer telemetry needs a source with trackable geometry (a display or a
+/// window) and Input Monitoring permission.
+fn mouse_tracking_available(source_id: &str) -> bool {
+    let trackable = source_id.starts_with("display:") || source_id.starts_with("window:");
+    #[cfg(target_os = "macos")]
+    {
+        trackable && crate::capture::macos::mouse_permission(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = trackable;
+        false
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -704,7 +704,20 @@ pub fn start_recording_impl(
     let geometry =
         crate::capture::compute_source_geometry(&resolved_source, width, height, FitMode::Fit);
     bundle.manifest_mut().source_geometry = options.capture_screen.then_some(geometry);
-    bundle.manifest_mut().cursor_mode = options.capture_screen.then(|| "baked".into());
+    // Hide the cursor from the screen video only when pointer tracking can
+    // record it, so the editor redraws it (`replace`). Otherwise the cursor is
+    // baked into the video and the editor must not draw a second one.
+    let hide_cursor = state.native_capture_enabled
+        && options.capture_screen
+        && options.capture_mouse
+        && mouse_tracking_available(&options.source_id);
+    bundle.manifest_mut().cursor_mode = options.capture_screen.then(|| {
+        if hide_cursor {
+            crate::telemetry::native::CURSOR_MODE_REPLACE.into()
+        } else {
+            crate::telemetry::native::CURSOR_MODE_BAKED.into()
+        }
+    });
 
     let manifest_path = bundle.root_path().join("manifest.json");
     bundle
@@ -755,6 +768,7 @@ pub fn start_recording_impl(
                     mic_gain_db: options.mic_gain_db,
                     video_bitrate_bps,
                     capture_mouse: options.capture_mouse,
+                    hide_cursor,
                 },
             ) {
                 Ok(session) => {
@@ -899,9 +913,6 @@ pub fn start_recording_impl(
         initial_layout,
         native_pause_unacked: false,
     });
-    if state.native_capture_enabled {
-        state.live_preview.store(true, Ordering::Release);
-    }
 
     Ok(StartRecordingResult {
         session_id,
@@ -1196,8 +1207,6 @@ pub fn stop_recording_impl(state: &AppState) -> Result<StopRecordingResult, Stri
             return Err("No active recording session to stop".to_string());
         }
     };
-    // Editor playback must decode project media; the live mailbox is idle after Stop.
-    state.live_preview.store(false, Ordering::Release);
 
     let gross_duration_us = session.epoch.current_elapsed_us();
 
@@ -1666,101 +1675,9 @@ pub fn recover_project_impl(project_dir: PathBuf) -> Result<ProjectRecoveryRepor
     RecoveryEngine::scan_and_recover(project_dir).map_err(|e| e.to_string())
 }
 
-fn hud_session_flags(state: &AppState) -> (bool, bool) {
-    let capture_alive = state.active_session.read().is_some();
-    let recording = matches!(
-        state.state_machine.current(),
-        SessionState::Preparing
-            | SessionState::Recording
-            | SessionState::Paused
-            | SessionState::Stopping
-    ) || capture_alive;
-    (recording, capture_alive)
-}
-
-pub fn hud_snapshot_impl(state: &AppState) -> HudSnapshot {
-    let (recording, capture_alive) = hud_session_flags(state);
-    state.hud.lock().snapshot(recording, capture_alive)
-}
-
-pub fn hud_update_impl(
-    state: &AppState,
-    expected_revision: u64,
-    patch: HudSettingsPatch,
-) -> Result<HudSnapshot, String> {
-    let (recording, capture_alive) = hud_session_flags(state);
-    state
-        .hud
-        .lock()
-        .update(expected_revision, patch, recording, capture_alive)
-}
-
-pub fn hud_reconcile_cameras_impl(
-    state: &AppState,
-    cameras: Vec<HudCameraInfo>,
-    selected_camera_id: Option<String>,
-) -> Result<HudSnapshot, String> {
-    let (recording, capture_alive) = hud_session_flags(state);
-    state
-        .hud
-        .lock()
-        .reconcile_cameras(cameras, selected_camera_id, recording, capture_alive)
-}
-
-pub fn hud_preview_attach_impl(
-    state: &AppState,
-    window_label: String,
-    hit_mode: PreviewHitMode,
-    native_window: Option<*mut std::ffi::c_void>,
-) -> Result<HudSnapshot, String> {
-    if window_label != HUD_WINDOW_LABEL {
-        return Err(format!(
-            "HUD preview can only attach to '{HUD_WINDOW_LABEL}'"
-        ));
-    }
-    {
-        let mut preview = state.hud_preview.lock();
-        preview.attach(window_label.clone(), hit_mode, native_window)?;
-    }
-    let (recording, capture_alive) = hud_session_flags(state);
-    state
-        .hud
-        .lock()
-        .attach_preview(&window_label, recording, capture_alive)
-}
-
-pub fn hud_preview_layout_impl(
-    state: &AppState,
-    viewport: PreviewViewport,
-) -> Result<PreviewStatus, String> {
-    if viewport.window_label != HUD_WINDOW_LABEL {
-        return Err(format!(
-            "HUD preview layout requires window '{HUD_WINDOW_LABEL}'"
-        ));
-    }
-    if viewport.generation == 0 {
-        return Err("Preview generation is required".into());
-    }
-    state.hud_preview.lock().layout(viewport)
-}
-
-pub fn hud_preview_status_impl(state: &AppState) -> PreviewStatus {
-    state.hud_preview.lock().status()
-}
-
-/// Detach the HUD overlay. Must not call stop_recording or drop the capture session.
-pub fn hud_close_impl(state: &AppState) -> Result<HudSnapshot, String> {
-    state.hud_preview.lock().detach();
-    let (recording, capture_alive) = hud_session_flags(state);
-    Ok(state.hud.lock().close(recording, capture_alive))
-}
-
 // --- Studio preview surface -------------------------------------------------
 //
-// The studio (`main` window) hosts the record scene preview and has its own
-// lifetime independent of the HUD camera overlay. It must therefore own a
-// separate `PreviewOwner`. These impls reject the HUD window label so the
-// two surfaces never share state.
+// The record scene preview is a native child view of the `main` window.
 
 pub fn studio_preview_attach_impl(
     state: &AppState,
@@ -1768,11 +1685,6 @@ pub fn studio_preview_attach_impl(
     hit_mode: PreviewHitMode,
     native_window: Option<*mut std::ffi::c_void>,
 ) -> Result<PreviewStatus, String> {
-    if window_label == HUD_WINDOW_LABEL {
-        return Err(format!(
-            "Studio preview cannot attach to '{HUD_WINDOW_LABEL}'; use the HUD commands instead"
-        ));
-    }
     state
         .studio_preview
         .lock()
@@ -1783,11 +1695,6 @@ pub fn studio_preview_layout_impl(
     state: &AppState,
     viewport: PreviewViewport,
 ) -> Result<PreviewStatus, String> {
-    if viewport.window_label == HUD_WINDOW_LABEL {
-        return Err(format!(
-            "Studio preview layout rejected for '{HUD_WINDOW_LABEL}'"
-        ));
-    }
     state.studio_preview.lock().layout(viewport)
 }
 
@@ -1798,14 +1705,6 @@ pub fn studio_preview_status_impl(state: &AppState) -> PreviewStatus {
 pub fn studio_preview_detach_impl(state: &AppState) -> Result<PreviewStatus, String> {
     state.studio_preview.lock().detach();
     Ok(state.studio_preview.lock().status())
-}
-
-pub fn hud_set_visible_impl(state: &AppState, visible: bool) -> Result<HudSnapshot, String> {
-    let (recording, capture_alive) = hud_session_flags(state);
-    state
-        .hud
-        .lock()
-        .set_requested_visible(visible, recording, capture_alive)
 }
 
 /// Formats the window title for recording scenes or active sessions.
@@ -1834,6 +1733,12 @@ pub fn window_title_for_project(project_name: Option<&str>) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn mouse_tracking_requires_display_or_window_geometry() {
+        // Application captures have no pointer geometry, so the cursor stays baked.
+        assert!(!mouse_tracking_available("application:com.example"));
+    }
 
     #[test]
     fn start_options_accept_optional_video_bitrate() {

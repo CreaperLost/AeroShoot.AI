@@ -26,17 +26,6 @@
         "center": true,
         "decorations": true,
         "transparent": false
-      },
-      {
-        "label": "camera_overlay",
-        "title": "AeroShoot Camera HUD",
-        "width": 240,
-        "height": 240,
-        "alwaysOnTop": true,
-        "decorations": false,
-        "transparent": true,
-        "visible": false,
-        "resizable": false
       }
     ],
     "security": {
