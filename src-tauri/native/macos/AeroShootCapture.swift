@@ -2350,8 +2350,13 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     // screen stream hides that inside the countdown instead of cutting it from
     // the start of the webcam and mic tracks.
     let countdownEnds = CACurrentMediaTime() + Double(max(config.startDelayMs ?? 0, 0)) / 1000
+    // A running preview already has the camera streaming: take its session
+    // over instead of reopening the device. The rest of the preview stops, and
+    // the recorder feeds the preview from here on.
+    let adoptedPreviewSession = livePreviewHandOff(cameraID: config.cameraId, micID: config.micId,
+      captureScreen: config.captureScreen) { session in adoptCaptureSession(session) }
     let avCaptureStarted = DispatchGroup()
-    if config.cameraId != nil || config.micId != nil {
+    if (config.cameraId != nil || config.micId != nil) && !adoptedPreviewSession {
       avCaptureStarted.enter()
       DispatchQueue.global(qos: .userInitiated).async { [self] in
         startActiveAVCapture()
@@ -2428,6 +2433,28 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     guard let clock, pts.isNumeric else { return pts }
     let host = CMSyncConvertTime(pts, from: clock, to: CMClockGetHostTimeClock())
     return host.isNumeric ? host : pts
+  }
+
+  /// Records from the preview's running camera/mic session (see
+  /// livePreviewHandOff). Declines a session whose clock or video format the
+  /// recorder cannot use; the preview then stops it and the recorder opens its own.
+  private func adoptCaptureSession(_ session: AVCaptureSession) -> Bool {
+    guard let clock = session.synchronizationClock else { return false }
+    let recordedFormat = Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    let videoOutputs = session.outputs.compactMap { $0 as? AVCaptureVideoDataOutput }
+    guard videoOutputs.allSatisfy({ ($0.videoSettings?[kCVPixelBufferPixelFormatTypeKey as String] as? Int) == recordedFormat }) else {
+      return false
+    }
+    for output in session.outputs {
+      if let video = output as? AVCaptureVideoDataOutput {
+        video.setSampleBufferDelegate(self, queue: cameraQueue)
+      } else if let audio = output as? AVCaptureAudioDataOutput {
+        audio.setSampleBufferDelegate(self, queue: micQueue)
+      }
+    }
+    stateLock.lock(); captureClock = clock; stateLock.unlock()
+    cameraSession = session
+    return true
   }
 
   // MARK: Runtime observers (Task 6)
@@ -2660,6 +2687,9 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
         micTracker = nil
       }
     }
+    // The size the webcam track is encoded at, and the preview session's
+    // format, so adopted and freshly opened cameras record identically.
+    if cameraReady, session.canSetSessionPreset(.hd1280x720) { session.sessionPreset = .hd1280x720 }
     session.commitConfiguration()
     if !cameraReady && !micReady { return }
     if cameraReady { cameraQueue.suspend() }
@@ -3526,6 +3556,14 @@ enum RecordingWriterContracts {
     window.open(at: at(2_000))
     precondition(window.admit("screen", hostTime: at(2_000), arrivedAt: 3.0), "resume records again from its click")
     print("Recording window passed: tracks share the start, the cut keeps in-flight media and nothing after it")
+
+    precondition(livePreviewSessionMatches(deviceIDs: ["cam", "mic"], cameraID: "cam", micID: "mic"))
+    precondition(livePreviewSessionMatches(deviceIDs: ["mic"], cameraID: nil, micID: "mic"))
+    precondition(!livePreviewSessionMatches(deviceIDs: ["cam", "mic"], cameraID: "cam", micID: nil), "a session with an unwanted mic must not be adopted")
+    precondition(!livePreviewSessionMatches(deviceIDs: ["cam"], cameraID: "cam", micID: "mic"), "a session missing the mic must not be adopted")
+    precondition(!livePreviewSessionMatches(deviceIDs: ["other"], cameraID: "cam", micID: nil), "a different camera must not be adopted")
+    precondition(!livePreviewSessionMatches(deviceIDs: [], cameraID: nil, micID: nil))
+    print("Preview hand-off passed: only a session running exactly the recording's devices is adopted")
   }
 }
 #endif

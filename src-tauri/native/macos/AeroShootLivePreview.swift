@@ -127,7 +127,9 @@ private final class LiveMonitor: NSObject, SCStreamOutput, SCStreamDelegate, AVC
           guard let device = AVCaptureDevice(uniqueID: cameraID) else { throw NSError(domain: "AeroShoot", code: 6, userInfo: [NSLocalizedDescriptionKey: "Selected webcam is unavailable"]) }
           let input = try AVCaptureDeviceInput(device: device)
           let output = AVCaptureVideoDataOutput()
-          output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+          // The recorder's format, so a starting recording can take this running
+          // session over (livePreviewHandOff). Core Image draws it either way.
+          output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
           output.alwaysDiscardsLateVideoFrames = true
           output.setSampleBufferDelegate(self, queue: queue)
           guard session.canAddInput(input), session.canAddOutput(output) else { throw NSError(domain: "AeroShoot", code: 7, userInfo: [NSLocalizedDescriptionKey: "Cannot open webcam preview"]) }
@@ -201,6 +203,40 @@ func livePreviewStart(_ source: UnsafePointer<CChar>?, _ captureScreen: Bool, _ 
     liveMonitor = monitor
     return nil
   } catch { monitor.stop(); return strdup(error.localizedDescription) }
+}
+
+/// Whether a preview capture session opened exactly the devices a recording needs.
+func livePreviewSessionMatches(deviceIDs: Set<String>, cameraID: String?, micID: String?) -> Bool {
+  !deviceIDs.isEmpty && deviceIDs == Set([cameraID, micID].compactMap { $0 })
+}
+
+/// Stops the preview because a recording is starting. If the preview's camera
+/// and microphone session runs exactly the recording's devices, `adopt` is
+/// offered it first; when it accepts, the session keeps running for the
+/// recording, so the camera does not restart (about 1.3 s for a FaceTime
+/// camera). Returns whether the session was adopted. Serialized with preview
+/// start and stop by Rust's command lock.
+func livePreviewHandOff(cameraID: String?, micID: String?, captureScreen: Bool, adopt: (AVCaptureSession) -> Bool) -> Bool {
+  var adopted = false
+  if let monitor = liveMonitor, let session = monitor.camera, session.isRunning {
+    let deviceIDs = Set(session.inputs.compactMap { ($0 as? AVCaptureDeviceInput)?.device.uniqueID })
+    if livePreviewSessionMatches(deviceIDs: deviceIDs, cameraID: cameraID, micID: micID), adopt(session) {
+      monitor.camera = nil
+      adopted = true
+    }
+  }
+  liveMonitor?.stop()
+  liveMonitor = nil
+  LivePreviewLevels.clear()
+  // Keep the newest frames of sources the recording continues, so the preview
+  // does not blank while the recording's first frames arrive.
+  LivePreviewFrames.lock.lock()
+  if !captureScreen { LivePreviewFrames.screen = nil }
+  if cameraID == nil { LivePreviewFrames.camera = nil }
+  LivePreviewFrames.showScreen = captureScreen
+  LivePreviewFrames.sequence &+= 1
+  LivePreviewFrames.lock.unlock()
+  return adopted
 }
 
 @_cdecl("aeroshoot_live_preview_copy_levels_json")

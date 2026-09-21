@@ -510,14 +510,12 @@ pub fn start_recording_impl(
     // 1. Serialize all lifecycle commands
     let _cmd_guard = state.command_lock.lock();
 
-    if state.native_capture_enabled {
-        // The studio preview view stays attached: the recording session feeds
-        // the same mailbox. Never touch the AppKit view from here — this runs
-        // on a blocking worker, and the Swift adapter's `DispatchQueue.main.sync`
-        // while holding the `studio_preview` lock deadlocks against main-thread
-        // layout/detach commands and the preview pump.
-        crate::capture::preview::stop();
-    }
+    // Native start stops the preview capture itself, taking over its running
+    // camera and microphone so they do not restart. The studio preview view
+    // stays attached: the recording session feeds the same mailbox. Never
+    // touch the AppKit view from here — this runs on a blocking worker, and the
+    // Swift adapter's `DispatchQueue.main.sync` while holding the
+    // `studio_preview` lock deadlocks against main-thread layout/detach commands.
 
     // 2. Check system permissions for required screen recording. Camera and
     // microphone are optional tracks: if those TCC grants are missing, drop
