@@ -1,3 +1,4 @@
+use crate::capture::backend::{self, NativeCaptureSession};
 use crate::capture::{
     AudioDevice, CameraDevice, CaptureSource, CaptureSourceType, FitMode, PermissionState,
     PermissionStatus, SourceGeometry,
@@ -26,11 +27,9 @@ pub struct ActiveSession {
     pub project_bundle: ProjectBundle,
     pub segment_writer: Option<TrackSegmentWriter>,
     pub extra_writers: Vec<TrackSegmentWriter>,
-    #[cfg(target_os = "macos")]
-    pub native_session: Option<crate::capture::macos::MacCaptureSession>,
+    pub native_session: Option<backend::Session>,
     /// Sticky native-capture obligation. Survives `native_session.take()` so a
     /// failed Stop cannot be retried as a non-native success.
-    #[cfg(target_os = "macos")]
     pub native_outcome: NativeCaptureOutcome,
     pub pause_intervals: Vec<(u64, u64)>,
     pub current_pause_start_us: Option<u64>,
@@ -42,7 +41,6 @@ pub struct ActiveSession {
 }
 
 /// Native capture finalization state. `Unused` is the synthetic test path.
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeCaptureOutcome {
     Unused,
@@ -79,7 +77,7 @@ impl AppState {
             project_base_dir,
             studio_preview: Mutex::new(PreviewOwner::new()),
             permission_override: RwLock::new(None),
-            native_capture_enabled: cfg!(target_os = "macos"),
+            native_capture_enabled: backend::NATIVE_RECORDING,
             diagnostics: Arc::new(SessionDiagnostics::new()),
         }
     }
@@ -205,11 +203,72 @@ pub struct StartRecordingOptions {
     /// Every source starts at once and warms up during it.
     #[serde(default)]
     pub start_delay_ms: u32,
+    /// Camera track format; sent flat as `cameraWidth`, `cameraHeight`,
+    /// `cameraFps`, and `cameraBitrateBps`.
+    #[serde(flatten)]
+    pub camera: CameraOptions,
 }
 
 fn default_true() -> bool {
     true
 }
+
+/// Requested camera track format. Every field is optional.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_fps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_bitrate_bps: Option<u32>,
+}
+
+/// The camera track's resolved format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CameraTrackFormat {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    /// `None`: the recorder's own default for the size and rate.
+    pub bitrate_bps: Option<u32>,
+}
+
+/// The format the camera will actually be recorded in. Recorders that do not
+/// honour a requested format (`backend::CAMERA_FORMATS`) keep the original
+/// 1280×720 at the screen frame rate, so the manifest never claims otherwise.
+pub fn camera_track_format(
+    camera: &CameraOptions,
+    screen_fps: u32,
+    honoured: bool,
+) -> CameraTrackFormat {
+    if !honoured {
+        return CameraTrackFormat {
+            width: 1280,
+            height: 720,
+            fps: screen_fps,
+            bitrate_bps: None,
+        };
+    }
+    // Even dimensions within what cameras and H.264 encoders handle.
+    let dimension = |value: Option<u32>, fallback: u32, max: u32| {
+        value.map_or(fallback, |v| v.clamp(160, max) & !1)
+    };
+    CameraTrackFormat {
+        width: dimension(camera.camera_width, 1280, 3840),
+        height: dimension(camera.camera_height, 720, 2160),
+        fps: camera.camera_fps.map_or(screen_fps, |fps| fps.clamp(1, 60)),
+        bitrate_bps: camera
+            .camera_bitrate_bps
+            .map(|bps| bps.clamp(MIN_CAMERA_BITRATE_BPS, MAX_CAMERA_BITRATE_BPS)),
+    }
+}
+
+const MIN_CAMERA_BITRATE_BPS: u32 = 1_000_000;
+const MAX_CAMERA_BITRATE_BPS: u32 = 20_000_000;
 
 /// Bounds for a user-selected screen bitrate. The recorder offers 10, 20 and
 /// 30 Mbps; anything outside that range is clamped.
@@ -220,15 +279,7 @@ const MAX_VIDEO_BITRATE_BPS: u32 = 30_000_000;
 /// window) and Input Monitoring permission.
 fn mouse_tracking_available(source_id: &str) -> bool {
     let trackable = source_id.starts_with("display:") || source_id.starts_with("window:");
-    #[cfg(target_os = "macos")]
-    {
-        trackable && crate::capture::macos::mouse_permission(false)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = trackable;
-        false
-    }
+    trackable && backend::mouse_permission(false)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -320,15 +371,17 @@ pub struct DevicesResult {
 }
 
 pub fn list_capture_sources_impl() -> Vec<CaptureSource> {
-    #[cfg(target_os = "macos")]
-    if let Ok(sources) = crate::capture::macos::capture_sources() {
+    if let Ok(sources) = backend::capture_sources() {
         if !sources.is_empty() {
             return sources;
         }
     }
+    // Only builds without native enumeration (and tests) invent sources.
+    if backend::NATIVE_DEVICES && !cfg!(test) {
+        return Vec::new();
+    }
 
-    #[cfg(any(not(target_os = "macos"), test))]
-    return vec![
+    vec![
         CaptureSource {
             id: "screen-main".into(),
             name: "Main Display (Apple Silicon / Retina)".into(),
@@ -350,26 +403,29 @@ pub fn list_capture_sources_impl() -> Vec<CaptureSource> {
             width: 1920,
             height: 1080,
         },
-    ];
-
-    #[cfg(not(any(not(target_os = "macos"), test)))]
-    Vec::new()
+    ]
 }
 
 pub fn list_devices_impl() -> DevicesResult {
-    #[cfg(target_os = "macos")]
-    if let Ok((cameras, mics)) = crate::capture::macos::devices() {
+    if let Ok((cameras, mics)) = backend::devices() {
         if !cameras.is_empty() || !mics.is_empty() {
             return DevicesResult { cameras, mics };
         }
     }
+    // Only builds without native enumeration (and tests) invent devices.
+    if backend::NATIVE_DEVICES && !cfg!(test) {
+        return DevicesResult {
+            cameras: Vec::new(),
+            mics: Vec::new(),
+        };
+    }
 
-    #[cfg(any(not(target_os = "macos"), test))]
-    return DevicesResult {
+    DevicesResult {
         cameras: vec![CameraDevice {
             id: "cam-facetime".into(),
             name: "FaceTime HD Camera (Built-in)".into(),
             is_default: true,
+            formats: Vec::new(),
         }],
         mics: vec![
             AudioDevice {
@@ -383,23 +439,11 @@ pub fn list_devices_impl() -> DevicesResult {
                 is_default: false,
             },
         ],
-    };
-
-    #[cfg(not(any(not(target_os = "macos"), test)))]
-    DevicesResult {
-        cameras: Vec::new(),
-        mics: Vec::new(),
     }
 }
 
 pub fn request_permissions_impl(screen: bool, camera: bool, microphone: bool) -> PermissionStatus {
-    #[cfg(target_os = "macos")]
-    return crate::capture::macos::request_permissions(screen, camera, microphone);
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (screen, camera, microphone);
-        crate::capture::check_system_permissions()
-    }
+    backend::request_permissions(screen, camera, microphone)
 }
 
 pub fn get_permission_status_impl(state: &AppState) -> PermissionStatus {
@@ -441,7 +485,22 @@ pub fn open_system_privacy_settings_impl(pane: Option<String>) -> OpenSettingsRe
             opened: status.map(|s| s.success()).unwrap_or(false),
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        // Windows has no screen-capture or input-monitoring privacy pane.
+        let uri = match pane.as_deref() {
+            Some("Camera") => "ms-settings:privacy-webcam",
+            Some("Microphone") => "ms-settings:privacy-microphone",
+            _ => "ms-settings:privacy",
+        };
+        // Explorer hands the URI to Settings; its exit code carries no meaning.
+        let opened = std::process::Command::new("explorer")
+            .arg(uri)
+            .spawn()
+            .is_ok();
+        OpenSettingsResult { opened }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = pane;
         OpenSettingsResult { opened: false }
@@ -469,13 +528,14 @@ pub fn show_in_finder_impl(path: String) -> Result<(), String> {
     {
         #[cfg(target_os = "windows")]
         {
-            let status = std::process::Command::new("explorer")
-                .arg(format!("/select,{}", path))
-                .status()
+            use std::os::windows::process::CommandExt;
+            // Explorer exits non-zero even when it succeeds, so only a
+            // launch failure is an error. `raw_arg` keeps the quoting
+            // Explorer expects for paths with spaces.
+            std::process::Command::new("explorer")
+                .raw_arg(format!("/select,\"{}\"", path))
+                .spawn()
                 .map_err(|e| format!("Failed to run explorer: {e}"))?;
-            if !status.success() {
-                return Err(format!("explorer failed with exit status: {status}"));
-            }
             Ok(())
         }
         #[cfg(target_os = "linux")]
@@ -640,15 +700,16 @@ pub fn start_recording_impl(
     }
 
     // 2. Conditional webcam track
+    let camera_format = camera_track_format(&options.camera, fps, backend::CAMERA_FORMATS);
     if options.camera_id.is_some() {
         bundle.manifest_mut().tracks.push(TrackDescriptor {
             id: "webcam".into(),
             track_type: TrackType::Webcam,
             codec: "h264".into(),
             relative_path: "media/webcam/000001.mp4".into(),
-            width: Some(1280),
-            height: Some(720),
-            fps: Some(fps),
+            width: Some(camera_format.width),
+            height: Some(camera_format.height),
+            fps: Some(camera_format.fps),
             sample_rate: None,
             channels: None,
             gaps_total: 0,
@@ -692,10 +753,11 @@ pub fn start_recording_impl(
 
     // Compute source geometry before saving initial manifest so crash recovery
     // and downstream tools can re-derive the active rect.
-    #[cfg(all(target_os = "macos", not(test)))]
-    let source_list = crate::capture::macos::capture_sources().unwrap_or_default();
-    #[cfg(any(not(target_os = "macos"), test))]
-    let source_list = list_capture_sources_impl();
+    let source_list = if backend::NATIVE_DEVICES && !cfg!(test) {
+        backend::capture_sources().unwrap_or_default()
+    } else {
+        list_capture_sources_impl()
+    };
 
     let resolved_source = source_list
         .iter()
@@ -737,100 +799,63 @@ pub fn start_recording_impl(
 
     let mut segment_writer = None;
     let mut extra_writers = Vec::new();
-    #[cfg(target_os = "macos")]
     let mut native_session = None;
 
     if state.native_capture_enabled {
-        #[cfg(target_os = "macos")]
-        {
-            // Wire the global C FFI callback targets before Swift
-            // starts producing callbacks. Both targets share the same
-            // diagnostics bag; the runtime-error target also gets a
-            // reference to the state machine for Failed transitions.
-            let sm_arc = Arc::new(state.state_machine.clone());
-            let journal_arc = Some(bundle.journal_arc());
-            crate::capture::macos::install_callback_targets(
-                state.diagnostics.clone(),
-                sm_arc,
-                epoch.clone(),
-                journal_arc,
-                Some(bundle.root_path().to_path_buf()),
-            );
+        // Wire the callback targets before the native recorder
+        // starts producing callbacks. Both targets share the same
+        // diagnostics bag; the runtime-error target also gets a
+        // reference to the state machine for Failed transitions.
+        let sm_arc = Arc::new(state.state_machine.clone());
+        let journal_arc = Some(bundle.journal_arc());
+        backend::install_callback_targets(
+            state.diagnostics.clone(),
+            sm_arc,
+            epoch.clone(),
+            journal_arc,
+            Some(bundle.root_path().to_path_buf()),
+        );
 
-            match crate::capture::macos::MacCaptureSession::start(
-                crate::capture::macos::NativeRecordingConfig {
-                    source_id: &options.source_id,
-                    capture_screen: options.capture_screen,
-                    camera_id: options.camera_id.as_deref(),
-                    mic_id: options.mic_id.as_deref(),
-                    capture_system_audio: options.capture_system_audio,
-                    fps,
-                    width,
-                    height,
-                    source_rect: geometry.source_rect,
-                    destination_rect: geometry.dest_rect,
-                    preserves_aspect_ratio: geometry.preserves_aspect_ratio,
-                    project_path: bundle.root_path(),
-                    // Native session time zero is when recording begins.
-                    session_offset_us: 0,
-                    mic_gain_db: options.mic_gain_db,
-                    video_bitrate_bps,
-                    capture_mouse: options.capture_mouse,
-                    hide_cursor,
-                    start_delay_ms: u32::try_from(
-                        recording_due
-                            .saturating_duration_since(std::time::Instant::now())
-                            .as_millis(),
-                    )
-                    .unwrap_or(u32::MAX),
-                },
-            ) {
-                Ok(session) => {
-                    let ready = session.wait_until_ready(
-                        options.capture_screen,
-                        options.camera_id.is_some(),
-                        options.mic_id.is_some(),
-                        std::time::Duration::from_secs(5),
-                    );
-                    if let Err(error) = ready {
-                        drop(session);
-                        crate::capture::macos::clear_callback_targets();
-                        let failed = ActiveSession {
-                            session_id: session_id.clone(),
-                            project_name: display_name,
-                            epoch,
-                            project_bundle: bundle,
-                            segment_writer: None,
-                            extra_writers: Vec::new(),
-                            native_session: None,
-                            native_outcome: NativeCaptureOutcome::PrepareFailed {
-                                message: error.clone(),
-                            },
-                            pause_intervals: Vec::new(),
-                            current_pause_start_us: None,
-                            started_at_us,
-                            initial_layout: initial_layout.clone(),
-                            native_pause_unacked: false,
-                        };
-                        return Err(retain_failed_session(
-                            state,
-                            failed,
-                            "session",
-                            LIFECYCLE_PREPARE,
-                            format!("Native capture did not become ready: {error}"),
-                        ));
-                    }
-                    // Session time zero is when native capture began
-                    // recording, after the countdown: move the session clock there.
-                    if let Some(ago_us) = session.stats().recording_started_ago_us {
-                        epoch = SessionEpoch::started_ago(std::time::Duration::from_micros(ago_us));
-                        started_at_us = epoch.start_wall_time_us();
-                        crate::capture::macos::set_callback_epoch(epoch.clone());
-                    }
-                    native_session = Some(session);
-                }
-                Err(error) => {
-                    crate::capture::macos::clear_callback_targets();
+        match backend::Session::start(crate::capture::NativeRecordingConfig {
+            source_id: &options.source_id,
+            capture_screen: options.capture_screen,
+            camera_id: options.camera_id.as_deref(),
+            mic_id: options.mic_id.as_deref(),
+            capture_system_audio: options.capture_system_audio,
+            fps,
+            width,
+            height,
+            source_rect: geometry.source_rect,
+            destination_rect: geometry.dest_rect,
+            preserves_aspect_ratio: geometry.preserves_aspect_ratio,
+            project_path: bundle.root_path(),
+            // Native session time zero is when recording begins.
+            session_offset_us: 0,
+            mic_gain_db: options.mic_gain_db,
+            video_bitrate_bps,
+            capture_mouse: options.capture_mouse,
+            hide_cursor,
+            start_delay_ms: u32::try_from(
+                recording_due
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u32::MAX),
+            camera_width: backend::CAMERA_FORMATS.then_some(camera_format.width),
+            camera_height: backend::CAMERA_FORMATS.then_some(camera_format.height),
+            camera_fps: backend::CAMERA_FORMATS.then_some(camera_format.fps),
+            camera_bitrate_bps: camera_format.bitrate_bps,
+        }) {
+            Ok(session) => {
+                let ready = session.wait_until_ready(
+                    options.capture_screen,
+                    options.camera_id.is_some(),
+                    options.mic_id.is_some(),
+                    std::time::Duration::from_secs(5),
+                );
+                if let Err(error) = ready {
+                    drop(session);
+                    backend::clear_callback_targets();
                     let failed = ActiveSession {
                         session_id: session_id.clone(),
                         project_name: display_name,
@@ -853,9 +878,44 @@ pub fn start_recording_impl(
                         failed,
                         "session",
                         LIFECYCLE_PREPARE,
-                        format!("Failed to start native macOS capture: {error}"),
+                        format!("Native capture did not become ready: {error}"),
                     ));
                 }
+                // Session time zero is when native capture began
+                // recording, after the countdown: move the session clock there.
+                if let Some(ago_us) = session.stats().recording_started_ago_us {
+                    epoch = SessionEpoch::started_ago(std::time::Duration::from_micros(ago_us));
+                    started_at_us = epoch.start_wall_time_us();
+                    backend::set_callback_epoch(epoch.clone());
+                }
+                native_session = Some(session);
+            }
+            Err(error) => {
+                backend::clear_callback_targets();
+                let failed = ActiveSession {
+                    session_id: session_id.clone(),
+                    project_name: display_name,
+                    epoch,
+                    project_bundle: bundle,
+                    segment_writer: None,
+                    extra_writers: Vec::new(),
+                    native_session: None,
+                    native_outcome: NativeCaptureOutcome::PrepareFailed {
+                        message: error.clone(),
+                    },
+                    pause_intervals: Vec::new(),
+                    current_pause_start_us: None,
+                    started_at_us,
+                    initial_layout: initial_layout.clone(),
+                    native_pause_unacked: false,
+                };
+                return Err(retain_failed_session(
+                    state,
+                    failed,
+                    "session",
+                    LIFECYCLE_PREPARE,
+                    format!("Failed to start native capture: {error}"),
+                ));
             }
         }
     } else {
@@ -910,7 +970,6 @@ pub fn start_recording_impl(
 
     let project_path = bundle.root_path().to_string_lossy().into_owned();
 
-    #[cfg(target_os = "macos")]
     let native_outcome = if native_session.is_some() {
         NativeCaptureOutcome::Live
     } else {
@@ -924,9 +983,7 @@ pub fn start_recording_impl(
         project_bundle: bundle,
         segment_writer,
         extra_writers,
-        #[cfg(target_os = "macos")]
         native_session,
-        #[cfg(target_os = "macos")]
         native_outcome,
         pause_intervals: Vec::new(),
         current_pause_start_us: None,
@@ -972,7 +1029,6 @@ fn retain_failed_session(
     message
 }
 
-#[cfg(target_os = "macos")]
 fn absorb_native_segment_writers(session: &mut ActiveSession, writers: Vec<TrackSegmentWriter>) {
     for writer in writers {
         if writer.track_id() == "screen" && session.segment_writer.is_none() {
@@ -983,12 +1039,10 @@ fn absorb_native_segment_writers(session: &mut ActiveSession, writers: Vec<Track
     }
 }
 
-#[cfg(target_os = "macos")]
 fn native_requires_honest_stop(session: &ActiveSession) -> bool {
     !matches!(session.native_outcome, NativeCaptureOutcome::Unused)
 }
 
-#[cfg(target_os = "macos")]
 fn sticky_native_stop_error(session: &ActiveSession) -> Option<(i32, String)> {
     match &session.native_outcome {
         NativeCaptureOutcome::PrepareFailed { message } => Some((
@@ -1056,7 +1110,6 @@ pub fn pause_recording_impl(state: &AppState) -> Result<SessionStateResult, Stri
             }
         }
     }
-    #[cfg(target_os = "macos")]
     if finalize_err.is_none() {
         if session.native_pause_unacked {
             // Native containers already finalized; retry only the journal ack.
@@ -1168,7 +1221,6 @@ pub fn resume_recording_impl(state: &AppState) -> Result<SessionStateResult, Str
             .write_data(&fmp4_data)
             .map_err(|e| format!("Failed writing screen segment on resume: {e}"))?;
     }
-    #[cfg(target_os = "macos")]
     if let Some(native) = session.native_session.as_ref() {
         native.set_paused(false);
         session.native_pause_unacked = false;
@@ -1231,22 +1283,16 @@ pub fn stop_recording_impl(state: &AppState) -> Result<StopRecordingResult, Stri
 
     let gross_duration_us = session.epoch.current_elapsed_us();
 
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(native) = session.native_session.take() {
-            match native.stop_with_result() {
-                Ok(()) => session.native_outcome = NativeCaptureOutcome::StopSucceeded,
-                Err((code, message)) => {
-                    session.native_outcome = NativeCaptureOutcome::StopFailed { code, message };
-                }
+    if let Some(native) = session.native_session.take() {
+        match native.stop_with_result() {
+            Ok(()) => session.native_outcome = NativeCaptureOutcome::StopSucceeded,
+            Err((code, message)) => {
+                session.native_outcome = NativeCaptureOutcome::StopFailed { code, message };
             }
         }
-        absorb_native_segment_writers(
-            &mut session,
-            crate::capture::macos::take_native_segment_writers(),
-        );
-        crate::capture::macos::clear_callback_targets();
     }
+    absorb_native_segment_writers(&mut session, backend::take_native_segment_writers());
+    backend::clear_callback_targets();
 
     // Close any in-flight pause
     if let Some(pause_start) = session.current_pause_start_us.take() {
@@ -1307,7 +1353,6 @@ pub fn stop_recording_impl(state: &AppState) -> Result<StopRecordingResult, Stri
         return Err(msg);
     }
 
-    #[cfg(target_os = "macos")]
     if let Some((code, msg)) = sticky_native_stop_error(&session) {
         record_lifecycle_error(state, "native", code, &msg, gross_duration_us);
         let _ = state.state_machine.transition_to(SessionState::Error);
@@ -1315,7 +1360,6 @@ pub fn stop_recording_impl(state: &AppState) -> Result<StopRecordingResult, Stri
         return Err(msg);
     }
 
-    #[cfg(target_os = "macos")]
     if native_requires_honest_stop(&session) {
         let records = match session.project_bundle.journal().read_all() {
             Ok(records) => records,
@@ -1564,7 +1608,6 @@ pub fn get_session_status_impl(state: &AppState) -> SessionStatusResult {
             0
         };
 
-    #[cfg(target_os = "macos")]
     let (
         dropped_frames,
         audio_buffer_underflows,
@@ -1605,23 +1648,6 @@ pub fn get_session_status_impl(state: &AppState) -> SessionStatusResult {
             )
         })
         .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, None, None, None, None, None, None));
-    #[cfg(not(target_os = "macos"))]
-    let (
-        dropped_frames,
-        audio_buffer_underflows,
-        native_gaps,
-        timestamp_records_dropped,
-        screen_samples,
-        camera_samples,
-        system_audio_samples,
-        mic_samples,
-        system_audio_peak_db,
-        mic_peak_db,
-        screen_last_sample_age_ms,
-        camera_last_sample_age_ms,
-        system_audio_last_sample_age_ms,
-        mic_last_sample_age_ms,
-    ) = (0, 0, 0, 0, 0, 0, 0, 0, None, None, None, None, None, None);
 
     let project_path = state
         .active_session
@@ -1792,6 +1818,7 @@ mod tests {
             video_bitrate_bps: None,
             capture_mouse: true,
             start_delay_ms: 0,
+            camera: Default::default(),
         };
 
         let json = serde_json::to_string(&opt).unwrap();
@@ -1804,6 +1831,7 @@ mod tests {
             video_bitrate_bps: None,
             capture_mouse: true,
             start_delay_ms: 0,
+            camera: Default::default(),
             ..opt.clone()
         };
         let json_no_gain = serde_json::to_string(&opt_no_gain).unwrap();
@@ -1843,6 +1871,7 @@ mod tests {
             video_bitrate_bps: None,
             capture_mouse: true,
             start_delay_ms: 0,
+            camera: Default::default(),
         };
 
         // First recording
@@ -1970,6 +1999,7 @@ mod tests {
                 video_bitrate_bps: None,
                 capture_mouse: true,
                 start_delay_ms: 0,
+                camera: Default::default(),
             },
         )
         .unwrap();
@@ -2000,6 +2030,7 @@ mod tests {
                 video_bitrate_bps: None,
                 capture_mouse: true,
                 start_delay_ms: 0,
+                camera: Default::default(),
             },
         );
         assert!(collision.unwrap_err().contains("already exists"));
@@ -2021,6 +2052,7 @@ mod tests {
                 video_bitrate_bps: None,
                 capture_mouse: true,
                 start_delay_ms: 0,
+                camera: Default::default(),
             },
         )
         .unwrap();
@@ -2046,6 +2078,7 @@ mod tests {
                 video_bitrate_bps: None,
                 capture_mouse: true,
                 start_delay_ms: 0,
+                camera: Default::default(),
             },
         )
         .unwrap();
@@ -2069,6 +2102,7 @@ mod tests {
                 video_bitrate_bps: None,
                 capture_mouse: true,
                 start_delay_ms: 0,
+                camera: Default::default(),
             },
         );
         assert!(relative.unwrap_err().contains("absolute"));
@@ -2106,6 +2140,7 @@ mod tests {
                 video_bitrate_bps: None,
                 capture_mouse: true,
                 start_delay_ms: 0,
+                camera: Default::default(),
             },
         )
         .unwrap();
@@ -2158,6 +2193,7 @@ mod tests {
                 video_bitrate_bps: None,
                 capture_mouse: true,
                 start_delay_ms: 0,
+                camera: Default::default(),
             },
         );
         assert!(result.unwrap_err().contains("at least one media source"));

@@ -1,10 +1,8 @@
-import React from "react";
-import { Video } from "lucide-react";
-import { MouseTelemetryControl } from "../recording-hud/MouseTelemetryControl";
+import React, { useCallback, useState } from "react";
+import { ChevronRight, Settings } from "lucide-react";
 import { DeviceControlDeck } from "../recording-hud/DeviceControlDeck";
-import { ProjectDestinationBar } from "../recording-hud/ProjectDestinationBar";
-import { RecordingQualityControl } from "../recording-hud/RecordingQualityControl";
-import { CountdownControl } from "../recording-hud/CountdownControl";
+import { useDefaultProjectDir } from "../recording-hud/ProjectDestinationBar";
+import { RecordingSettingsDialog, useSettingsSummary } from "../recording-hud/RecordingSettingsDialog";
 import { CapturePreview } from "../canvas/CapturePreview";
 import { RecordingFloatingDock } from "../recording-hud/RecordingFloatingDock";
 import { CaptureHealthBar } from "../recording-hud/CaptureHealthBar";
@@ -28,14 +26,6 @@ interface RecordSceneProps {
   previewHidden?: boolean;
 }
 
-function SidebarSection({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section aria-label={title} className="space-y-2">
-      <h2 className="text-[10px] font-semibold uppercase tracking-[0.14em] text-studio-500">{title}</h2>
-      {children}
-    </section>
-  );
-}
 
 export const RecordScene: React.FC<RecordSceneProps> = ({
   sources,
@@ -60,6 +50,10 @@ export const RecordScene: React.FC<RecordSceneProps> = ({
     captureHealth,
     countdownEndsAt,
   } = recording;
+
+  useDefaultProjectDir();
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const closeSettings = useCallback(() => setSettingsOpen(false), []);
 
   const selectedSource = sources.find((s) => s.id === settings.selectedSourceId);
   const selectedCamera = cameras.find((c) => c.id === settings.selectedCameraId) ?? cameras[0];
@@ -102,6 +96,8 @@ export const RecordScene: React.FC<RecordSceneProps> = ({
     await startRecording();
   };
 
+  const settingsSummary = useSettingsSummary(cameraUsable);
+
   const previewEnabled =
     ((Boolean(selectedSource) && screenReady) ||
       (cameraSelected && permissions.camera === "authorized") ||
@@ -113,89 +109,80 @@ export const RecordScene: React.FC<RecordSceneProps> = ({
     <div className="record-layout flex-1 w-full h-full min-h-0 overflow-hidden">
       {/* Left: live preview. The native AppKit view mirrors this column and
           draws above web content, so nothing interactive may overlap it. */}
-      <section aria-label="Preview" className="flex min-h-0 min-w-0 flex-col bg-studio-950 px-4 pb-4 pt-3">
-        <header className="flex shrink-0 items-center justify-center gap-2.5 pb-3">
-          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-tr from-rose-600 to-indigo-600 text-white shadow-md shadow-rose-600/30">
-            <Video className="h-4 w-4" />
-          </div>
-          <span className="text-sm font-bold tracking-tight text-white">AeroShoot</span>
-          <span className="rounded-full border border-rose-500/30 bg-rose-500/15 px-2 py-0.5 font-mono text-[10px] font-medium text-rose-300">
-            Recorder
-          </span>
-        </header>
+      <section aria-label="Preview" className="flex min-h-0 min-w-0 flex-col gap-2 bg-studio-950 px-4 pb-4 pt-3">
+        <p className="shrink-0 truncate text-xs text-studio-400">
+          {selectedSource
+            ? `${selectedSource.name} · ${selectedSource.width}×${selectedSource.height}`
+            : "No screen — recording camera and audio only"}
+        </p>
         <div className="flex min-h-0 flex-1">
-        <CapturePreview
-          sourceId={selectedSource?.id ?? settings.availableSourceFallbackId ?? undefined}
-          captureScreen={Boolean(selectedSource)}
-          captureSystemAudio={settings.captureSystemAudio && screenReady}
-          cameraId={settings.cameraBubble.enabled && permissions.camera === "authorized" ? selectedCamera?.id : undefined}
-          micId={permissions.microphone === "authorized" ? settings.selectedMicId ?? undefined : undefined}
-          micGainDb={settings.micGainDb}
-          enabled={previewEnabled}
-          surfaceVisible={!previewHidden}
-        />
+          <CapturePreview
+            sourceId={selectedSource?.id ?? settings.availableSourceFallbackId ?? undefined}
+            captureScreen={Boolean(selectedSource)}
+            captureSystemAudio={settings.captureSystemAudio && screenReady}
+            cameraId={settings.cameraBubble.enabled && permissions.camera === "authorized" ? selectedCamera?.id : undefined}
+            micId={permissions.microphone === "authorized" ? settings.selectedMicId ?? undefined : undefined}
+            micGainDb={settings.micGainDb}
+            enabled={previewEnabled}
+            surfaceVisible={!previewHidden && !settingsOpen}
+          />
         </div>
       </section>
 
       {/* Right: options, with capture status and record controls pinned at the bottom. */}
       <aside aria-label="Recording options" className="record-sidebar flex min-h-0 min-w-0 flex-col bg-studio-900/70">
-        <div className="flex-1 min-h-0 space-y-5 overflow-y-auto px-4 py-4">
+        <div className="flex-1 min-h-0 space-y-3 overflow-y-auto px-4 py-4">
           {enumerationError && (
             <p role="alert" className="rounded-lg border border-rose-800/60 bg-rose-950/60 px-3 py-2 text-xs text-rose-200">
               {enumerationError}
             </p>
           )}
-          <SidebarSection title="Sources">
-            <DeviceControlDeck
-              sources={sources}
-              cameras={cameras}
-              mics={mics}
-              disabled={isRecording || isPaused}
-              permissions={permissions}
-              needsScreenPermission={needsScreenPermission}
-              onRequestScreenPermission={async () => {
-                if (permissions.screenRecording === "denied" || permissions.screenRecording === "restricted") {
-                  await api.openSystemPrivacySettings("ScreenCapture");
-                  return;
-                }
-                await refreshPermissions(true, { screen: true, camera: false, microphone: false });
-              }}
-              onRequestCameraPermission={async () => {
-                if (permissions.camera === "denied" || permissions.camera === "restricted") {
-                  await api.openSystemPrivacySettings("Camera");
-                  return;
-                }
-                if (permissions.camera !== "authorized") {
-                  await refreshPermissions(true, { screen: false, camera: true, microphone: false });
-                }
-              }}
-              onRequestMicrophonePermission={async () => {
-                if (permissions.microphone === "denied" || permissions.microphone === "restricted") {
-                  await api.openSystemPrivacySettings("Microphone");
-                  return;
-                }
-                if (permissions.microphone !== "authorized") {
-                  await refreshPermissions(true, { screen: false, camera: false, microphone: true });
-                }
-              }}
-            />
-          </SidebarSection>
-
-          <SidebarSection title="Quality">
-            <RecordingQualityControl disabled={isRecording || isPaused || isTransitioning} />
-          </SidebarSection>
-
-          <SidebarSection title="Save to">
-            <ProjectDestinationBar disabled={isRecording || isPaused || isTransitioning} />
-          </SidebarSection>
-
-          <SidebarSection title="Countdown">
-            <CountdownControl disabled={isRecording || isPaused || isTransitioning} />
-          </SidebarSection>
-
-          <SidebarSection title="Mouse tracking">
-            <MouseTelemetryControl disabled={isRecording || isPaused || isTransitioning} />
-          </SidebarSection>
+          <h2 className="text-sm font-medium text-white">What to record</h2>
+          <DeviceControlDeck
+            sources={sources}
+            cameras={cameras}
+            mics={mics}
+            disabled={isRecording || isPaused}
+            permissions={permissions}
+            needsScreenPermission={needsScreenPermission}
+            onRequestScreenPermission={async () => {
+              if (permissions.screenRecording === "denied" || permissions.screenRecording === "restricted") {
+                await api.openSystemPrivacySettings("ScreenCapture");
+                return;
+              }
+              await refreshPermissions(true, { screen: true, camera: false, microphone: false });
+            }}
+            onRequestCameraPermission={async () => {
+              if (permissions.camera === "denied" || permissions.camera === "restricted") {
+                await api.openSystemPrivacySettings("Camera");
+                return;
+              }
+              if (permissions.camera !== "authorized") {
+                await refreshPermissions(true, { screen: false, camera: true, microphone: false });
+              }
+            }}
+            onRequestMicrophonePermission={async () => {
+              if (permissions.microphone === "denied" || permissions.microphone === "restricted") {
+                await api.openSystemPrivacySettings("Microphone");
+                return;
+              }
+              if (permissions.microphone !== "authorized") {
+                await refreshPermissions(true, { screen: false, camera: false, microphone: true });
+              }
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => setSettingsOpen(true)}
+            disabled={isRecording || isPaused || isTransitioning}
+            title={isRecording || isPaused ? "Settings can't change during a recording" : undefined}
+            className="flex w-full items-center gap-3 rounded-lg border border-studio-700 bg-studio-850 px-3 py-2.5 text-left hover:bg-studio-800 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Settings aria-hidden="true" className="h-4 w-4 text-studio-300" />
+            <span className="text-[13px] font-medium text-white">Settings</span>
+            <span className="min-w-0 flex-1 truncate text-right text-xs text-studio-400">{settingsSummary}</span>
+            <ChevronRight aria-hidden="true" className="h-3.5 w-3.5 text-studio-500" />
+          </button>
         </div>
 
         <div className="shrink-0 space-y-2.5 border-t border-studio-800/80 bg-studio-900/95 px-4 py-3">
@@ -224,6 +211,13 @@ export const RecordScene: React.FC<RecordSceneProps> = ({
           />
         </div>
       </aside>
+
+      <RecordingSettingsDialog
+        open={settingsOpen}
+        onClose={closeSettings}
+        cameraOn={settings.cameraBubble.enabled}
+        disabled={isRecording || isPaused || isTransitioning}
+      />
     </div>
   );
 };

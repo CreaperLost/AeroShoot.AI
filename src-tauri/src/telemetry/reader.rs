@@ -303,7 +303,7 @@ fn geometry_from_v1(record: GeometryRecord) -> CanonicalGeometry {
 
 fn geometry_from_v2(record: MouseGeometry) -> CanonicalGeometry {
     let mut unsupported_reason = None;
-    if record.coordinate_space != "quartz_global" {
+    if !crate::telemetry::native::is_supported_coordinate_space(&record.coordinate_space) {
         unsupported_reason = Some(format!(
             "unsupported coordinate space {}",
             record.coordinate_space

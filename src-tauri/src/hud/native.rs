@@ -60,7 +60,11 @@ pub fn attach(ns_window: *mut c_void, generation: u64) -> Result<NonNull<c_void>
         NonNull::new(aeroshoot_preview_attach(ns_window, generation))
             .ok_or_else(|| "Failed to attach the native preview view".into())
     }
-    #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::capture::windows::preview_surface::attach(ns_window, generation)
+    }
+    #[cfg(not(any(all(target_os = "macos", not(stub_swift_ffi)), target_os = "windows")))]
     {
         let _ = (ns_window, generation);
         Err("Native preview is not implemented on this platform".into())
@@ -72,7 +76,9 @@ pub fn detach(handle: NonNull<c_void>) {
     unsafe {
         aeroshoot_preview_detach(handle.as_ptr());
     }
-    #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
+    #[cfg(target_os = "windows")]
+    crate::capture::windows::preview_surface::detach(handle);
+    #[cfg(not(any(all(target_os = "macos", not(stub_swift_ffi)), target_os = "windows")))]
     {
         let _ = handle;
     }
@@ -102,7 +108,12 @@ pub fn set_geometry(
             .unwrap_or([0.0, 0.0, viewport.width, viewport.height]);
         map_status(aeroshoot_preview_set_clip(handle.as_ptr(), x, y, w, h))
     }
-    #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = generation;
+        crate::capture::windows::preview_surface::set_geometry(handle, viewport)
+    }
+    #[cfg(not(any(all(target_os = "macos", not(stub_swift_ffi)), target_os = "windows")))]
     {
         let _ = (handle, viewport, generation);
         Ok(())
@@ -121,7 +132,13 @@ pub fn set_hit_mode(handle: NonNull<c_void>, mode: PreviewHitMode) -> Result<(),
     unsafe {
         map_status(aeroshoot_preview_set_hit_mode(handle.as_ptr(), value))
     }
-    #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = value;
+        crate::capture::windows::preview_surface::set_hit_mode(handle, mode);
+        Ok(())
+    }
+    #[cfg(not(any(all(target_os = "macos", not(stub_swift_ffi)), target_os = "windows")))]
     {
         let _ = (handle, value);
         Ok(())
@@ -145,7 +162,13 @@ pub fn present_fixed(
             generation,
         ))
     }
-    #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = generation;
+        crate::capture::windows::preview_surface::present_fixed(handle, r, g, b);
+        Ok(())
+    }
+    #[cfg(not(any(all(target_os = "macos", not(stub_swift_ffi)), target_os = "windows")))]
     {
         let _ = (handle, r, g, b, generation);
         Ok(())
@@ -181,7 +204,11 @@ pub fn stats_json(handle: NonNull<c_void>) -> Result<String, String> {
         aeroshoot_macos_free_string(pointer.as_ptr());
         Ok(value)
     }
-    #[cfg(not(all(target_os = "macos", not(stub_swift_ffi))))]
+    #[cfg(target_os = "windows")]
+    {
+        Ok(crate::capture::windows::preview_surface::stats_json(handle))
+    }
+    #[cfg(not(any(all(target_os = "macos", not(stub_swift_ffi)), target_os = "windows")))]
     {
         let _ = handle;
         Ok(r#"{"attached":false}"#.into())

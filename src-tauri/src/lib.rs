@@ -25,7 +25,14 @@ fn preview_ns_window(
             .ns_window()
             .map_err(|e| format!("Failed to get NSWindow: {e}"))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        window
+            .hwnd()
+            .map(|hwnd| hwnd.0 as *mut std::ffi::c_void)
+            .map_err(|e| format!("Failed to get the window handle: {e}"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = window;
         Err("Native preview is not implemented on this platform".into())
@@ -183,15 +190,11 @@ async fn request_capture_permissions(
 #[cfg(feature = "tauri-app")]
 #[tauri::command]
 fn mouse_telemetry_permission(request: bool) -> crate::telemetry::native::MouseTelemetryPermission {
-    #[cfg(target_os = "macos")]
-    {
-        crate::telemetry::native::MouseTelemetryPermission::macos(capture::macos::mouse_permission(
-            request,
-        ))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = request;
+    if capture::backend::MOUSE_TELEMETRY {
+        crate::telemetry::native::MouseTelemetryPermission::macos(
+            capture::backend::mouse_permission(request),
+        )
+    } else {
         crate::telemetry::native::MouseTelemetryPermission::unsupported()
     }
 }

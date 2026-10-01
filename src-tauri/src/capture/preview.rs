@@ -23,6 +23,8 @@ pub fn stop() {
     unsafe {
         aeroshoot_live_preview_stop();
     }
+    #[cfg(target_os = "windows")]
+    crate::capture::windows::preview::stop();
 }
 
 pub fn start(
@@ -61,7 +63,18 @@ pub fn start(
         }
         Ok(())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::capture::windows::preview::start(
+            source,
+            capture_screen,
+            capture_system_audio,
+            camera,
+            mic,
+            mic_gain_db.clamp(-24.0, 24.0),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (
             source,
@@ -95,7 +108,15 @@ pub fn audio_levels() -> PreviewAudioLevels {
         aeroshoot_macos_free_string(pointer);
         serde_json::from_str(&json).unwrap_or_default()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let (system_audio_peak_db, mic_peak_db) = crate::capture::windows::preview::audio_levels();
+        PreviewAudioLevels {
+            system_audio_peak_db,
+            mic_peak_db,
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     PreviewAudioLevels::default()
 }
 

@@ -1,4 +1,3 @@
-#[cfg(target_os = "macos")]
 use aeroshoot_lib::commands::NativeCaptureOutcome;
 use aeroshoot_lib::commands::{
     get_session_status_impl, pause_recording_impl, resume_recording_impl, start_recording_impl,
@@ -30,6 +29,7 @@ fn start_opts(camera: bool) -> StartRecordingOptions {
         video_bitrate_bps: None,
         capture_mouse: true,
         start_delay_ms: 0,
+        camera: Default::default(),
     }
 }
 
@@ -456,7 +456,6 @@ fn failed_stop_retains_session_and_start_refuses_competing_owner() {
     );
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn native_stop_failure_is_retained_on_retry() {
     let dir = tempdir().unwrap();
@@ -488,7 +487,6 @@ fn native_stop_failure_is_retained_on_retry() {
     assert!(state.last_stop_result.read().is_none());
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn native_missing_screen_media_is_retained_on_retry() {
     let dir = tempdir().unwrap();
@@ -522,7 +520,6 @@ fn native_missing_screen_media_is_retained_on_retry() {
     assert!(state.last_stop_result.read().is_none());
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn native_prepare_failure_stop_does_not_complete() {
     let dir = tempdir().unwrap();

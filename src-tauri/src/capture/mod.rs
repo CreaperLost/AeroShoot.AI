@@ -1,11 +1,17 @@
+pub mod backend;
 pub mod preview;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod segments;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +45,19 @@ pub struct CameraDevice {
     pub id: String,
     pub name: String,
     pub is_default: bool,
+    /// Native capture modes, when the platform can list them. Empty means
+    /// unknown: the UI then offers every setting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<CameraFormat>,
+}
+
+/// One native camera mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraFormat {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -182,7 +201,7 @@ pub fn compute_source_geometry(
 /// bars top/bottom (width is the limiting axis, height shrinks).
 /// A portrait source (e.g. 9:16) on a 16:9 dest gets **pillarbox**
 /// bars left/right (height is the limiting axis, width shrinks).
-fn fit_letterbox(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> SourceRect {
+pub(crate) fn fit_letterbox(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> SourceRect {
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return SourceRect::from_dimensions(dst_w, dst_h);
     }
@@ -218,6 +237,73 @@ fn fit_crop(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> SourceRect {
     // rect is conceptually the entire source — ScreenCaptureKit's own
     // cropping (set later) handles the actual trim.
     SourceRect::from_dimensions(dst_w, dst_h)
+}
+
+/// Recording request handed to the platform recorder. Serialized as JSON
+/// for the macOS Swift bridge, so field names are part of that contract.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeRecordingConfig<'a> {
+    pub source_id: &'a str,
+    pub capture_screen: bool,
+    pub camera_id: Option<&'a str>,
+    pub mic_id: Option<&'a str>,
+    pub capture_system_audio: bool,
+    pub fps: u32,
+    pub width: u32,
+    pub height: u32,
+    pub source_rect: SourceRect,
+    pub destination_rect: SourceRect,
+    pub preserves_aspect_ratio: bool,
+    pub project_path: &'a Path,
+    pub session_offset_us: u64,
+    /// Microphone gain in decibels applied to the captured mic samples
+    /// before they are written to the WAV segment. `0.0` means unity.
+    /// Clamped on the Swift side to a sane window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mic_gain_db: Option<f32>,
+    /// Average bitrate for the screen track; `None` uses the automatic rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_bitrate_bps: Option<u32>,
+    /// Start the pointer hook and telemetry log (screen recordings only).
+    pub capture_mouse: bool,
+    /// Hide the OS cursor from screen capture; the editor redraws it from telemetry.
+    pub hide_cursor: bool,
+    /// Countdown before recording begins; every source warms up during it.
+    pub start_delay_ms: u32,
+    /// Camera track format, sent only to recorders that honour it
+    /// (`backend::CAMERA_FORMATS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_fps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_bitrate_bps: Option<u32>,
+}
+
+/// Live counters reported by the platform recorder.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct NativeCaptureStats {
+    /// Microseconds since native recording began; `None` during the countdown.
+    pub recording_started_ago_us: Option<u64>,
+    pub dropped_frames: u64,
+    pub audio_buffer_underflows: u64,
+    pub timestamp_records_dropped: u64,
+    pub gaps_total: u64,
+    pub last_error: Option<String>,
+    pub screen_samples: u64,
+    pub camera_samples: u64,
+    pub system_audio_samples: u64,
+    pub mic_samples: u64,
+    pub system_audio_peak_db: Option<f64>,
+    pub mic_peak_db: Option<f64>,
+    pub screen_last_sample_age_ms: Option<u64>,
+    pub camera_last_sample_age_ms: Option<u64>,
+    pub system_audio_last_sample_age_ms: Option<u64>,
+    pub mic_last_sample_age_ms: Option<u64>,
 }
 
 #[derive(Error, Debug)]
@@ -334,18 +420,7 @@ impl Drop for NativeCaptureSessionHandle {
 
 /// Checks current OS-level capture permissions.
 pub fn check_system_permissions() -> PermissionStatus {
-    #[cfg(target_os = "macos")]
-    {
-        macos::permissions()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        PermissionStatus {
-            screen_recording: PermissionState::Authorized,
-            camera: PermissionState::Authorized,
-            microphone: PermissionState::Authorized,
-        }
-    }
+    backend::permissions()
 }
 
 /// Synthetic mock capturer for testing recording pipelines without hardware dependencies

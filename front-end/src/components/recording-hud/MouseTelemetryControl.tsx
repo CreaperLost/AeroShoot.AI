@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../../lib/ipc";
 import type { MouseTelemetryPermission } from "../../lib/types";
 import { useSettingsStore } from "../../stores/settingsStore";
+import { SettingRow, Switch } from "../ui/controls";
 
 export function MouseTelemetryControl({ disabled }: { disabled: boolean }) {
   const { captureMouse, setCaptureMouse } = useSettingsStore();
@@ -49,12 +50,12 @@ export function MouseTelemetryControl({ disabled }: { disabled: boolean }) {
 
   const supported = status?.supported ?? true;
   const needsPermission = captureMouse && supported && status !== undefined && !status.authorized;
-  const message = !supported
+  const description = !supported
     ? "Mouse tracking isn't available on this platform."
     : !captureMouse
-      ? "Pointer moves and clicks won't be logged."
+      ? "The cursor stays in the video as recorded."
       : status?.authorized
-        ? "Pointer moves and clicks are logged for editing."
+        ? "Records the pointer separately so the editor can redraw it smoothly."
         : !status
           ? "Checking Input Monitoring permission…"
           : requested
@@ -62,35 +63,26 @@ export function MouseTelemetryControl({ disabled }: { disabled: boolean }) {
             : "Needs Input Monitoring permission. Recording still works without it.";
 
   return (
-    <div className="flex min-w-0 flex-col gap-2 text-xs text-studio-300" aria-live="polite">
-      <div
-        role="radiogroup"
-        aria-label="Mouse tracking"
-        className="grid grid-cols-2 gap-0.5 rounded-lg border border-studio-800 bg-studio-950/60 p-0.5"
+    <div aria-live="polite">
+      <SettingRow
+        title="Track mouse for editing"
+        description={
+          <span className={needsPermission || error ? "text-amber-300" : undefined}>{error ?? description}</span>
+        }
       >
-        {[true, false].map((value) => (
-          <button
-            key={String(value)}
-            type="button"
-            role="radio"
-            aria-checked={captureMouse === value}
-            disabled={disabled || !supported}
-            onClick={() => setCaptureMouse(value)}
-            className={`rounded-md px-1 py-1 font-mono text-[11px] transition-colors disabled:opacity-50 ${
-              captureMouse === value ? "bg-studio-800 text-white shadow-sm" : "text-studio-400 hover:text-studio-200"
-            }`}
-          >
-            {value ? "On" : "Off"}
-          </button>
-        ))}
-      </div>
-      <p className={`leading-snug ${needsPermission || error ? "text-amber-300" : "text-studio-400"}`}>{error ?? message}</p>
+        <Switch
+          label="Track mouse for editing"
+          checked={captureMouse && supported}
+          onChange={setCaptureMouse}
+          disabled={disabled || !supported}
+        />
+      </SettingRow>
       {needsPermission && (
         <button
           type="button"
           disabled={disabled || busy}
           onClick={() => void allow()}
-          className="self-start rounded-lg border border-amber-700/50 bg-amber-900/30 px-2.5 py-1 font-medium text-amber-200 hover:bg-amber-900/50 disabled:opacity-50"
+          className="mb-1 rounded-lg border border-amber-700/50 bg-amber-900/30 px-2.5 py-1 text-xs font-medium text-amber-200 hover:bg-amber-900/50 disabled:opacity-50"
         >
           {busy ? "Requesting…" : "Allow Input Monitoring"}
         </button>

@@ -76,21 +76,16 @@ impl ProjectLock {
             }
         };
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if ret != 0 {
-                // OS lock acquisition failed: another process holds the lock
-                let mut content = String::new();
-                let _ = file.read_to_string(&mut content);
-                let existing_pid = content.trim().parse::<u32>().unwrap_or(0);
+        if !try_lock_exclusive(&file) {
+            // OS lock acquisition failed: another process holds the lock
+            let mut content = String::new();
+            let _ = file.read_to_string(&mut content);
+            let existing_pid = content.trim().parse::<u32>().unwrap_or(0);
 
-                let mut locked_set = LOCKED_PROJECTS.lock();
-                locked_set.remove(&canonical_dir);
+            let mut locked_set = LOCKED_PROJECTS.lock();
+            locked_set.remove(&canonical_dir);
 
-                return Err(LockError::AlreadyLocked { pid: existing_pid });
-            }
+            return Err(LockError::AlreadyLocked { pid: existing_pid });
         }
 
         // Lock acquired: write current process PID
@@ -108,6 +103,47 @@ impl ProjectLock {
             _directory_lease: directory_lease,
         })
     }
+}
+
+/// Non-blocking exclusive OS lock on the open lock file, released when the
+/// handle closes.
+#[cfg(unix)]
+fn try_lock_exclusive(file: &File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Non-blocking exclusive OS lock on the open lock file, released when the
+/// handle closes. Locks one byte far past the end of the file, so the PID
+/// written below stays readable to the process that is refused.
+#[cfg(windows)]
+fn try_lock_exclusive(file: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = OVERLAPPED::default();
+    overlapped.Anonymous.Anonymous.Offset = u32::MAX;
+    overlapped.Anonymous.Anonymous.OffsetHigh = u32::MAX >> 1;
+    unsafe {
+        LockFileEx(
+            HANDLE(file.as_raw_handle()),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            None,
+            1,
+            0,
+            &mut overlapped,
+        )
+    }
+    .is_ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn try_lock_exclusive(_file: &File) -> bool {
+    true
 }
 
 impl Drop for ProjectLock {
@@ -149,5 +185,24 @@ mod tests {
         let lock3 = ProjectLock::acquire(dir.path()).unwrap();
         assert!(dir.path().join(".lock").exists());
         drop(lock3);
+    }
+
+    #[test]
+    fn os_lock_excludes_other_handles_and_exposes_owner_pid() {
+        // A second handle stands in for another process: the OS lock is
+        // per open file, not per process.
+        let dir = tempdir().unwrap();
+        let lock = ProjectLock::acquire(dir.path()).unwrap();
+        let mut other = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(".lock"))
+            .unwrap();
+        assert!(!try_lock_exclusive(&other));
+        let mut content = String::new();
+        other.read_to_string(&mut content).unwrap();
+        assert_eq!(content.trim(), std::process::id().to_string());
+        drop(other);
+        drop(lock);
     }
 }

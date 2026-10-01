@@ -9,7 +9,6 @@ build/
 # Rust / Cargo
 target/
 **/*.rs.bk
-Cargo.lock
 
 # Tauri
 src-tauri/target/
@@ -22,3 +21,17 @@ output/
 # MiniMax Code runtime data (skills, agents, sessions, logs).
 # Reproduce locally with the commands documented in README.md.
 .minimax/
+
+# Codex launcher state (PIDs of processes started by script/codex.*).
+.codex/run/
+
+# Tauri regenerates these on every build.
+src-tauri/gen/schemas/
+
+# Local working notes and AI-agent tooling, kept out of the repo.
+/ACTIVE_RECORDING_WORK.md
+/AEROSHOOT_MASTER_PLAN.md
+/RECORDING_DIAGNOSIS.md
+/REVIEW_WORKING_TREE.md
+/skills-lock.json
+/.claude/

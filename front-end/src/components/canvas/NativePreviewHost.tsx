@@ -1,8 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../../lib/ipc";
-import { PreviewStatus } from "../../lib/types";
 
 const WINDOW_LABEL = "main";
+
+// The native surface is one per window. React StrictMode (development) mounts
+// hosts twice; only the newest mount may detach it, or a stale mount's late
+// attach reply would detach the surface its successor just attached.
+let latestMount = 0;
 
 interface NativePreviewHostProps {
   showStatus?: boolean;
@@ -17,7 +21,6 @@ interface NativePreviewHostProps {
 export function NativePreviewHost({ showStatus = true, surfaceVisible = true }: NativePreviewHostProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const surfaceVisibleRef = useRef(surfaceVisible);
-  const [status, setStatus] = useState<PreviewStatus | null>(null);
   const [error, setError] = useState<string>();
 
   // Visibility is layout state, not ownership state. Keep the native child
@@ -30,6 +33,7 @@ export function NativePreviewHost({ showStatus = true, surfaceVisible = true }: 
   }, [surfaceVisible]);
 
   useEffect(() => {
+    const mount = ++latestMount;
     let cancelled = false;
     let revision = 0;
     let generation: number | undefined;
@@ -73,7 +77,7 @@ export function NativePreviewHost({ showStatus = true, surfaceVisible = true }: 
       if (key === lastGeometry) return;
       sending = true;
       void api.studioPreviewLayout({ ...viewport, revision: ++revision })
-        .then(next => { if (!cancelled) { lastGeometry = key; setStatus(next); setError(undefined); } })
+        .then(() => { if (!cancelled) { lastGeometry = key; setError(undefined); } })
         .catch(err => { if (!cancelled) setError(String(err)); })
         .finally(() => {
           sending = false;
@@ -95,10 +99,10 @@ export function NativePreviewHost({ showStatus = true, surfaceVisible = true }: 
     void api.studioPreviewAttach(WINDOW_LABEL, "consume").then(() => api.studioPreviewStatus()).then(attached => {
       generation = attached.generation;
       if (cancelled) {
-        void api.studioPreviewDetach().catch(() => undefined);
+        if (mount === latestMount) void api.studioPreviewDetach().catch(() => undefined);
         return;
       }
-      setStatus(attached); setError(undefined);
+      setError(undefined);
       schedule();
     }).catch(err => { if (!cancelled) setError(String(err)); });
     return () => {
@@ -110,7 +114,7 @@ export function NativePreviewHost({ showStatus = true, surfaceVisible = true }: 
       document.removeEventListener("visibilitychange", schedule);
       window.clearInterval(fallback);
       scheduleLayoutRef.current = () => undefined;
-      if (generation !== undefined) {
+      if (generation !== undefined && mount === latestMount) {
         void api.studioPreviewDetach().catch(() => undefined);
       }
     };
@@ -128,9 +132,11 @@ export function NativePreviewHost({ showStatus = true, surfaceVisible = true }: 
           className="pointer-events-none preview-fit rounded-xl border border-studio-800 bg-black/50"
         />
       </div>
-      {showStatus && <p className="text-xs text-studio-400 max-w-md text-center shrink-0">
-        {error ? error : status?.attached ? "Live screen and selected webcam" : "Native preview surface is not attached."}
-      </p>}
+      {showStatus && error && (
+        <p role="alert" className="text-xs text-rose-300 max-w-md text-center shrink-0">
+          {error}
+        </p>
+      )}
     </div>
   );
 }

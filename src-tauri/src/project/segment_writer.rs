@@ -243,7 +243,9 @@ impl TrackSegmentWriter {
         let end_us = start_us
             .checked_add(info.duration_us)
             .ok_or_else(|| invalid("Native segment time overflow".into()))?;
-        File::open(temp_path)?.sync_all()?;
+        // Windows `FlushFileBuffers` requires write access; a read-only
+        // handle fails with ERROR_ACCESS_DENIED.
+        OpenOptions::new().write(true).open(temp_path)?.sync_all()?;
         let destination = self.project_dir.join(&relative_path);
         publish_no_overwrite(temp_path, &destination)?;
         let pending = PendingPublication {

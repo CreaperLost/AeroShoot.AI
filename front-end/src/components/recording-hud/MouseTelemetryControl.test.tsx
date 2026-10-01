@@ -28,7 +28,7 @@ describe("MouseTelemetryControl", () => {
   it("reports logging once permission is granted", async () => {
     ipc.mouseTelemetryPermission.mockResolvedValue({ supported: true, authorized: true });
     render(<MouseTelemetryControl disabled={false} />);
-    expect(await screen.findByText("Pointer moves and clicks are logged for editing.")).toBeTruthy();
+    expect(await screen.findByText("Records the pointer separately so the editor can redraw it smoothly.")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Allow Input Monitoring" })).toBeNull();
   });
 
@@ -36,10 +36,13 @@ describe("MouseTelemetryControl", () => {
     ipc.mouseTelemetryPermission.mockResolvedValue({ supported: true, authorized: false });
     render(<MouseTelemetryControl disabled={false} />);
     await screen.findByRole("button", { name: "Allow Input Monitoring" });
-    fireEvent.click(screen.getByRole("radio", { name: "Off" }));
+    const toggle = screen.getByRole("switch", { name: "Track mouse for editing" });
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(toggle);
     expect(useSettingsStore.getState().captureMouse).toBe(false);
     expect(localStorage.getItem("aeroshoot.captureMouse")).toBe("false");
-    expect(screen.getByText("Pointer moves and clicks won't be logged.")).toBeTruthy();
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByText("The cursor stays in the video as recorded.")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Allow Input Monitoring" })).toBeNull();
   });
 });

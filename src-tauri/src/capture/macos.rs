@@ -1,19 +1,15 @@
-use super::{
-    AudioDevice, CameraDevice, CaptureSource, PermissionState, PermissionStatus, SourceRect,
-};
-use crate::project::manifest::TrackType;
-use crate::project::segment_writer::TrackSegmentWriter;
-use crate::session::SessionEvent;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use super::backend::NativeCaptureSession;
+use super::segments;
+use super::{AudioDevice, CameraDevice, CaptureSource, PermissionState, PermissionStatus};
+pub use super::{NativeCaptureStats, NativeRecordingConfig};
+use serde::Deserialize;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::Arc;
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Condvar, OnceLock};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -449,13 +445,10 @@ unsafe extern "C" fn mouse_sink(json: *const c_char) -> c_int {
                         // mouse-tracking control before recording, so only mid-session
                         // failures are surfaced as runtime errors. The gap stays in the log.
                         if matches!(reason, "input_monitoring_revoked" | "event_tap_unavailable" | "unsupported_source_geometry") {
-                            if let Some(target) = RUNTIME_ERROR_TARGET.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
-                                target.diagnostics.apply(&SessionEvent::RuntimeError {
-                                    track_id: "telemetry".into(), error_code: 700,
-                                    message: format!("Mouse telemetry unavailable ({reason}); recording continues with the baked cursor."),
-                                    t_us: target.epoch.current_elapsed_us(), recoverable: true,
-                                });
-                            }
+                            segments::report_recoverable_error(
+                                "telemetry", 700,
+                                format!("Mouse telemetry unavailable ({reason}); recording continues with the baked cursor."),
+                            );
                         }
                     }
                 }
@@ -470,92 +463,18 @@ unsafe extern "C" fn mouse_sink(json: *const c_char) -> c_int {
     })
 }
 
-static RUNTIME_ERROR_TARGET: Mutex<Option<RuntimeErrorTarget>> = Mutex::new(None);
-static SEGMENT_TARGET: Mutex<Option<SegmentTarget>> = Mutex::new(None);
-
 /// Cheap test-friendly counter: the last error_code we saw on the
 /// runtime-error callback path. Used by `test_ffi_runtime_error_callback`
 /// below to assert the FFI was actually invoked.
 pub static LAST_RUNTIME_ERROR_CODE: AtomicI32 = AtomicI32::new(0);
 
-#[derive(Clone)]
-struct RuntimeErrorTarget {
-    diagnostics: std::sync::Arc<crate::session::SessionDiagnostics>,
-    state_machine: std::sync::Arc<crate::session::SessionStateMachine>,
-    epoch: crate::session::SessionEpoch,
-}
-
-#[derive(Clone)]
-struct SegmentTarget {
-    diagnostics: std::sync::Arc<crate::session::SessionDiagnostics>,
-    epoch: crate::session::SessionEpoch,
-    journal: Option<std::sync::Arc<crate::project::journal::ProjectJournal>>,
-    project_root: Option<std::path::PathBuf>,
-    /// Long-lived per-track writers so a journal failure after publish can
-    /// be retried. A throwaway writer would drop `pending_publication`.
-    writers: Arc<Mutex<HashMap<String, TrackSegmentWriter>>>,
-    closed: Arc<AtomicBool>,
-}
-
-/// Install the global callback targets for the duration of a session.
-/// Called from `MacCaptureSession::start` (or the public start impl in
-/// `commands/mod.rs`) before the first segment is committed.
-pub(crate) fn install_callback_targets(
-    diagnostics: std::sync::Arc<crate::session::SessionDiagnostics>,
-    state_machine: std::sync::Arc<crate::session::SessionStateMachine>,
-    epoch: crate::session::SessionEpoch,
-    journal: Option<std::sync::Arc<crate::project::journal::ProjectJournal>>,
-    project_root: Option<std::path::PathBuf>,
-) {
-    *RUNTIME_ERROR_TARGET.lock().unwrap_or_else(PoisonError::into_inner) = Some(RuntimeErrorTarget {
-        diagnostics: diagnostics.clone(),
-        state_machine: state_machine.clone(),
-        epoch: epoch.clone(),
-    });
-    *SEGMENT_TARGET.lock().unwrap_or_else(PoisonError::into_inner) = Some(SegmentTarget {
-        diagnostics,
-        epoch,
-        journal,
-        project_root,
-        writers: Arc::new(Mutex::new(HashMap::new())),
-        closed: Arc::new(AtomicBool::new(false)),
-    });
-}
-
-/// Move the session clock used by native callbacks once recording has begun.
-pub(crate) fn set_callback_epoch(epoch: crate::session::SessionEpoch) {
-    if let Some(target) = RUNTIME_ERROR_TARGET
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .as_mut()
-    {
-        target.epoch = epoch.clone();
-    }
-    if let Some(target) = SEGMENT_TARGET
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .as_mut()
-    {
-        target.epoch = epoch;
-    }
-}
-
-/// Drain native publication writers before clearing callback targets.
-/// Sets `closed` first so a racing callback cannot recreate a throwaway writer.
-pub(crate) fn take_native_segment_writers() -> Vec<TrackSegmentWriter> {
-    let guard = SEGMENT_TARGET.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(target) = guard.as_ref() else {
-        return Vec::new();
-    };
-    target.closed.store(true, Ordering::SeqCst);
-    let mut writers = target.writers.lock().unwrap_or_else(PoisonError::into_inner);
-    writers.drain().map(|(_, writer)| writer).collect()
-}
+pub(crate) use segments::{
+    install_callback_targets, set_callback_epoch, take_native_segment_writers,
+};
 
 /// Clear the global callback targets. Safe to call from any thread.
 pub(crate) fn clear_callback_targets() {
-    *RUNTIME_ERROR_TARGET.lock().unwrap_or_else(PoisonError::into_inner) = None;
-    *SEGMENT_TARGET.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    segments::clear_callback_targets();
     *MOUSE_LOGGER.lock().unwrap_or_else(PoisonError::into_inner) = None;
     unsafe {
         aeroshoot_macos_register_mouse_sink(None);
@@ -584,61 +503,16 @@ unsafe extern "C" fn c_segment_callback(
         }
         let id = CStr::from_ptr(track_id).to_string_lossy();
         let path = CStr::from_ptr(file_path).to_string_lossy();
-        let target = SEGMENT_TARGET.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        let Some(target) = target else {
-            return -600;
-        };
-        if target.closed.load(Ordering::SeqCst) {
-            return -600;
-        }
-        let (Some(journal), Some(root)) = (&target.journal, &target.project_root) else {
-            return -600;
-        };
-        let kind = match id.as_ref() {
-            "screen" => TrackType::Screen,
-            "webcam" => TrackType::Webcam,
-            "system" => TrackType::SystemAudio,
-            "mic" => TrackType::MicAudio,
-            _ => return -600,
-        };
-        let mut writers = target.writers.lock().unwrap_or_else(PoisonError::into_inner);
-        if target.closed.load(Ordering::SeqCst) {
-            return -600;
-        }
-        let writer = writers
-            .entry(id.to_string())
-            .or_insert_with(|| TrackSegmentWriter::new(root, id.to_string(), kind, String::new()));
-        match writer.commit_native_segment(
-            Path::new(path.as_ref()),
+        match segments::publish_segment(
+            &id,
             segment_index as u32,
             host_anchor_us,
             timescale as u32,
             media_start_value,
-            target.epoch.current_elapsed_us(),
-            journal,
+            Path::new(path.as_ref()),
         ) {
-            Ok(_) => {
-                drop(writers);
-                target.diagnostics.apply(&SessionEvent::SegmentRotated {
-                    track_id: id.to_string(),
-                    segment_index: segment_index as u32,
-                    host_anchor_us,
-                    media_timescale: timescale as u32,
-                    media_start_value,
-                });
-                0
-            }
-            Err(error) => {
-                drop(writers);
-                target.diagnostics.apply(&SessionEvent::RuntimeError {
-                    track_id: id.to_string(),
-                    error_code: -600,
-                    message: error.to_string(),
-                    t_us: target.epoch.current_elapsed_us(),
-                    recoverable: true,
-                });
-                -600
-            }
+            Ok(()) => 0,
+            Err(()) => -600,
         }
     })
     .unwrap_or_else(|panic| {
@@ -666,30 +540,10 @@ unsafe extern "C" fn c_runtime_error_callback(
     // Record the raw code for tests that want to assert the FFI fired.
     LAST_RUNTIME_ERROR_CODE.store(error_code, Ordering::SeqCst);
 
-    let target = RUNTIME_ERROR_TARGET.lock().unwrap_or_else(PoisonError::into_inner).clone();
-    if let Some(target) = target {
-        let event = SessionEvent::RuntimeError {
-            track_id: track_id_str,
-            error_code,
-            message: message_str,
-            t_us: target.epoch.current_elapsed_us(),
-            // Native runtime errors are recoverable by default; the
-            // Swift side escalates non-recoverable ones via a reserved
-            // error code (e.g. -1 sentinel). We don't introspect that
-            // here because the contract says recoverable=true unless
-            // the encoder also reported Failed in the stop result.
-            recoverable: error_code >= 0,
-        };
-        if let Some(record) = target.diagnostics.apply(&event) {
-            // If the error is non-recoverable, transition the state
-            // machine to Error so subsequent stops are correctly typed.
-            if !record.recoverable {
-                let _ = target
-                    .state_machine
-                    .transition_to(crate::session::SessionState::Error);
-            }
-        }
-    }
+    // Native runtime errors are recoverable by default; the Swift side
+    // escalates non-recoverable ones with a negative code, which moves the
+    // state machine to Error so subsequent stops are correctly typed.
+    segments::report_runtime_error(track_id_str, error_code, message_str);
 }
 
 /// Public C-callable function pointer for the segment callback.
@@ -714,60 +568,6 @@ pub fn decode_encoder_result(result: AeroShootEncoderResult) -> Result<(), (i32,
         cstr.to_string_lossy().into_owned()
     };
     Err((result.error_code, message))
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeRecordingConfig<'a> {
-    pub source_id: &'a str,
-    pub capture_screen: bool,
-    pub camera_id: Option<&'a str>,
-    pub mic_id: Option<&'a str>,
-    pub capture_system_audio: bool,
-    pub fps: u32,
-    pub width: u32,
-    pub height: u32,
-    pub source_rect: SourceRect,
-    pub destination_rect: SourceRect,
-    pub preserves_aspect_ratio: bool,
-    pub project_path: &'a Path,
-    pub session_offset_us: u64,
-    /// Microphone gain in decibels applied to the captured mic samples
-    /// before they are written to the WAV segment. `0.0` means unity.
-    /// Clamped on the Swift side to a sane window.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mic_gain_db: Option<f32>,
-    /// Average bitrate for the screen track; `None` uses the automatic rate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub video_bitrate_bps: Option<u32>,
-    /// Start the pointer hook and telemetry log (screen recordings only).
-    pub capture_mouse: bool,
-    /// Hide the OS cursor from screen capture; the editor redraws it from telemetry.
-    pub hide_cursor: bool,
-    /// Countdown before recording begins; every source warms up during it.
-    pub start_delay_ms: u32,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct NativeCaptureStats {
-    /// Microseconds since native recording began; `None` during the countdown.
-    pub recording_started_ago_us: Option<u64>,
-    pub dropped_frames: u64,
-    pub audio_buffer_underflows: u64,
-    pub timestamp_records_dropped: u64,
-    pub gaps_total: u64,
-    pub last_error: Option<String>,
-    pub screen_samples: u64,
-    pub camera_samples: u64,
-    pub system_audio_samples: u64,
-    pub mic_samples: u64,
-    pub system_audio_peak_db: Option<f64>,
-    pub mic_peak_db: Option<f64>,
-    pub screen_last_sample_age_ms: Option<u64>,
-    pub camera_last_sample_age_ms: Option<u64>,
-    pub system_audio_last_sample_age_ms: Option<u64>,
-    pub mic_last_sample_age_ms: Option<u64>,
 }
 
 pub struct MacCaptureSession {
@@ -870,54 +670,6 @@ impl MacCaptureSession {
             .unwrap_or_default()
     }
 
-    /// Wait until every selected source that is expected to produce continuous
-    /// samples has delivered at least one callback. System audio is excluded:
-    /// ScreenCaptureKit legitimately emits no audio buffers while the system is
-    /// silent, and a successful `startCapture` completion is its readiness
-    /// signal. This prevents the app from advertising Recording while a stale
-    /// display, busy camera, or unavailable microphone is producing nothing.
-    pub fn wait_until_ready(
-        &self,
-        capture_screen: bool,
-        camera_enabled: bool,
-        mic_enabled: bool,
-        timeout: std::time::Duration,
-    ) -> Result<(), String> {
-        if !capture_screen && !camera_enabled && !mic_enabled {
-            return Ok(());
-        }
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let stats = self.stats();
-            if let Some(error) = stats.last_error.filter(|error| !error.is_empty()) {
-                return Err(format!("native capture failed during startup: {error}"));
-            }
-            let screen_ready = !capture_screen || stats.screen_samples > 0;
-            let camera_ready = !camera_enabled || stats.camera_samples > 0;
-            let mic_ready = !mic_enabled || stats.mic_samples > 0;
-            if screen_ready && camera_ready && mic_ready {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                let mut pending = Vec::new();
-                if !screen_ready {
-                    pending.push("screen");
-                }
-                if !camera_ready {
-                    pending.push("webcam");
-                }
-                if !mic_ready {
-                    pending.push("microphone");
-                }
-                return Err(format!(
-                    "Timed out waiting for first native sample from {}",
-                    pending.join(", ")
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-    }
-
     pub fn stop(mut self) {
         if let Some(handle) = self.handle.take() {
             unsafe {
@@ -959,6 +711,24 @@ impl MacCaptureSession {
     }
 }
 
+impl NativeCaptureSession for MacCaptureSession {
+    fn start(config: NativeRecordingConfig<'_>) -> Result<Self, String> {
+        MacCaptureSession::start(config)
+    }
+    fn set_paused(&self, paused: bool) {
+        MacCaptureSession::set_paused(self, paused)
+    }
+    fn pause_and_finalize(&self) -> Result<(), (i32, String)> {
+        MacCaptureSession::pause_and_finalize(self)
+    }
+    fn stats(&self) -> NativeCaptureStats {
+        MacCaptureSession::stats(self)
+    }
+    fn stop_with_result(self) -> Result<(), (i32, String)> {
+        MacCaptureSession::stop_with_result(self)
+    }
+}
+
 impl Drop for MacCaptureSession {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
@@ -974,6 +744,7 @@ impl Drop for MacCaptureSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::SourceRect;
     use crate::session::{SessionDiagnostics, SessionStateMachine};
     use std::fs;
     use std::sync::Arc;
@@ -1062,6 +833,10 @@ mod tests {
             capture_mouse: true,
             hide_cursor: false,
             start_delay_ms: 3_000,
+            camera_width: None,
+            camera_height: None,
+            camera_fps: None,
+            camera_bitrate_bps: None,
         };
         let json = serde_json::to_string(&cfg).expect("serialize config");
         // camelCase field that the Swift side decodes.

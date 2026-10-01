@@ -26,6 +26,17 @@ pub const GAP_INITIAL_BUTTON_STATE_UNKNOWN: &str = "initial_button_state_unknown
 /// again from this gap on; the editor must stop drawing its own cursor here.
 pub const GAP_CURSOR_SHOWN_IN_VIDEO: &str = "cursor_shown_in_video";
 
+/// macOS: Quartz global display coordinates, in points.
+pub const COORDINATE_SPACE_QUARTZ: &str = "quartz_global";
+/// Windows: virtual-screen coordinates in physical pixels (per-monitor DPI
+/// aware). Cursor sizes and hotspots use the same units.
+pub const COORDINATE_SPACE_WINDOWS: &str = "windows_virtual_screen";
+
+/// Whether geometry in this coordinate space can be normalized.
+pub fn is_supported_coordinate_space(space: &str) -> bool {
+    space == COORDINATE_SPACE_QUARTZ || space == COORDINATE_SPACE_WINDOWS
+}
+
 /// The OS cursor is part of the screen video; the editor must not draw one.
 pub const CURSOR_MODE_BAKED: &str = "baked";
 /// The OS cursor is hidden from the screen video; the editor draws it from telemetry.
@@ -252,7 +263,7 @@ impl NativeMouseLogger {
                 if record.version != 2
                     || record.geometry_id.is_empty()
                     || record.geometry_id.len() > 128
-                    || record.coordinate_space != "quartz_global"
+                    || !is_supported_coordinate_space(&record.coordinate_space)
                     || ![CURSOR_MODE_BAKED, CURSOR_MODE_REPLACE].contains(&record.cursor_mode.as_str())
                     || record.sampling_interval_us != GEOMETRY_SAMPLING_INTERVAL_US
                     || record.bounds.width <= 0.0

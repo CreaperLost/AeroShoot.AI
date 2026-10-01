@@ -15,6 +15,7 @@ import {
 import { StopRecordingResult } from "../../lib/types";
 import { api } from "../../lib/ipc";
 import { useSettingsStore } from "../../stores/settingsStore";
+import { hostText } from "../../lib/platform";
 
 interface RecordingCompletedModalProps {
   result: StopRecordingResult;
@@ -74,7 +75,7 @@ export const RecordingCompletedModal: React.FC<RecordingCompletedModalProps> = (
             className="flex items-center gap-1 px-2.5 py-1 rounded bg-studio-800 hover:bg-studio-700 text-studio-200 hover:text-white font-sans text-xs shrink-0 transition-colors"
           >
             <FolderOpen className="w-3.5 h-3.5 text-teal-300" />
-            <span>Show in Finder</span>
+            <span>Show in {hostText.fileManager}</span>
           </button>
         </div>
 
@@ -165,7 +166,7 @@ export const RecordingCompletedModal: React.FC<RecordingCompletedModalProps> = (
             className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-teal-600 hover:bg-teal-500 text-white text-xs font-semibold shadow-md shadow-teal-900/40 transition-colors"
           >
             <ExternalLink className="w-3.5 h-3.5" />
-            <span>Open in Finder</span>
+            <span>Open in {hostText.fileManager}</span>
           </button>
         </div>
       </div>

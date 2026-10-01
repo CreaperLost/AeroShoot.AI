@@ -1,1 +1,0 @@
-{"default-capability":{"identifier":"default-capability","description":"Default least-privilege capability for AeroShoot Studio","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-set-title"]}}

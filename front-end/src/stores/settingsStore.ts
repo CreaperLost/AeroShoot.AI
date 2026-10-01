@@ -4,12 +4,22 @@ import {
   CanvasSettings,
   CaptureSource,
   CameraDevice,
+  CameraFormat,
   AudioDevice,
   EditLayout,
   canvasFromLayout,
   cameraFromLayout,
 } from "../lib/types";
-import { loadRecordingQuality, Resolution, saveRecordingQuality } from "../lib/recordingQuality";
+import {
+  CameraQuality,
+  CameraResolution,
+  effectiveCameraQuality,
+  loadCameraQuality,
+  loadRecordingQuality,
+  Resolution,
+  saveCameraQuality,
+  saveRecordingQuality,
+} from "../lib/recordingQuality";
 
 interface SettingsStore {
   selectedSourceId: string | null;
@@ -21,6 +31,12 @@ interface SettingsStore {
   resolution: Resolution;
   /** Screen video bitrate in Mbps (10, 20 or 30). */
   videoBitrateMbps: number;
+  /** Camera video, recorded as its own track with its own settings. */
+  cameraResolution: CameraResolution;
+  cameraFps: number;
+  cameraBitrateMbps: number;
+  /** Native modes per camera ID, from the last device listing. */
+  cameraFormats: Record<string, CameraFormat[] | undefined>;
   cameraBubble: CameraBubbleSettings;
   canvas: CanvasSettings;
   selectionsReady: boolean;
@@ -46,6 +62,9 @@ interface SettingsStore {
   setFps: (fps: number) => void;
   setResolution: (res: Resolution) => void;
   setVideoBitrateMbps: (mbps: number) => void;
+  setCameraResolution: (resolution: CameraResolution) => void;
+  setCameraFps: (fps: number) => void;
+  setCameraBitrateMbps: (mbps: number) => void;
   setMicGainDb: (gainDb: number) => void;
   setCaptureMouse: (enabled: boolean) => void;
   setCountdownSeconds: (seconds: number) => void;
@@ -60,6 +79,7 @@ interface SettingsStore {
 }
 
 const initialQuality = loadRecordingQuality();
+const initialCameraQuality = loadCameraQuality();
 
 const CAPTURE_MOUSE_KEY = "aeroshoot.captureMouse";
 
@@ -77,6 +97,14 @@ function saveCaptureMouse(enabled: boolean) {
   } catch {
     // Storage can be unavailable; the choice still applies for this session.
   }
+}
+
+function saveCamera(state: SettingsStore) {
+  saveCameraQuality({
+    resolution: state.cameraResolution,
+    fps: state.cameraFps,
+    bitrateMbps: state.cameraBitrateMbps,
+  });
 }
 
 export const COUNTDOWN_SECONDS = [0, 3, 5] as const;
@@ -110,6 +138,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   fps: initialQuality.fps,
   resolution: initialQuality.resolution,
   videoBitrateMbps: initialQuality.videoBitrateMbps,
+  cameraResolution: initialCameraQuality.resolution,
+  cameraFormats: {},
+  cameraFps: initialCameraQuality.fps,
+  cameraBitrateMbps: initialCameraQuality.bitrateMbps,
   selectionsReady: false,
   projectName: "",
   projectDir: null,
@@ -162,6 +194,18 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setVideoBitrateMbps: (videoBitrateMbps) => {
     set({ videoBitrateMbps });
     saveRecordingQuality(get());
+  },
+  setCameraResolution: (cameraResolution) => {
+    set({ cameraResolution });
+    saveCamera(get());
+  },
+  setCameraFps: (cameraFps) => {
+    set({ cameraFps });
+    saveCamera(get());
+  },
+  setCameraBitrateMbps: (cameraBitrateMbps) => {
+    set({ cameraBitrateMbps });
+    saveCamera(get());
   },
   setMicGainDb: (micGainDb) => {
     const clamped = Math.max(-24, Math.min(24, micGainDb));
@@ -225,6 +269,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       selectedSourceId: nextSourceId,
       availableSourceFallbackId: safeSources.find((s) => s.sourceType === "display")?.id ?? safeSources[0]?.id ?? null,
       selectedCameraId: nextCameraId,
+      cameraFormats: Object.fromEntries(safeCameras.map((camera) => [camera.id, camera.formats])),
       selectedMicId: nextMicId,
       cameraBubble: {
         ...state.cameraBubble,
@@ -235,3 +280,17 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     });
   },
 }));
+
+/** The selected camera's native modes; undefined when unknown. */
+export function selectedCameraFormats(state: SettingsStore): CameraFormat[] | undefined {
+  return state.selectedCameraId ? state.cameraFormats[state.selectedCameraId] : undefined;
+}
+
+/** The chosen camera quality, lowered to what the selected camera delivers. */
+export function selectCameraQuality(state: SettingsStore): CameraQuality {
+  return effectiveCameraQuality(selectedCameraFormats(state), {
+    resolution: state.cameraResolution,
+    fps: state.cameraFps,
+    bitrateMbps: state.cameraBitrateMbps,
+  });
+}

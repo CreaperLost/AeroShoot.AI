@@ -5,22 +5,60 @@ name = "AeroShoot.AI"
 [setup]
 script = "./script/codex.sh setup"
 
+# Linux and macOS (bash). Helpers: script/codex.sh, script/build.sh.
+
 [[actions]]
 name = "Setup"
 icon = "tool"
+platform = "unix"
 command = "./script/codex.sh setup"
 
 [[actions]]
 name = "Start"
 icon = "run"
+platform = "unix"
 command = "./script/codex.sh start"
 
 [[actions]]
 name = "Stop"
 icon = "tool"
+platform = "unix"
 command = "./script/codex.sh stop"
 
 [[actions]]
 name = "Build"
 icon = "tool"
-command = "./script/build.sh --dmg"
+platform = "unix"
+command = "./script/codex.sh build"
+
+# Windows (PowerShell). Helper: script/codex.ps1.
+
+[[actions]]
+name = "Setup"
+icon = "tool"
+platform = "windows"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\script\\codex.ps1 setup"
+
+[[actions]]
+name = "Start"
+icon = "run"
+platform = "windows"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\script\\codex.ps1 start"
+
+[[actions]]
+name = "Stop"
+icon = "tool"
+platform = "windows"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\script\\codex.ps1 stop"
+
+[[actions]]
+name = "Build"
+icon = "tool"
+platform = "windows"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\script\\codex.ps1 build"
+
+[[actions]]
+name = "Run App"
+icon = "tool"
+platform = "windows"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File .\\script\\codex.ps1 run"

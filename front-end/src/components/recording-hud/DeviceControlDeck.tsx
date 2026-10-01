@@ -1,18 +1,11 @@
 import React, { useState, useRef, useEffect, useLayoutEffect } from "react";
-import {
-  Monitor,
-  Camera,
-  CameraOff,
-  Mic,
-  Volume2,
-  VolumeX,
-  ChevronDown,
-  Check,
-} from "lucide-react";
+import { Monitor, Camera, Mic, Volume2, ChevronDown, Check } from "lucide-react";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { CaptureSource, CameraDevice, AudioDevice, PermissionBundle } from "../../lib/types";
 import { MicGainSlider } from "./MicGainSlider";
 import { api } from "../../lib/ipc";
+import { hostText } from "../../lib/platform";
+import { Switch } from "../ui/controls";
 
 interface DeviceControlDeckProps {
   sources: CaptureSource[];
@@ -25,6 +18,141 @@ interface DeviceControlDeckProps {
   permissions: PermissionBundle;
   needsScreenPermission: boolean;
   onRequestScreenPermission?: () => Promise<void>;
+}
+
+type Menu = "source" | "mic" | "camera";
+
+const levelPercent = (peakDb: number | null) =>
+  peakDb === null ? 0 : Math.max(0, Math.min(100, ((peakDb + 60) / 60) * 100));
+
+function LevelMeter({ peakDb, label }: { peakDb: number | null; label: string }) {
+  return (
+    <span
+      className="mt-1.5 block h-1 w-full overflow-hidden rounded-full bg-studio-800"
+      title={peakDb === null ? `Waiting for ${label}` : `${peakDb.toFixed(1)} dBFS`}
+    >
+      <span
+        className={`block h-full rounded-full ${peakDb !== null && peakDb > -3 ? "bg-rose-400" : "bg-emerald-400"}`}
+        style={{ width: `${levelPercent(peakDb)}%` }}
+      />
+    </span>
+  );
+}
+
+/** One source: name and device on the left (opens its menu), on/off switch on the right. */
+function SourceRow({
+  icon,
+  title,
+  detail,
+  on,
+  onToggle,
+  switchLabel,
+  disabled,
+  switchDisabled,
+  menu,
+  open,
+  onOpen,
+  menuId,
+  children,
+  issue,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  detail: React.ReactNode;
+  on: boolean;
+  onToggle: (on: boolean) => void;
+  switchLabel: string;
+  disabled: boolean;
+  switchDisabled?: boolean;
+  menu?: Menu;
+  open?: boolean;
+  onOpen?: () => void;
+  menuId?: string;
+  children?: React.ReactNode;
+  issue?: React.ReactNode;
+}) {
+  const body = (
+    <>
+      <span aria-hidden="true" className={on ? "text-studio-100" : "text-studio-500"}>
+        {icon}
+      </span>
+      <span className="min-w-0 flex-1 text-left">
+        <span className={`block text-[13px] font-medium ${on ? "text-white" : "text-studio-400"}`}>{title}</span>
+        <span className={`block truncate text-xs ${on ? "text-studio-400" : "text-studio-500"}`}>{detail}</span>
+      </span>
+    </>
+  );
+  return (
+    <div className="relative min-w-0">
+      <div
+        className={`flex items-center gap-3 rounded-lg border px-3 py-2.5 transition-colors ${
+          open ? "border-indigo-500/70 bg-studio-800" : on ? "border-studio-700 bg-studio-850" : "border-studio-800 bg-studio-900"
+        }`}
+      >
+        {menu ? (
+          <button
+            type="button"
+            disabled={disabled}
+            aria-haspopup="menu"
+            aria-expanded={open}
+            aria-controls={menuId}
+            aria-label={`${title}: choose device`}
+            onClick={onOpen}
+            className="flex min-w-0 flex-1 items-center gap-3 rounded-md disabled:cursor-not-allowed"
+          >
+            {body}
+            <ChevronDown
+              aria-hidden="true"
+              className={`h-3.5 w-3.5 shrink-0 text-studio-500 transition-transform ${open ? "rotate-180" : ""}`}
+            />
+          </button>
+        ) : (
+          <div className="flex min-w-0 flex-1 items-center gap-3">{body}</div>
+        )}
+        <Switch checked={on} onChange={onToggle} label={switchLabel} disabled={disabled || switchDisabled} />
+      </div>
+      {children}
+      {issue}
+    </div>
+  );
+}
+
+function MenuPanel({ id, label, children }: { id: string; label: string; children: React.ReactNode }) {
+  return (
+    <div
+      id={id}
+      role="menu"
+      aria-label={label}
+      className="device-dropdown-panel absolute inset-x-0 top-full z-50 mt-1.5 rounded-xl border border-studio-700 bg-studio-900 p-1.5 shadow-2xl"
+    >
+      {children}
+    </div>
+  );
+}
+
+function MenuItem({
+  selected,
+  onSelect,
+  children,
+}: {
+  selected: boolean;
+  onSelect: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitemradio"
+      aria-checked={selected}
+      onClick={onSelect}
+      className={`flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] transition-colors ${
+        selected ? "bg-indigo-500/15 text-white" : "text-studio-200 hover:bg-studio-800"
+      }`}
+    >
+      <span className="min-w-0 flex-1 truncate">{children}</span>
+      {selected && <Check aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-indigo-300" />}
+    </button>
+  );
 }
 
 export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
@@ -41,13 +169,13 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
 }) => {
   const settings = useSettingsStore();
 
-  const [openDropdown, setOpenDropdown] = useState<"source" | "mic" | "camera" | null>(null);
+  const [openDropdown, setOpenDropdown] = useState<Menu | null>(null);
   const [micPeakDb, setMicPeakDb] = useState<number | null>(null);
   const [systemPeakDb, setSystemPeakDb] = useState<number | null>(null);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  // Close dropdown on outside click
+  // Close the open menu on an outside click.
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
@@ -119,471 +247,207 @@ export const DeviceControlDeck: React.FC<DeviceControlDeckProps> = ({
   const selectedSource = displays.find((s) => s.id === settings.selectedSourceId);
   const selectedMic = mics.find((m) => m.id === settings.selectedMicId);
   const selectedCamera = cameras.find((c) => c.id === settings.selectedCameraId) ?? cameras[0];
+  const screenOn = settings.selectedSourceId !== null;
+  const micOn = settings.selectedMicId !== null;
+  const cameraOn = settings.cameraBubble.enabled;
   const screenPermissionProblem = needsScreenPermission && permissions.screenRecording !== "authorized";
-  const cameraPermissionProblem = settings.cameraBubble.enabled && permissions.camera !== "authorized";
-  const micPermissionProblem = Boolean(settings.selectedMicId) && permissions.microphone !== "authorized";
+  const cameraPermissionProblem = cameraOn && permissions.camera !== "authorized";
+  const micPermissionProblem = micOn && permissions.microphone !== "authorized";
+
+  const toggleMenu = (menu: Menu) => setOpenDropdown(openDropdown === menu ? null : menu);
 
   const permissionHint = (kind: "screen" | "camera" | "microphone") => {
     const state = kind === "screen" ? permissions.screenRecording : permissions[kind];
-    if (state === "denied" || state === "restricted") return "Permission blocked — open macOS Settings";
+    if (state === "denied" || state === "restricted") return `Permission blocked — open ${hostText.systemSettings}`;
     return "Permission required — activate to allow";
+  };
+  const issue = (kind: "screen" | "camera" | "microphone", id: string, onClick?: () => Promise<void>) => (
+    <button id={id} type="button" onClick={() => void onClick?.()} className="source-permission-issue" aria-label={permissionHint(kind)}>
+      {permissionHint(kind)}
+    </button>
+  );
+
+  const turnScreen = (on: boolean) =>
+    settings.setSelectedSourceId(on ? settings.availableSourceFallbackId ?? displays[0]?.id ?? null : null);
+  const turnMic = (on: boolean) => {
+    settings.setSelectedMicId(on ? (mics.find((m) => m.isDefault) ?? mics[0])?.id ?? null : null);
+    if (on) void onRequestMicrophonePermission?.();
+  };
+  const turnCamera = (on: boolean) => {
+    settings.updateCameraBubble({ enabled: on });
+    if (on && !settings.selectedCameraId && cameras[0]) settings.setSelectedCameraId(cameras[0].id);
+    if (on) void onRequestCameraPermission?.();
   };
 
   return (
-    <div
-      ref={containerRef}
-      onKeyDown={handleMenuKeyDown}
-      className="relative flex w-full flex-col gap-2 text-xs select-none"
-    >
-      <div className="device-selectors-grid">
-        {/* 1. PHYSICAL DISPLAY SELECTOR */}
-        <div className="relative min-w-0">
-          <button
-            type="button"
-            disabled={disabled}
-            aria-label={`Display source: ${selectedSource?.name ?? "No Screen"}`}
-            aria-haspopup="menu"
-            aria-expanded={openDropdown === "source"}
-            aria-controls="display-source-menu"
-            aria-describedby={screenPermissionProblem ? "screen-permission-status" : undefined}
-            onClick={() => setOpenDropdown(openDropdown === "source" ? null : "source")}
-            className={`device-control-card flex w-full min-w-0 items-center space-x-2.5 px-3 py-2 rounded-xl border transition-all ${
-              openDropdown === "source"
-                ? "bg-studio-800 border-indigo-500/80 text-white shadow-lg shadow-indigo-500/10"
-                : "bg-studio-850/80 hover:bg-studio-800 border-studio-750 text-studio-200"
-            }`}
-          >
-            <div className="p-1 rounded-lg bg-indigo-500/15 text-indigo-400">
-              <Monitor className="w-4 h-4" />
-            </div>
-            <div className="flex flex-col text-left">
-              <span className="text-[10px] uppercase font-semibold tracking-wider text-studio-400">
-                Display
-              </span>
-              <span className="font-medium text-white max-w-[170px] truncate">
-                {selectedSource ? selectedSource.name : "No Display"}
-              </span>
-            </div>
-            {selectedSource && (
-              <span className="device-control-detail text-[10px] font-mono px-1.5 py-0.5 rounded bg-studio-800 border border-studio-700 text-studio-400">
-                {selectedSource.width}×{selectedSource.height}
-              </span>
-            )}
-            <ChevronDown
-              className={`w-3.5 h-3.5 text-studio-400 transition-transform ${
-                openDropdown === "source" ? "rotate-180" : ""
-              }`}
-            />
-          </button>
-
-          {openDropdown === "source" && (
-            <div id="display-source-menu" role="menu" aria-label="Display sources" className="device-dropdown-panel absolute inset-x-0 top-full mt-2bg-studio-900 border border-studio-700/80 rounded-2xl shadow-2xl p-2 z-50 animate-in fade-in zoom-in-95 backdrop-blur-xl">
-              <div className="text-[11px] font-semibold text-studio-400 uppercase px-3 py-1.5 border-b border-studio-800 flex justify-between">
-                <span>Displays</span>
-                <span className="text-[10px] text-studio-500 font-mono">
-                  {displays.length} detected
-                </span>
-              </div>
-              <div className="py-1 space-y-0.5 max-h-56 overflow-y-auto">
-                <button
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={settings.selectedSourceId === null}
-                  onClick={() => {
-                    settings.setSelectedSourceId(null);
-                    setOpenDropdown(null);
-                  }}
-                  className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left transition-colors ${
-                    settings.selectedSourceId === null
-                      ? "bg-indigo-600/20 text-indigo-200 border border-indigo-500/30 font-medium"
-                      : "text-studio-300 hover:bg-studio-800/80"
-                  }`}
-                >
-                  <div className="flex items-center space-x-2.5 truncate">
-                    <VolumeX className="w-4 h-4 text-studio-400 shrink-0" />
-                    <div className="truncate">
-                      <div className="font-medium text-white">No Screen</div>
-                      <div className="text-[10px] text-studio-500">Record only the other enabled sources</div>
-                    </div>
-                  </div>
-                  {settings.selectedSourceId === null && <Check className="w-3.5 h-3.5 text-indigo-400 shrink-0 ml-2" />}
-                </button>
-                <div className="h-px bg-studio-800 my-1" />
-                {displays.length === 0 ? (
-                  <div className="px-3 py-3 text-studio-400 text-center">No displays detected</div>
-                ) : (
-                  displays.map((disp) => (
-                    <button
-                      key={disp.id}
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={settings.selectedSourceId === disp.id}
-                      onClick={() => {
-                        settings.setSelectedSourceId(disp.id);
-                        setOpenDropdown(null);
-                      }}
-                      className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left transition-colors ${
-                        settings.selectedSourceId === disp.id
-                          ? "bg-indigo-600/20 text-indigo-200 border border-indigo-500/30 font-medium"
-                          : "text-studio-200 hover:bg-studio-800/80"
-                      }`}
-                    >
-                      <div className="flex items-center space-x-2.5 truncate">
-                        <Monitor className="w-4 h-4 text-emerald-400 shrink-0" />
-                        <div className="truncate">
-                          <div className="truncate font-medium">{disp.name}</div>
-                          <div className="text-[10px] text-studio-400 font-mono">
-                            {disp.width} × {disp.height}
-                          </div>
-                        </div>
-                      </div>
-                      {settings.selectedSourceId === disp.id && (
-                        <Check className="w-3.5 h-3.5 text-indigo-400 shrink-0 ml-2" />
-                      )}
-                    </button>
-                  ))
-                )}
-              </div>
-            </div>
-          )}
-          {screenPermissionProblem && <button id="screen-permission-status" type="button" onClick={() => void onRequestScreenPermission?.()} className="source-permission-issue" aria-label={permissionHint("screen")}>{permissionHint("screen")}</button>}
-        </div>
-
-        {/* 2. MICROPHONE / AUDIO SELECTOR */}
-        <div className="relative min-w-0">
-          <button
-            type="button"
-            disabled={disabled}
-            aria-label={`Microphone source: ${selectedMic?.name ?? "No Microphone"}`}
-            aria-haspopup="menu"
-            aria-expanded={openDropdown === "mic"}
-            aria-controls="microphone-source-menu"
-            aria-describedby={micPermissionProblem ? "microphone-permission-status" : undefined}
-            onClick={() => setOpenDropdown(openDropdown === "mic" ? null : "mic")}
-            className={`device-control-card flex w-full min-w-0 items-center space-x-2.5 px-3 py-2 rounded-xl border transition-all ${
-              openDropdown === "mic"
-                ? "bg-studio-800 border-amber-500/80 text-white shadow-lg shadow-amber-500/10"
-                : "bg-studio-850/80 hover:bg-studio-800 border-studio-750 text-studio-200"
-            }`}
-          >
-            <div className="p-1 rounded-lg bg-amber-500/15 text-amber-400 relative">
-              <Mic className="w-4 h-4" />
-              {/* Live activity dot, derived from MicPreview's peak */}
-              {selectedMic && micPeakDb !== null && Number.isFinite(micPeakDb) && micPeakDb > -50 && (
-                <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-              )}
-            </div>
-            <div className="flex flex-col text-left">
-              <span className="text-[10px] uppercase font-semibold tracking-wider text-studio-400">
-                Microphone
-              </span>
-              <span className="font-medium text-white max-w-[150px] truncate">
-                {selectedMic ? selectedMic.name : "No Microphone"}
-              </span>
-            </div>
-            {/* Live waveform + gain readout */}
-            {selectedMic && (
-              <div className="device-control-detail flex items-center space-x-1.5">
-                <span className="h-1.5 w-10 overflow-hidden rounded-full bg-studio-800" title={micPeakDb === null ? "Waiting for microphone audio" : `${micPeakDb.toFixed(1)} dBFS`}>
-                  <span className={`block h-full rounded-full ${micPeakDb !== null && micPeakDb > -3 ? "bg-rose-400" : "bg-amber-400"}`}
-                    style={{ width: `${micPeakDb === null ? 0 : Math.max(0, Math.min(100, ((micPeakDb + 60) / 60) * 100))}%` }} />
-                </span>
-                <span
-                  className={`text-[10px] font-mono ${
-                    settings.micGainDb === 0
-                      ? "text-studio-400"
-                      : settings.micGainDb > 0
-                        ? "text-amber-300"
-                        : "text-sky-300"
-                  }`}
-                  title="Applied mic gain"
-                >
-                  {settings.micGainDb > 0 ? "+" : ""}
-                  {settings.micGainDb} dB
-                </span>
-              </div>
-            )}
-            <ChevronDown
-              className={`w-3.5 h-3.5 text-studio-400 transition-transform ${
-                openDropdown === "mic" ? "rotate-180" : ""
-              }`}
-            />
-          </button>
-
-          {openDropdown === "mic" && (
-            <div id="microphone-source-menu" role="menu" aria-label="Microphone sources" className="device-dropdown-panel absolute inset-x-0 top-full mt-2bg-studio-900 border border-studio-700/80 rounded-2xl shadow-2xl p-2 z-50 animate-in fade-in zoom-in-95 backdrop-blur-xl">
-              <div className="text-[11px] font-semibold text-studio-400 uppercase px-3 py-1.5 border-b border-studio-800 flex justify-between">
-                <span>Audio Inputs</span>
-                <span className="text-[10px] text-studio-500 font-mono">{mics.length} detected</span>
-              </div>
-              <div className="py-1 space-y-0.5 max-h-48 overflow-y-auto">
-                <button
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={settings.selectedMicId === null}
-                  onClick={() => {
-                    settings.setSelectedMicId(null);
-                    setOpenDropdown(null);
-                  }}
-                  className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left transition-colors ${
-                    settings.selectedMicId === null
-                      ? "bg-amber-500/20 text-amber-200 border border-amber-500/30 font-medium"
-                      : "text-studio-300 hover:bg-studio-800/80"
-                  }`}
-                >
-                  <div className="flex items-center space-x-2.5 truncate">
-                    <VolumeX className="w-4 h-4 text-studio-400 shrink-0" />
-                    <div className="truncate">
-                      <div className="font-medium text-white">No Microphone</div>
-                      <div className="text-[10px] text-studio-500">Do not create a mic track</div>
-                    </div>
-                  </div>
-                  {settings.selectedMicId === null && (
-                    <Check className="w-3.5 h-3.5 text-amber-400 shrink-0 ml-2" />
-                  )}
-                </button>
-                <div className="h-px bg-studio-800 my-1" />
-                {mics.length === 0 ? (
-                  <div className="px-3 py-3 text-studio-400 text-center">No microphones detected</div>
-                ) : (
-                  mics.map((mic) => (
-                    <button
-                      key={mic.id}
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={settings.selectedMicId === mic.id}
-                      onClick={() => {
-                        settings.setSelectedMicId(mic.id);
-                        setOpenDropdown(null);
-                        void onRequestMicrophonePermission?.();
-                      }}
-                      className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left transition-colors ${
-                        settings.selectedMicId === mic.id
-                          ? "bg-amber-500/20 text-amber-200 border border-amber-500/30 font-medium"
-                          : "text-studio-200 hover:bg-studio-800/80"
-                      }`}
-                    >
-                      <div className="flex items-center space-x-2.5 truncate">
-                        <Mic className="w-4 h-4 text-amber-400 shrink-0" />
-                        <span className="truncate">{mic.name}</span>
-                      </div>
-                      {settings.selectedMicId === mic.id && (
-                        <Check className="w-3.5 h-3.5 text-amber-400 shrink-0 ml-2" />
-                      )}
-                    </button>
-                  ))
-                )}
-              </div>
-              {selectedMic && (
-                <div className="border-t border-studio-800 mt-1 pt-3 px-3 pb-2 space-y-3">
-                  <div className="flex items-center space-x-3">
-                    <span className="h-2.5 w-36 overflow-hidden rounded-full bg-studio-800" title={micPeakDb === null ? "Waiting for native microphone audio" : `${micPeakDb.toFixed(1)} dBFS`}>
-                      <span className={`block h-full rounded-full ${micPeakDb !== null && micPeakDb > -3 ? "bg-rose-400" : micPeakDb !== null && micPeakDb > -12 ? "bg-amber-300" : "bg-emerald-400"}`}
-                        style={{ width: `${micPeakDb === null ? 0 : Math.max(0, Math.min(100, ((micPeakDb + 60) / 60) * 100))}%` }} />
-                    </span>
-                    <div className="flex flex-col text-[10px] font-mono leading-tight">
-                      <span className="text-studio-400 uppercase">Peak</span>
-                      <span
-                        className={`text-base font-semibold ${
-                          micPeakDb !== null && Number.isFinite(micPeakDb)
-                            ? micPeakDb > -3
-                              ? "text-rose-400"
-                              : micPeakDb > -12
-                                ? "text-amber-300"
-                                : "text-emerald-300"
-                            : "text-studio-500"
-                        }`}
-                      >
-                        {micPeakDb !== null && Number.isFinite(micPeakDb)
-                          ? `${micPeakDb.toFixed(1)}`
-                          : "—"}
-                      </span>
-                      <span className="text-studio-500">dBFS</span>
-                    </div>
-                  </div>
-                  <MicGainSlider
-                    value={settings.micGainDb}
-                    onChange={settings.setMicGainDb}
-                    peakDb={micPeakDb}
-                    disabled={disabled}
-                  />
-                  <p className="text-[10px] text-studio-500 leading-snug">
-                    Gain is applied to the captured mic track. Values above 0 dB can clip loud inputs.
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
-          {micPermissionProblem && <button id="microphone-permission-status" type="button" onClick={() => void onRequestMicrophonePermission?.()} className="source-permission-issue" aria-label={permissionHint("microphone")}>{permissionHint("microphone")}</button>}
-        </div>
-
-        {/* 3. WEBCAMERA SELECTOR (Unified card with 'No Camera' option) */}
-        <div className="relative min-w-0">
-          <button
-            type="button"
-            disabled={disabled}
-            aria-label={`Camera source: ${settings.cameraBubble.enabled && selectedCamera ? selectedCamera.name : "No Camera"}`}
-            aria-haspopup="menu"
-            aria-expanded={openDropdown === "camera"}
-            aria-controls="camera-source-menu"
-            aria-describedby={cameraPermissionProblem ? "camera-permission-status" : undefined}
-            onClick={() => setOpenDropdown(openDropdown === "camera" ? null : "camera")}
-            className={`device-control-card flex w-full min-w-0 items-center space-x-2.5 px-3 py-2 rounded-xl border transition-all ${
-              openDropdown === "camera"
-                ? "bg-studio-800 border-indigo-500/80 text-white shadow-lg shadow-indigo-500/10"
-                : settings.cameraBubble.enabled
-                ? "bg-studio-850/80 hover:bg-studio-800 border-studio-750 text-studio-200"
-                : "bg-studio-850/60 hover:bg-studio-800 border-studio-800 text-studio-400"
-            }`}
-          >
-            <div
-              className={`p-1 rounded-lg ${
-                settings.cameraBubble.enabled
-                  ? "bg-indigo-500/20 text-indigo-300"
-                  : "bg-studio-800 text-studio-500"
-              }`}
-            >
-              {settings.cameraBubble.enabled ? (
-                <Camera className="w-4 h-4" />
+    <div ref={containerRef} onKeyDown={handleMenuKeyDown} className="relative flex w-full flex-col gap-2 select-none">
+      <SourceRow
+        icon={<Monitor className="h-4 w-4" />}
+        title="Screen"
+        detail={
+          screenOn && selectedSource
+            ? `${selectedSource.name} · ${selectedSource.width}×${selectedSource.height}`
+            : displays.length === 0
+              ? "No display found"
+              : "Off"
+        }
+        on={screenOn}
+        onToggle={turnScreen}
+        switchLabel="Record screen"
+        switchDisabled={displays.length === 0}
+        disabled={disabled}
+        menu="source"
+        open={openDropdown === "source"}
+        onOpen={() => toggleMenu("source")}
+        menuId="display-source-menu"
+        issue={screenPermissionProblem && issue("screen", "screen-permission-status", onRequestScreenPermission)}
+      >
+        {openDropdown === "source" && (
+          <MenuPanel id="display-source-menu" label="Displays">
+            <div className="max-h-56 space-y-0.5 overflow-y-auto">
+              {displays.length === 0 ? (
+                <p className="px-2.5 py-3 text-center text-xs text-studio-400">No displays found</p>
               ) : (
-                <CameraOff className="w-4 h-4" />
+                displays.map((display) => (
+                  <MenuItem
+                    key={display.id}
+                    selected={settings.selectedSourceId === display.id}
+                    onSelect={() => {
+                      settings.setSelectedSourceId(display.id);
+                      setOpenDropdown(null);
+                    }}
+                  >
+                    {display.name}
+                    <span className="ml-2 text-xs text-studio-500">
+                      {display.width}×{display.height}
+                    </span>
+                  </MenuItem>
+                ))
               )}
             </div>
-            <div className="flex flex-col text-left">
-              <span className="text-[10px] uppercase font-semibold tracking-wider text-studio-400">
-                Webcamera
-              </span>
-              <span
-                className={`font-medium max-w-[140px] truncate ${
-                  settings.cameraBubble.enabled ? "text-white" : "text-studio-400"
-                }`}
-              >
-                {settings.cameraBubble.enabled && selectedCamera
-                  ? selectedCamera.name
-                  : "No Camera"}
-              </span>
-            </div>
-            <ChevronDown
-              className={`w-3.5 h-3.5 text-studio-400 transition-transform ${
-                openDropdown === "camera" ? "rotate-180" : ""
-              }`}
-            />
-          </button>
+          </MenuPanel>
+        )}
+      </SourceRow>
 
-          {openDropdown === "camera" && (
-            <div id="camera-source-menu" role="menu" aria-label="Camera sources" className="device-dropdown-panel absolute inset-x-0 top-full mt-2bg-studio-900 border border-studio-700/80 rounded-2xl shadow-2xl p-2 z-50 animate-in fade-in zoom-in-95 backdrop-blur-xl">
-              <div className="text-[11px] font-semibold text-studio-400 uppercase px-3 py-1.5 border-b border-studio-800 flex justify-between">
-                <span>Camera Options</span>
-                <span className="text-[10px] text-studio-500 font-mono">
-                  {cameras.length} available
-                </span>
-              </div>
-              <div className="py-1 space-y-0.5 max-h-56 overflow-y-auto">
-                {/* Option 1: No Camera */}
-                <button
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={!settings.cameraBubble.enabled}
-                  onClick={() => {
-                    settings.updateCameraBubble({ enabled: false });
-                    setOpenDropdown(null);
-                  }}
-                  className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left transition-colors ${
-                    !settings.cameraBubble.enabled
-                      ? "bg-indigo-600/20 text-indigo-200 border border-indigo-500/30 font-medium"
-                      : "text-studio-300 hover:bg-studio-800/80"
-                  }`}
-                >
-                  <div className="flex items-center space-x-2.5 truncate">
-                    <CameraOff className="w-4 h-4 text-studio-400 shrink-0" />
-                    <div className="truncate">
-                      <div className="font-medium text-white">No Camera</div>
-                      <div className="text-[10px] text-studio-500">Disable webcam bubble</div>
-                    </div>
-                  </div>
-                  {!settings.cameraBubble.enabled && (
-                    <Check className="w-3.5 h-3.5 text-indigo-400 shrink-0 ml-2" />
-                  )}
-                </button>
-
-                <div className="h-px bg-studio-800 my-1" />
-
-                {/* Available Cameras */}
-                {cameras.length === 0 ? (
-                  <div className="px-3 py-3 text-studio-400 text-center text-[11px]">
-                    No webcams detected
-                  </div>
-                ) : (
-                  cameras.map((cam) => (
-                    <button
-                      key={cam.id}
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={settings.cameraBubble.enabled && settings.selectedCameraId === cam.id}
-                      onClick={() => {
-                        settings.updateCameraBubble({ enabled: true });
-                        settings.setSelectedCameraId(cam.id);
-                        setOpenDropdown(null);
-                        void onRequestCameraPermission?.();
-                      }}
-                      className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left transition-colors ${
-                        settings.cameraBubble.enabled && settings.selectedCameraId === cam.id
-                          ? "bg-indigo-600/20 text-indigo-200 border border-indigo-500/30 font-medium"
-                          : "text-studio-200 hover:bg-studio-800/80"
-                      }`}
-                    >
-                      <div className="flex items-center space-x-2.5 truncate">
-                        <Camera className="w-4 h-4 text-indigo-400 shrink-0" />
-                        <span className="truncate font-medium">{cam.name}</span>
-                      </div>
-                      {settings.cameraBubble.enabled && settings.selectedCameraId === cam.id && (
-                        <Check className="w-3.5 h-3.5 text-indigo-400 shrink-0 ml-2" />
-                      )}
-                    </button>
-                  ))
-                )}
-              </div>
-            </div>
-          )}
-          {cameraPermissionProblem && <button id="camera-permission-status" type="button" onClick={() => void onRequestCameraPermission?.()} className="source-permission-issue" aria-label={permissionHint("camera")}>{permissionHint("camera")}</button>}
-        </div>
-
-        {/* 4. SYSTEM AUDIO LOOPBACK TOGGLE */}
-        <button
-          type="button"
-          disabled={disabled}
-          aria-label="Capture system audio"
-          aria-pressed={settings.captureSystemAudio}
-          onClick={() => settings.setCaptureSystemAudio(!settings.captureSystemAudio)}
-          className={`device-control-card flex w-full min-w-0 items-center space-x-2 px-3 py-2 rounded-xl border transition-all ${
-            settings.captureSystemAudio
-              ? "bg-emerald-600/20 border-emerald-500/50 text-emerald-200 shadow-sm shadow-emerald-950"
-              : "bg-studio-850/80 hover:bg-studio-800 border-studio-750 text-studio-400"
-          }`}
-          title="Capture system audio (apps, music, calls)"
-        >
-          {settings.captureSystemAudio ? (
-            <Volume2 className="w-4 h-4 text-emerald-400" />
+      <SourceRow
+        icon={<Mic className="h-4 w-4" />}
+        title="Microphone"
+        detail={
+          micOn && selectedMic ? (
+            <>
+              {selectedMic.name}
+              {settings.micGainDb !== 0 && ` · ${settings.micGainDb > 0 ? "+" : ""}${settings.micGainDb} dB`}
+              <LevelMeter peakDb={micPeakDb} label="microphone audio" />
+            </>
+          ) : mics.length === 0 ? (
+            "No microphone found"
           ) : (
-            <VolumeX className="w-4 h-4 text-studio-500" />
-          )}
-          <div className="flex flex-col text-left">
-            <span className="text-[10px] uppercase font-semibold tracking-wider text-studio-400">
-              Sys Audio
-            </span>
-            <span className="font-medium text-white">
-              {settings.captureSystemAudio ? "Loopback Active" : "Muted"}
-            </span>
-          </div>
-          {settings.captureSystemAudio && (
-            <span className="device-control-detail h-1.5 min-w-10 flex-1 overflow-hidden rounded-full bg-studio-800" title={systemPeakDb === null ? "Waiting for system audio" : `${systemPeakDb.toFixed(1)} dBFS`}>
-              <span className={`block h-full rounded-full ${systemPeakDb !== null && systemPeakDb > -3 ? "bg-rose-400" : "bg-emerald-400"}`}
-                style={{ width: `${systemPeakDb === null ? 0 : Math.max(0, Math.min(100, ((systemPeakDb + 60) / 60) * 100))}%` }} />
-            </span>
-          )}
-        </button>
-      </div>
+            "Off"
+          )
+        }
+        on={micOn}
+        onToggle={turnMic}
+        switchLabel="Record microphone"
+        switchDisabled={mics.length === 0}
+        disabled={disabled}
+        menu="mic"
+        open={openDropdown === "mic"}
+        onOpen={() => toggleMenu("mic")}
+        menuId="microphone-source-menu"
+        issue={micPermissionProblem && issue("microphone", "microphone-permission-status", onRequestMicrophonePermission)}
+      >
+        {openDropdown === "mic" && (
+          <MenuPanel id="microphone-source-menu" label="Microphones">
+            <div className="max-h-48 space-y-0.5 overflow-y-auto">
+              {mics.length === 0 ? (
+                <p className="px-2.5 py-3 text-center text-xs text-studio-400">No microphones found</p>
+              ) : (
+                mics.map((mic) => (
+                  <MenuItem
+                    key={mic.id}
+                    selected={settings.selectedMicId === mic.id}
+                    onSelect={() => {
+                      settings.setSelectedMicId(mic.id);
+                      setOpenDropdown(null);
+                      void onRequestMicrophonePermission?.();
+                    }}
+                  >
+                    {mic.name}
+                  </MenuItem>
+                ))
+              )}
+            </div>
+            {selectedMic && (
+              <div className="mt-1.5 space-y-2 border-t border-studio-800 px-2.5 pb-1.5 pt-2.5">
+                <MicGainSlider value={settings.micGainDb} onChange={settings.setMicGainDb} peakDb={micPeakDb} disabled={disabled} />
+                <p className="text-xs leading-snug text-studio-500">
+                  Gain applies to the recorded mic track. Above 0 dB, loud input can clip.
+                </p>
+              </div>
+            )}
+          </MenuPanel>
+        )}
+      </SourceRow>
 
+      <SourceRow
+        icon={<Camera className="h-4 w-4" />}
+        title="Camera"
+        detail={cameraOn && selectedCamera ? selectedCamera.name : cameras.length === 0 ? "No camera found" : "Off"}
+        on={cameraOn}
+        onToggle={turnCamera}
+        switchLabel="Record camera"
+        switchDisabled={cameras.length === 0}
+        disabled={disabled}
+        menu="camera"
+        open={openDropdown === "camera"}
+        onOpen={() => toggleMenu("camera")}
+        menuId="camera-source-menu"
+        issue={cameraPermissionProblem && issue("camera", "camera-permission-status", onRequestCameraPermission)}
+      >
+        {openDropdown === "camera" && (
+          <MenuPanel id="camera-source-menu" label="Cameras">
+            <div className="max-h-56 space-y-0.5 overflow-y-auto">
+              {cameras.length === 0 ? (
+                <p className="px-2.5 py-3 text-center text-xs text-studio-400">No cameras found</p>
+              ) : (
+                cameras.map((camera) => (
+                  <MenuItem
+                    key={camera.id}
+                    selected={cameraOn && settings.selectedCameraId === camera.id}
+                    onSelect={() => {
+                      settings.updateCameraBubble({ enabled: true });
+                      settings.setSelectedCameraId(camera.id);
+                      setOpenDropdown(null);
+                      void onRequestCameraPermission?.();
+                    }}
+                  >
+                    {camera.name}
+                  </MenuItem>
+                ))
+              )}
+            </div>
+          </MenuPanel>
+        )}
+      </SourceRow>
+
+      <SourceRow
+        icon={<Volume2 className="h-4 w-4" />}
+        title="Computer audio"
+        detail={
+          settings.captureSystemAudio ? (
+            <>
+              Apps, music, and calls
+              <LevelMeter peakDb={systemPeakDb} label="computer audio" />
+            </>
+          ) : (
+            "Off"
+          )
+        }
+        on={settings.captureSystemAudio}
+        onToggle={settings.setCaptureSystemAudio}
+        switchLabel="Record computer audio"
+        disabled={disabled}
+      />
     </div>
   );
 };

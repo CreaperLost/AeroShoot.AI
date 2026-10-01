@@ -476,6 +476,11 @@ export const api = {
     layout?: EditLayout;
     projectName?: string;
     projectDir?: string;
+    /** Camera track settings; used when a camera is recorded. */
+    cameraWidth?: number;
+    cameraHeight?: number;
+    cameraFps?: number;
+    cameraBitrateBps?: number;
     /** Microphone gain in decibels applied to the captured mic track.
      *  Omit / `undefined` when no mic is selected. */
     micGainDb?: number;

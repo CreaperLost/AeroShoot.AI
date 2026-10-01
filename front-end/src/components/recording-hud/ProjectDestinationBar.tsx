@@ -1,8 +1,10 @@
 import React, { useEffect, useState } from "react";
-import { Folder, FolderOpen } from "lucide-react";
+import { FolderOpen } from "lucide-react";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { api } from "../../lib/ipc";
 import { formatDatedUntitled } from "../../lib/projectUtils";
+import { hostText } from "../../lib/platform";
+import { SettingRow } from "../ui/controls";
 
 const SAVE_DIR_KEY = "aeroshoot.projectSaveDir";
 
@@ -14,24 +16,9 @@ function shortenPath(path: string): string {
   return `…/${parts.slice(-2).join("/")}`;
 }
 
-interface ProjectDestinationBarProps {
-  disabled?: boolean;
-}
-
-export const ProjectDestinationBar: React.FC<ProjectDestinationBarProps> = ({ disabled = false }) => {
-  const { projectName, projectDir, createdProjectPath, setProjectName, setProjectDir } = useSettingsStore();
-  const [pickerError, setPickerError] = useState<string>();
-
-  const handleShowInFinder = async () => {
-    if (!createdProjectPath) return;
-    setPickerError(undefined);
-    try {
-      await api.showInFinder(createdProjectPath);
-    } catch (err) {
-      setPickerError(String(err));
-    }
-  };
-
+/** Restore the saved recordings folder, or the platform default, once. */
+export function useDefaultProjectDir() {
+  const setProjectDir = useSettingsStore((state) => state.setProjectDir);
   useEffect(() => {
     let cancelled = false;
     const stored = typeof localStorage !== "undefined" ? localStorage.getItem(SAVE_DIR_KEY) : null;
@@ -51,6 +38,26 @@ export const ProjectDestinationBar: React.FC<ProjectDestinationBarProps> = ({ di
       cancelled = true;
     };
   }, [setProjectDir]);
+}
+
+interface ProjectDestinationBarProps {
+  disabled?: boolean;
+}
+
+/** Project name and recordings folder, as settings rows. */
+export const ProjectDestinationBar: React.FC<ProjectDestinationBarProps> = ({ disabled = false }) => {
+  const { projectName, projectDir, createdProjectPath, setProjectName, setProjectDir } = useSettingsStore();
+  const [pickerError, setPickerError] = useState<string>();
+
+  const handleShowInFinder = async () => {
+    if (!createdProjectPath) return;
+    setPickerError(undefined);
+    try {
+      await api.showInFinder(createdProjectPath);
+    } catch (err) {
+      setPickerError(String(err));
+    }
+  };
 
   const chooseLocation = async () => {
     setPickerError(undefined);
@@ -64,48 +71,51 @@ export const ProjectDestinationBar: React.FC<ProjectDestinationBarProps> = ({ di
     }
   };
 
-  const locationLabel = projectDir ? shortenPath(projectDir) : "Documents/AeroShootRec";
+  const locationLabel = projectDir ? shortenPath(projectDir) : "Documents/AeroShootRecordings";
 
   return (
-    <div className="flex w-full flex-col gap-2 text-xs">
-      <label className="flex items-center gap-2 min-w-0 flex-1">
-        <span className="uppercase font-semibold tracking-wider text-studio-400 shrink-0">Project</span>
+    <div>
+      <SettingRow title="Project name" description="Leave empty to name it by date.">
         <input
           type="text"
+          aria-label="Project name"
           value={projectName}
           disabled={disabled}
           maxLength={80}
           placeholder={formatDatedUntitled()}
           onChange={(event) => setProjectName(event.target.value)}
-          className="select-text min-w-0 flex-1 px-3 py-1.5 rounded-lg bg-studio-950 border border-studio-750 text-white placeholder:text-studio-500 focus:outline-none focus:border-indigo-500/70 disabled:opacity-50"
+          className="w-52 select-text rounded-lg border border-studio-700 bg-studio-950 px-2.5 py-1.5 text-[13px] text-white placeholder:text-studio-500 focus:border-indigo-500 focus:outline-none disabled:opacity-50"
         />
-      </label>
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={() => void chooseLocation()}
-        title={projectDir ?? "Choose where new .aero folders are created"}
-        className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-studio-850/80 hover:bg-studio-800 border border-studio-750 text-studio-200 disabled:opacity-50 max-w-full"
+      </SettingRow>
+      <SettingRow
+        title="Folder"
+        description={<span title={projectDir ?? undefined}>{locationLabel}</span>}
       >
-        <FolderOpen className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-        <span className="truncate">{locationLabel}</span>
-        <Folder className="w-3.5 h-3.5 text-studio-500 shrink-0" />
-      </button>
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => void chooseLocation()}
+          title="Choose where new recordings are saved"
+          className="flex items-center gap-1.5 rounded-lg border border-studio-700 bg-studio-850 px-2.5 py-1.5 text-[13px] text-studio-100 hover:bg-studio-800 disabled:opacity-50"
+        >
+          <FolderOpen aria-hidden="true" className="h-3.5 w-3.5 text-studio-400" />
+          Change
+        </button>
+      </SettingRow>
       {createdProjectPath && (
         <button
           type="button"
           onClick={() => void handleShowInFinder()}
-          title={`Show ${createdProjectPath} in Finder`}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 border border-indigo-500/40 text-indigo-300 text-xs font-medium shrink-0 transition-colors shadow-sm"
+          title={`Show ${createdProjectPath} in ${hostText.fileManager}`}
+          className="mt-1 text-xs text-indigo-300 hover:text-indigo-200"
         >
-          <Folder className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-          <span>Show in Finder</span>
+          Show last recording in {hostText.fileManager}
         </button>
       )}
       {pickerError && (
-        <span role="alert" className="text-rose-300 truncate max-w-full">
+        <p role="alert" className="mt-1 text-xs text-rose-300">
           {pickerError}
-        </span>
+        </p>
       )}
     </div>
   );

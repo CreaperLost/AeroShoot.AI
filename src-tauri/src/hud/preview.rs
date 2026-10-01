@@ -141,7 +141,7 @@ impl PreviewOwner {
             copies: 0,
             presented_bytes: 0,
             hit_mode: PreviewHitMode::Consume,
-            supported: cfg!(target_os = "macos"),
+            supported: cfg!(any(target_os = "macos", target_os = "windows")),
         }
     }
 
@@ -177,7 +177,9 @@ impl PreviewOwner {
         native_window: Option<*mut std::ffi::c_void>,
     ) -> Result<PreviewStatus, String> {
         if !self.supported {
-            return Err("Native preview is not implemented on this platform".into());
+            return Err(
+                "Live preview isn't available on this platform yet. Recording still works.".into(),
+            );
         }
         self.detach();
         self.generation = self.generation.saturating_add(1).max(1);
@@ -337,6 +339,14 @@ mod tests {
         }
     }
 
+    /// Owner state logic is platform-neutral; opt in so it runs on every OS.
+    /// With no native window, no platform adapter is invoked.
+    fn owner() -> PreviewOwner {
+        let mut owner = PreviewOwner::new();
+        owner.supported = true;
+        owner
+    }
+
     #[test]
     fn logical_points_map_to_physical_pixels() {
         let physical = viewport(1).physical().unwrap();
@@ -348,7 +358,7 @@ mod tests {
 
     #[test]
     fn stale_layout_and_generation_are_rejected() {
-        let mut owner = PreviewOwner::new();
+        let mut owner = owner();
         owner
             .attach("main".into(), PreviewHitMode::Consume, None)
             .unwrap();
@@ -381,7 +391,7 @@ mod tests {
 
     #[test]
     fn circle_hit_mode_passes_transparent_corners() {
-        let mut owner = PreviewOwner::new();
+        let mut owner = owner();
         owner
             .attach("main".into(), PreviewHitMode::Circle, None)
             .unwrap();

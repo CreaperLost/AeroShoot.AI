@@ -1,99 +1,100 @@
-import { useSettingsStore } from "../../stores/settingsStore";
+import { useShallow } from "zustand/react/shallow";
+import { selectCameraQuality, selectedCameraFormats, useSettingsStore } from "../../stores/settingsStore";
 import {
   BITRATES_MBPS,
+  CAMERA_BITRATES_MBPS,
+  cameraMaximum,
+  cameraOptions,
+  CameraResolution,
   FRAME_RATES,
+  megabytesPerMinute,
   Resolution,
   RESOLUTIONS,
-  resolutionSize,
 } from "../../lib/recordingQuality";
+import { SelectField } from "../ui/controls";
 
-export function Segmented<T>({
-  label,
-  unit,
-  options,
-  value,
-  onChange,
-  format,
-  disabled,
-}: {
-  label: string;
-  unit?: string;
-  options: readonly T[];
-  value: T;
-  onChange: (value: T) => void;
-  format: (value: T) => string;
-  disabled: boolean;
-}) {
+const fpsLabel = (fps: number) => `${fps} fps`;
+const mbpsLabel = (mbps: number) => `${mbps} Mbps`;
+
+/** Resolution, frame rate, and bitrate for the screen track. */
+export function ScreenVideoSettings({ disabled }: { disabled: boolean }) {
+  const { fps, setFps, resolution, setResolution, videoBitrateMbps, setVideoBitrateMbps } = useSettingsStore();
   return (
     <div>
-      <div className="mb-1 flex items-baseline justify-between text-[10px] font-semibold uppercase tracking-wider text-studio-400">
-        <span>{label}</span>
-        {unit && <span className="font-mono normal-case text-studio-500">{unit}</span>}
+      <div className="grid grid-cols-3 gap-2.5">
+        <SelectField<Resolution>
+          label="Resolution"
+          value={resolution}
+          options={RESOLUTIONS}
+          format={(value) => value}
+          onChange={setResolution}
+          disabled={disabled}
+        />
+        <SelectField<number>
+          label="Frame rate"
+          value={fps}
+          options={FRAME_RATES}
+          format={fpsLabel}
+          onChange={setFps}
+          disabled={disabled}
+        />
+        <SelectField<number>
+          label="Bitrate"
+          value={videoBitrateMbps}
+          options={BITRATES_MBPS}
+          format={mbpsLabel}
+          onChange={setVideoBitrateMbps}
+          disabled={disabled}
+        />
       </div>
-      <div
-        role="radiogroup"
-        aria-label={label}
-        className="grid gap-0.5 rounded-lg border border-studio-800 bg-studio-950/60 p-0.5"
-        style={{ gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))` }}
-      >
-        {options.map((option) => {
-          const selected = option === value;
-          return (
-            <button
-              key={String(option)}
-              type="button"
-              role="radio"
-              aria-checked={selected}
-              disabled={disabled}
-              onClick={() => onChange(option)}
-              className={`rounded-md px-1 py-1 font-mono text-[11px] transition-colors disabled:opacity-50 ${
-                selected ? "bg-studio-800 text-white shadow-sm" : "text-studio-400 hover:text-studio-200"
-              }`}
-            >
-              {format(option)}
-            </button>
-          );
-        })}
-      </div>
+      <p className="mt-1.5 text-xs text-studio-500">About {megabytesPerMinute(videoBitrateMbps)} MB per minute</p>
     </div>
   );
 }
 
-export function RecordingQualityControl({ disabled }: { disabled: boolean }) {
-  const { fps, setFps, resolution, setResolution, videoBitrateMbps, setVideoBitrateMbps } = useSettingsStore();
-  const { width, height } = resolutionSize(resolution);
-  const megabytesPerMinute = Math.round((videoBitrateMbps * 60) / 8);
-
+/** The camera's own track settings; shown only while a camera is recorded. */
+export function CameraVideoSettings({ disabled, cameraOn }: { disabled: boolean; cameraOn: boolean }) {
+  const { setCameraResolution, setCameraFps, cameraBitrateMbps, setCameraBitrateMbps } = useSettingsStore();
+  const formats = useSettingsStore(selectedCameraFormats);
+  // Shown lowered to what this camera delivers; the stored choice is kept
+  // for cameras that can do more.
+  const { resolution: cameraResolution, fps: cameraFps } = useSettingsStore(useShallow(selectCameraQuality));
+  if (!cameraOn) {
+    return <p className="text-xs text-studio-400">The camera is off. Turn it on under What to record.</p>;
+  }
+  const { resolutions, frameRates } = cameraOptions(formats, cameraResolution);
+  const maximum = cameraMaximum(formats);
   return (
-    <div className="space-y-2.5">
-      <Segmented<Resolution>
-        label="Resolution"
-        options={RESOLUTIONS}
-        value={resolution}
-        onChange={setResolution}
-        format={(value) => value}
-        disabled={disabled}
-      />
-      <Segmented<number>
-        label="Frame rate"
-        unit="fps"
-        options={FRAME_RATES}
-        value={fps}
-        onChange={setFps}
-        format={(value) => String(value)}
-        disabled={disabled}
-      />
-      <Segmented<number>
-        label="Bitrate"
-        unit="Mbps"
-        options={BITRATES_MBPS}
-        value={videoBitrateMbps}
-        onChange={setVideoBitrateMbps}
-        format={(value) => String(value)}
-        disabled={disabled}
-      />
-      <p className="text-[10px] leading-snug text-studio-500">
-        {width}×{height} · {fps} fps · {videoBitrateMbps} Mbps · ≈{megabytesPerMinute} MB/min of screen video
+    <div>
+      <div className="grid grid-cols-3 gap-2.5">
+        <SelectField<CameraResolution>
+          label="Resolution"
+          value={cameraResolution}
+          options={resolutions}
+          format={(value) => value}
+          onChange={setCameraResolution}
+          disabled={disabled}
+        />
+        <SelectField<number>
+          label="Frame rate"
+          value={cameraFps}
+          options={frameRates}
+          format={fpsLabel}
+          onChange={setCameraFps}
+          disabled={disabled}
+        />
+        <SelectField<number>
+          label="Bitrate"
+          value={cameraBitrateMbps}
+          options={CAMERA_BITRATES_MBPS}
+          format={mbpsLabel}
+          onChange={setCameraBitrateMbps}
+          disabled={disabled}
+        />
+      </div>
+      <p className="mt-1.5 text-xs text-studio-500">
+        About {megabytesPerMinute(cameraBitrateMbps)} MB per minute
+        {maximum && ` · This camera records up to ${maximum}`}
       </p>
     </div>
   );

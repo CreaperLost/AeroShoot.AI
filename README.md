@@ -1,19 +1,22 @@
 # AeroShoot.AI
 
-The target architecture is documented in [`AEROSHOOT_MASTER_PLAN.md`](AEROSHOOT_MASTER_PLAN.md). The shorter, current defect list and acceptance-driven execution order live in [`ACTIVE_RECORDING_WORK.md`](ACTIVE_RECORDING_WORK.md).
+A desktop screen recorder for macOS (13+, Apple Silicon) and Windows 11. It records the screen, a camera, a microphone, and computer audio as separate tracks, plus mouse movement, into a project the editor can open.
 
-The companion video editor has been split out and now lives in its own repository: [`CreaperLost/Automated-Editor`](https://github.com/CreaperLost/Automated-Editor).
+The companion video editor lives in its own repository: [`CreaperLost/Automated-Editor`](https://github.com/CreaperLost/Automated-Editor).
 
-## Skills
+## Layout
 
-This project pins its agent skills in [`skills-lock.json`](skills-lock.json) — a manifest that records each skill's source, path, and integrity hash. The lockfile is committed; the actual installed files under `.minimax/skills/` are not (the directory is git-ignored).
+- `front-end/` — React + Vite user interface.
+- `src-tauri/` — Tauri 2 app and the Rust recording core.
+  - `native/macos/` — Swift capture bridge (ScreenCaptureKit, AVFoundation).
+  - `src/capture/windows/` — Windows capture (Windows Graphics Capture, Media Foundation, WASAPI).
+- `script/` — build, test, and launcher scripts.
 
-To install everything the lockfile declares, from the repo root:
+## Development
 
 ```sh
-npx skills add leonardomso/rust-skills --agent minimax-code --yes
+cd front-end && npm install && npm test
+cd src-tauri && cargo test --no-default-features
 ```
 
-After installing, restart MiniMax Code (or reload the workspace) so the new skills are picked up. Re-run the install command any time `skills-lock.json` changes.
-
-The Rust skills package is used when writing, reviewing, or refactoring Rust code; invoke it with `/rust-skills` or rely on automatic application in qualifying contexts.
+`script/build.sh` builds the macOS app; `script/codex.ps1 build` builds the Windows one.

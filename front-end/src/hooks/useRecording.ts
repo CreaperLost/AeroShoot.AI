@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
 import { layoutFromSettings, SessionState, StopRecordingResult } from "../lib/types";
 import { api } from "../lib/ipc";
-import { useSettingsStore } from "../stores/settingsStore";
+import { selectCameraQuality, useSettingsStore } from "../stores/settingsStore";
+import { cameraResolutionSize } from "../lib/recordingQuality";
 
 export type RecordingController = ReturnType<typeof useRecording>;
 
@@ -173,6 +174,9 @@ export function useRecording() {
       const startDelayMs = settings.countdownSeconds * 1000;
       setCountdownEndsAt(startDelayMs > 0 ? Date.now() + startDelayMs : null);
       const projectName = settings.projectName.trim();
+      const cameraQuality = selectCameraQuality(settings);
+      const camera = cameraResolutionSize(cameraQuality.resolution);
+      const recordCamera = settings.cameraBubble.enabled && Boolean(settings.selectedCameraId);
       const res = await api.startRecording({
         sourceId,
         captureScreen,
@@ -188,6 +192,14 @@ export function useRecording() {
         videoBitrateBps: settings.videoBitrateMbps * 1_000_000,
         captureMouse: settings.captureMouse,
         startDelayMs,
+        ...(recordCamera
+          ? {
+              cameraWidth: camera.width,
+              cameraHeight: camera.height,
+              cameraFps: cameraQuality.fps,
+              cameraBitrateBps: settings.cameraBitrateMbps * 1_000_000,
+            }
+          : {}),
       });
       setCountdownEndsAt(null);
       setSessionState(res.state);

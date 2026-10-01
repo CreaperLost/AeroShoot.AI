@@ -64,7 +64,8 @@ export const RecordingFloatingDock: React.FC<RecordingFloatingDockProps> = ({
   return (
     <div className="flex w-full flex-col gap-2 select-none">
       <div className="flex w-full items-center gap-2">
-        {/* Timer & Status Badge */}
+        {/* Elapsed time, only once a recording is under way. */}
+        {(isRecording || isPaused || isStopping) && (
         <div className="flex shrink-0 items-center gap-2.5 px-3 py-2 rounded-xl bg-studio-950/80 border border-studio-800 font-mono text-sm">
           {isRecording && (
             <span className="relative flex h-2.5 w-2.5">
@@ -83,6 +84,7 @@ export const RecordingFloatingDock: React.FC<RecordingFloatingDockProps> = ({
             {formatElapsed(elapsedMs)}
           </span>
         </div>
+        )}
 
         {/* Main Trigger Button */}
         {isStopping ? (

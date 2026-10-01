@@ -47,6 +47,14 @@ export interface CameraDevice {
   id: string;
   name: string;
   isDefault: boolean;
+  /** Native capture modes; absent when unknown (every setting is offered). */
+  formats?: CameraFormat[];
+}
+
+export interface CameraFormat {
+  width: number;
+  height: number;
+  fps: number;
 }
 
 export type TrackType = "screen" | "webcam" | "mic" | "system";

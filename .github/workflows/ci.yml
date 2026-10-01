@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: front-end
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: front-end/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+  rust:
+    name: Rust (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon runner: builds and links the real Swift capture bridge.
+          - name: macOS arm64
+            os: macos-14
+          - name: Windows x64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Unit tests
+        run: cargo test --lib --no-default-features
+      - name: Integration tests
+        run: cargo test --tests --no-default-features
+      # Tauri's context macro expects the frontend dist directory to exist;
+      # the app shell is type-checked without building the frontend here.
+      - name: Prepare frontend dist placeholder
+        shell: bash
+        run: mkdir -p ../front-end/dist
+      - name: Check desktop app
+        run: cargo check --features tauri-app
+      - name: Swift contract tests
+        if: runner.os == 'macOS'
+        run: sh ../script/test-mic-gain.sh
+      # Includes the recorder's pure checks (camera format, recording window,
+      # preview hand-off) but also writes real H.264, which needs a hardware
+      # encoder that hosted macOS VMs may not expose.
+      - name: Swift recording writer tests
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: sh ../script/test-recording-writer.sh

@@ -463,6 +463,32 @@ private struct NativeConfig: Decodable {
   /// Countdown before the recording begins. Sources start immediately and
   /// warm up while it runs; nothing captured before it ends is recorded.
   let startDelayMs: Int?
+  /// Requested camera track format. Absent: 1280×720 at `fps`.
+  let cameraWidth: Int?
+  let cameraHeight: Int?
+  let cameraFps: Int?
+  let cameraBitrateBps: Int?
+}
+
+/// The size, rate, and bitrate the webcam track is recorded at.
+private struct CameraTrackFormat: Equatable {
+  let width: Int
+  let height: Int
+  let fps: Int
+  let bitrateBps: Int?
+
+  init(width: Int, height: Int, fps: Int, bitrateBps: Int?) {
+    self.width = width; self.height = height; self.fps = fps; self.bitrateBps = bitrateBps
+  }
+
+  init(config: NativeConfig) {
+    self.init(width: config.cameraWidth ?? 1280, height: config.cameraHeight ?? 720,
+      fps: max(config.cameraFps ?? config.fps, 1), bitrateBps: config.cameraBitrateBps)
+  }
+
+  /// Whether the live preview's camera session (1280×720 preset, the camera's
+  /// default rate, normally 30 fps) already delivers this format.
+  var matchesPreviewSession: Bool { width == 1280 && height == 720 && fps == 30 }
 }
 
 private struct NativeRect: Decodable {
@@ -488,7 +514,74 @@ private struct DeviceDTO: Encodable {
   let isDefault: Bool
 }
 
-private struct DevicesDTO: Encodable { let cameras: [DeviceDTO]; let mics: [DeviceDTO] }
+/// A native camera mode at its highest frame rate.
+private struct CameraFormatDTO: Encodable, Hashable, Comparable {
+  let width: Int
+  let height: Int
+  let fps: Int
+
+  static func < (a: CameraFormatDTO, b: CameraFormatDTO) -> Bool {
+    (a.width, a.height, a.fps) < (b.width, b.height, b.fps)
+  }
+}
+
+private struct CameraDTO: Encodable {
+  let id: String
+  let name: String
+  let isDefault: Bool
+  let formats: [CameraFormatDTO]
+}
+
+private struct DevicesDTO: Encodable { let cameras: [CameraDTO]; let mics: [DeviceDTO] }
+
+private func cameraFormats(_ device: AVCaptureDevice) -> [CameraFormatDTO] {
+  let modes = device.formats.compactMap { format -> CameraFormatDTO? in
+    let size = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+    let fps = format.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+    guard size.width > 0, size.height > 0, fps >= 1 else { return nil }
+    return CameraFormatDTO(width: Int(size.width), height: Int(size.height), fps: Int(fps.rounded()))
+  }
+  return Set(modes).sorted()
+}
+
+/// Switch `device` to its smallest native mode that covers `format` at its
+/// frame rate (16:9 preferred), and have `output` deliver frames at the track
+/// size. Call between begin/commitConfiguration with the device's input
+/// already added. Returns false when nothing fits; the caller then keeps the
+/// 1280×720 preset and the writer scales.
+private func applyCameraFormat(_ format: CameraTrackFormat, device: AVCaptureDevice, output: AVCaptureVideoDataOutput) -> Bool {
+  let wanted = Double(format.fps)
+  var best: (format: AVCaptureDevice.Format, range: AVFrameRateRange, score: (Int, Int, Int))?
+  for candidate in device.formats {
+    let size = CMVideoFormatDescriptionGetDimensions(candidate.formatDescription)
+    let width = Int(size.width)
+    let height = Int(size.height)
+    guard width > 0, height > 0,
+      let range = candidate.videoSupportedFrameRateRanges.first(where: {
+        $0.minFrameRate <= wanted + 0.5 && $0.maxFrameRate + 0.5 >= wanted
+      }) else { continue }
+    let covers = width >= format.width && height >= format.height
+    // Covering modes first (smallest wins), then the largest smaller one.
+    let score = (covers ? 0 : 1, width * 9 == height * 16 ? 0 : 1, covers ? width * height : -(width * height))
+    if let current = best, current.score <= score { continue }
+    best = (candidate, range, score)
+  }
+  guard let best else { return false }
+  do { try device.lockForConfiguration() } catch { return false }
+  device.activeFormat = best.format
+  // Clamp into the mode's range: a 29.97 fps mode rejects exactly 1/30 s.
+  let requested = CMTime(value: 1, timescale: CMTimeScale(format.fps))
+  let duration = CMTimeMaximum(best.range.minFrameDuration, CMTimeMinimum(requested, best.range.maxFrameDuration))
+  device.activeVideoMinFrameDuration = duration
+  device.activeVideoMaxFrameDuration = duration
+  device.unlockForConfiguration()
+  output.videoSettings = [
+    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    kCVPixelBufferWidthKey as String: format.width,
+    kCVPixelBufferHeightKey as String: format.height,
+  ]
+  return true
+}
 private struct PermissionsDTO: Encodable { let screenRecording: Bool; let camera: Bool; let microphone: Bool }
 private struct StatsDTO: Encodable {
   let droppedFrames: UInt64
@@ -606,7 +699,9 @@ private func devices(for mediaType: AVMediaType) -> [AVCaptureDevice] {
 public func aeroshootMacOSCopyDevicesJSON() -> UnsafeMutablePointer<CChar>? {
   let defaultCamera = AVCaptureDevice.default(for: .video)?.uniqueID
   let defaultMic = AVCaptureDevice.default(for: .audio)?.uniqueID
-  let cameras = devices(for: .video).map { DeviceDTO(id: $0.uniqueID, name: $0.localizedName, isDefault: $0.uniqueID == defaultCamera) }
+  let cameras = devices(for: .video).map {
+    CameraDTO(id: $0.uniqueID, name: $0.localizedName, isDefault: $0.uniqueID == defaultCamera, formats: cameraFormats($0))
+  }
   let mics = devices(for: .audio).map { DeviceDTO(id: $0.uniqueID, name: $0.localizedName, isDefault: $0.uniqueID == defaultMic) }
   return copiedCString(jsonString(DevicesDTO(cameras: cameras, mics: mics)))
 }
@@ -2244,6 +2339,8 @@ private let kMaximumRecordingSegmentDurationSec: TimeInterval = 60.0
 
 private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
   let config: NativeConfig
+  /// The webcam track's format, from the config.
+  private let cameraFormat: CameraTrackFormat
   let screenQueue = DispatchQueue(label: "ai.aeroshoot.active.screen", qos: .userInteractive, autoreleaseFrequency: .workItem)
   let systemAudioQueue = DispatchQueue(label: "ai.aeroshoot.active.system", qos: .userInitiated, autoreleaseFrequency: .workItem)
   let cameraQueue = DispatchQueue(label: "ai.aeroshoot.active.camera", qos: .userInteractive, autoreleaseFrequency: .workItem)
@@ -2295,6 +2392,7 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
 
   init(config: NativeConfig) {
     self.config = config
+    self.cameraFormat = CameraTrackFormat(config: config)
     self.sessionHostEpoch = CMClockGetTime(CMClockGetHostTimeClock())
     super.init()
   }
@@ -2316,7 +2414,7 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     }
     do {
       if config.captureScreen { try requireHardwareH264(width: config.width, height: config.height) }
-      if config.cameraId != nil { try requireHardwareH264(width: 1280, height: 720) }
+      if config.cameraId != nil { try requireHardwareH264(width: cameraFormat.width, height: cameraFormat.height) }
     } catch {
       return encoderResultFailed(code: 0, message: "hardware H.264 unavailable: \(error.localizedDescription)")
     }
@@ -2337,7 +2435,7 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
       systemTracker = PerTrackRecorder(trackId: "system", kind: .audio, directory: systemDir, videoWidth: 0, videoHeight: 0, videoFps: 0, audioChannels: 2, coalesceKey: nil)
     }
     if config.cameraId != nil {
-      cameraTracker = PerTrackRecorder(trackId: "webcam", kind: .video, directory: webcamDir, videoWidth: 1280, videoHeight: 720, videoFps: config.fps, audioChannels: 0, coalesceKey: nil)
+      cameraTracker = PerTrackRecorder(trackId: "webcam", kind: .video, directory: webcamDir, videoWidth: cameraFormat.width, videoHeight: cameraFormat.height, videoFps: cameraFormat.fps, audioChannels: 0, coalesceKey: nil, videoBitrate: cameraFormat.bitrateBps)
     }
     if config.micId != nil {
       micTracker = PerTrackRecorder(trackId: "mic", kind: .audio, directory: micDir, videoWidth: 0, videoHeight: 0, videoFps: 0, audioChannels: 1, coalesceKey: nil)
@@ -2440,6 +2538,8 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
   /// recorder cannot use; the preview then stops it and the recorder opens its own.
   private func adoptCaptureSession(_ session: AVCaptureSession) -> Bool {
     guard let clock = session.synchronizationClock else { return false }
+    // Reformatting a running camera would let frames of the old size through.
+    if config.cameraId != nil && !cameraFormat.matchesPreviewSession { return false }
     let recordedFormat = Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
     let videoOutputs = session.outputs.compactMap { $0 as? AVCaptureVideoDataOutput }
     guard videoOutputs.allSatisfy({ ($0.videoSettings?[kCVPixelBufferPixelFormatTypeKey as String] as? Int) == recordedFormat }) else {
@@ -2640,6 +2740,7 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
     let session = AVCaptureSession()
     session.beginConfiguration()
     var cameraReady = false
+    var cameraModeApplied = false
     var micReady = false
     if let id = config.cameraId {
       do {
@@ -2660,6 +2761,7 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
         }
         session.addOutput(output)
         cameraReady = true
+        cameraModeApplied = applyCameraFormat(cameraFormat, device: device, output: output)
       } catch {
         invokeRuntimeErrorCallback(trackId: "webcam", code: 16, message: "Webcam start failed: \(error.localizedDescription); continuing without camera")
         cameraTracker = nil
@@ -2687,9 +2789,9 @@ private final class ActiveRecorder: NSObject, SCStreamDelegate, SCStreamOutput, 
         micTracker = nil
       }
     }
-    // The size the webcam track is encoded at, and the preview session's
-    // format, so adopted and freshly opened cameras record identically.
-    if cameraReady, session.canSetSessionPreset(.hd1280x720) { session.sessionPreset = .hd1280x720 }
+    // Without a matching native mode, the preview session's format; the
+    // writer scales it to the track size.
+    if cameraReady, !cameraModeApplied, session.canSetSessionPreset(.hd1280x720) { session.sessionPreset = .hd1280x720 }
     session.commitConfiguration()
     if !cameraReady && !micReady { return }
     if cameraReady { cameraQueue.suspend() }
@@ -3564,6 +3666,14 @@ enum RecordingWriterContracts {
     precondition(!livePreviewSessionMatches(deviceIDs: ["other"], cameraID: "cam", micID: nil), "a different camera must not be adopted")
     precondition(!livePreviewSessionMatches(deviceIDs: [], cameraID: nil, micID: nil))
     print("Preview hand-off passed: only a session running exactly the recording's devices is adopted")
+
+    let base = #"{"sourceId":"display:1","captureScreen":false,"cameraId":"cam","captureSystemAudio":false,"fps":60,"width":1920,"height":1080,"projectPath":"/tmp/x.aero","sessionOffsetUs":0"#
+    let plain = CameraTrackFormat(config: try! JSONDecoder().decode(NativeConfig.self, from: Data((base + "}").utf8)))
+    precondition(plain == CameraTrackFormat(width: 1280, height: 720, fps: 60, bitrateBps: nil), "no request records 1280x720 at the screen rate")
+    let chosen = CameraTrackFormat(config: try! JSONDecoder().decode(NativeConfig.self, from: Data((base + #","cameraWidth":854,"cameraHeight":480,"cameraFps":30,"cameraBitrateBps":4000000}"#).utf8)))
+    precondition(chosen == CameraTrackFormat(width: 854, height: 480, fps: 30, bitrateBps: 4_000_000), "the requested camera format is recorded")
+    precondition(!chosen.matchesPreviewSession && CameraTrackFormat(width: 1280, height: 720, fps: 30, bitrateBps: 6_000_000).matchesPreviewSession)
+    print("Camera format passed: the requested format is used, and only the preview's own format adopts its session")
   }
 }
 #endif

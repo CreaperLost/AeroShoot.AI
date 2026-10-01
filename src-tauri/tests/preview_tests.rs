@@ -19,6 +19,10 @@ fn studio_viewport(revision: u64) -> PreviewViewport {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    ignore = "native preview is not implemented on this platform yet"
+)]
 fn studio_preview_attaches_lays_out_and_detaches() {
     let dir = tempdir().unwrap();
     let state = AppState::new_test(dir.path().to_path_buf());
