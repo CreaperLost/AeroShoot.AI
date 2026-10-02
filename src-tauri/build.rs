@@ -11,6 +11,9 @@ fn main() {
         build_macos_capture_bridge();
     }
 
+    // The Windows exe embeds icons/icon.ico when this script runs; without
+    // this, replacing an icon leaves the old one in the next build.
+    println!("cargo:rerun-if-changed=icons");
     #[cfg(feature = "tauri-app")]
     tauri_build::build();
 }

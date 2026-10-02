@@ -41,6 +41,8 @@ The app is signed with the first code-signing identity found in your Keychain (D
 
 `./script/codex.sh build` runs the frontend and Rust tests first, then the same build.
 
+Without a Developer ID certificate the app is not notarized, so on another Mac the first launch needs right-click → Open (or System Settings → Privacy & Security → Open Anyway).
+
 ### Windows
 
 Requirements: Windows 11 (x64 or ARM64), Node.js 22+, Rust with the MSVC toolchain (via [rustup](https://rustup.rs)), and the Visual Studio C++ build tools (the "Desktop development with C++" workload). The app uses the Microsoft Edge WebView2 Runtime, which ships with Windows 11.
@@ -51,7 +53,13 @@ powershell -ExecutionPolicy Bypass -File .\script\codex.ps1 build
 
 This installs the frontend dependencies if needed, runs the frontend and Rust tests, and builds the release app.
 
-Output: `src-tauri\target\release\bundle\windows\AeroShoot.exe` and a zip of it (`AeroShoot_<version>_<arch>.zip`). The frontend is built into the exe, so no other files are needed next to it.
+Output, under `src-tauri\target\release\bundle\`:
+
+- `nsis\AeroShoot_<version>_x64-setup.exe`: the installer to share (recommended). It installs for the current user without an admin prompt, adds a Start menu shortcut and an uninstaller, and downloads WebView2 if it is missing.
+- `msi\AeroShoot_<version>_x64_en-US.msi`: an MSI installer, for managed deployment.
+- `windows\AeroShoot.exe` and `AeroShoot_<version>_<arch>.zip`: the app without an installer.
+
+The installers need the Tauri CLI (`cargo install tauri-cli --locked`); without it, only the exe and zip are built. The installers are not code-signed, so Windows SmartScreen asks for confirmation the first time (More info → Run anyway).
 
 To build without running the tests:
 
@@ -61,3 +69,14 @@ cargo build --release --manifest-path src-tauri\Cargo.toml --features tauri-app,
 ```
 
 The exe is then at `src-tauri\target\release\aeroshoot.exe`.
+
+### Installers from GitHub
+
+The **Installers** workflow (`.github/workflows/release.yml`) builds the macOS DMG and the Windows setup.exe and MSI on GitHub's machines, so you don't need a Mac or a Windows PC for them. Run it from the repository's Actions tab and download the files from the run, or push a version tag to also publish them as a GitHub release:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Bump `version` in `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml` before tagging a new release.

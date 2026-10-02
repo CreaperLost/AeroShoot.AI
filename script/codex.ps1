@@ -34,7 +34,9 @@ Commands:
   stop    Stop the dev server and desktop app started by start/run
   run     Start Vite if needed, then run the desktop app in debug mode
   build   Run frontend and Rust tests, then build the release app:
-          target\release\bundle\windows\AeroShoot.exe and a zip
+          target\release\bundle\windows\AeroShoot.exe and a zip, plus
+          the setup.exe and MSI installers when the Tauri CLI is installed
+          (cargo install tauri-cli --locked)
 "@
 }
 
@@ -297,7 +299,9 @@ function Invoke-Build {
     foreach ($path in @(
             (Join-Path $FrontendDir "dist"),
             (Join-Path $FrontendDir "node_modules\.vite"),
-            $bundleDir)) {
+            $bundleDir,
+            (Join-Path $TargetDir "release\bundle\nsis"),
+            (Join-Path $TargetDir "release\bundle\msi"))) {
         if (Test-Path $path) {
             Remove-Item -Recurse -Force $path
             Write-Host "    Removed $path"
@@ -310,11 +314,24 @@ function Invoke-Build {
         Pop-Location
     }
 
-    # Same single supported path as build.sh: Cargo embeds the frontend
-    # (custom-protocol); no Tauri CLI is involved.
-    Write-Host "==> [4/5] Compiling desktop application..."
-    Invoke-Native "cargo build" {
-        cargo build --release --manifest-path $Manifest --features tauri-app,custom-protocol
+    # Cargo embeds the frontend (custom-protocol). The Tauri CLI, when
+    # installed, runs the same release build and also wraps it in installers.
+    if (Get-Command "cargo-tauri" -ErrorAction SilentlyContinue) {
+        Write-Host "==> [4/5] Compiling desktop application and installers..."
+        Push-Location $TauriDir
+        try {
+            Invoke-Native "cargo tauri build" {
+                cargo tauri build --features tauri-app --bundles nsis,msi --ci
+            }
+        } finally {
+            Pop-Location
+        }
+    } else {
+        Write-Host "==> [4/5] Compiling desktop application..."
+        Write-Host "    Tauri CLI not found; skipping installers (cargo install tauri-cli --locked)."
+        Invoke-Native "cargo build" {
+            cargo build --release --manifest-path $Manifest --features tauri-app,custom-protocol
+        }
     }
 
     Write-Host "==> [5/5] Packaging..."
@@ -328,6 +345,13 @@ function Invoke-Build {
     Write-Host "Build complete. Requires the Microsoft Edge WebView2 Runtime (included with Windows 11)."
     Write-Host "    App: $exe"
     Write-Host "    Zip: $zip"
+    $installers = @(
+        Get-ChildItem (Join-Path $TargetDir "release\bundle\nsis\*-setup.exe") -ErrorAction SilentlyContinue
+        Get-ChildItem (Join-Path $TargetDir "release\bundle\msi\*.msi") -ErrorAction SilentlyContinue
+    )
+    foreach ($installer in $installers) {
+        Write-Host "    Installer: $($installer.FullName)"
+    }
 }
 
 $exitCode = 0

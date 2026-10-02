@@ -41,6 +41,18 @@
       "icons/icon.png",
       "icons/icon.ico"
     ],
+    "publisher": "AeroShoot",
+    "category": "Video",
+    "shortDescription": "Screen, camera, and audio recorder",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico"
+      }
+    },
     "macOS": {
       "minimumSystemVersion": "13.0",
       "infoPlist": "Info.plist"
